@@ -22,11 +22,13 @@
 (declare-function slackit-room-open "slackit-room" (app conversation-id &optional select))
 (declare-function slackit-runtime-ensure-user
                   "slackit-runtime" (app user-id))
+(declare-function slackit-root-transient "slackit-transient" (&optional scope))
 
 (defvar slackit-root-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-directory-mode-map)
     (define-key map (kbd "g") #'slackit-root-refresh)
+    (define-key map (kbd "?") #'slackit-root-transient)
     map)
   "Keymap for `slackit-root-mode'.")
 
@@ -67,12 +69,13 @@
   "Build one directory item for CONVERSATION-ID under SECTION."
   (let* ((conversation (slackit-state-conversation state conversation-id))
          (name (slackit-state-conversation-name state conversation-id))
+         (label (slackit-state-conversation-label state conversation-id))
          (unread-p (slackit-root--conversation-unread-p state conversation-id)))
     (appkit-directory-entry-create
      :key conversation-id
      :role 'item
      :section-key section
-     :label (if (eq section 'channel) (concat "#" name) name)
+     :label label
      :trailing (and unread-p "  •")
      :face 'slackit-room-name
      :indent 2
@@ -178,9 +181,13 @@
 (defun slackit-root-refresh ()
   "Restart cursor-complete bootstrap for the current root account."
   (interactive)
-  (if-let* ((view (appkit-current-view)))
-      (slackit-bootstrap-account (appkit-view-app view))
-    (user-error "slackit: this buffer has no live account view")))
+  (let* ((view (appkit-current-view))
+         (app (and (appkit-view-p view) (appkit-view-app view))))
+    (unless (and (appkit-view-live-p view)
+                 (eq (appkit-app-kind app) 'slackit-account)
+                 (equal (appkit-view-id view) '(root)))
+      (user-error "slackit: this command requires a live Slackit root view"))
+    (slackit-bootstrap-account app)))
 
 (provide 'slackit-root)
 

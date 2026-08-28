@@ -30,21 +30,28 @@ The existing workspace projects have distinct roles:
   keys.
 - =emacs-qq= is the account-lifecycle reference: each stable account owns a
   separate Appkit application and state partition.
+- =slk= is an independent Slack protocol and interaction reference.  Slackit
+  reuses its measured room/reply pagination directions, stable
+  conversation/timestamp action routing, emoji-name semantics, and lazy media
+  UX; it does not copy slk's Go/TUI state machine, global caches, cross-workspace
+  media credential fallback, optimistic reaction rollback, or redirect policy.
 - =appkit.el/docs/integrator.org= is authoritative for reusable UI and update
   mechanics.  Slackit does not add a second projection, composer, history, or
   lifecycle framework beside it.
 
-The initial compatibility floor is Emacs 29.1 with =appkit=, =plz=, and
-=websocket=.  No =request=, =circe=/LUI, =dash=, =s=, or EIEIO dependency is
-needed for the first slice.
+The compatibility floor is Emacs 29.1 with =appkit=, =browser-session=,
+=transient=, =plz=, and =websocket=.  Evil is an optional development/runtime
+integration discovered after load.  No =request=, =circe=/LUI, =dash=, =s=, or
+EIEIO dependency is required.
 
 * Account identity and credentials
 
 One registered Slack account owns one =slackit-account= Appkit application.
 =ACCOUNT-ID= is required, local, stable, and chosen by the user.  It identifies
-the Appkit application and appears in buffer names.  A Slack team ID and self
-user ID learned during capture/bootstrap are protocol facts, not lifecycle
-identities: one workspace can contain more than one configured user account.
+the Appkit application and appears in buffer names.  Slack team/self IDs are
+protocol facts, not Appkit lifecycle IDs, but browser-imported credentials pin
+them: later =auth.test= and =rtm.connect= identities must agree before they can
+publish canonical state.
 
 The default interactive entry point is:
 
@@ -251,8 +258,9 @@ Canonical user records are an in-memory account cache, matching
 directory of workspace profile metadata.  Public profile image bytes are the
 expensive reusable part, so =slackit-avatar.el= caches them on disk under
 account-qualified SHA-256 identities.  The cache directory is private on Unix,
-downloads carry no Slack bearer or Cookie credentials, and view rows depend on
-opaque avatar resource keys for exact redraw after acquisition.
+downloads carry no Slack bearer or Cookie credentials, and Appkit derives
+center-cropped circular images at the current two-line pixel size.  View rows
+depend on opaque avatar resource keys for exact redraw after acquisition.
 
 The root does not call =client.userBoot= or =client.counts= and does not invent
 unread or mention badges.  It may mark a row unread only after the selected
@@ -271,21 +279,24 @@ chat timeline.  It uses:
   auxiliary state, and structured mention/channel objects;
 - =appkit-chat-completion= for account-local =@user= and =#channel=
   candidates;
-- resource dependencies for senders, user/channel references, and account-local
-  avatar images, with exact row invalidation after lazy resource arrival.
+- resource dependencies for senders, user/channel references, account-local
+  avatars, and public media posters, with exact row invalidation after lazy
+  resource arrival.
 
 Slackit owns the row payload, Slack mrkdwn/reference interpretation, subtype
-handling, clock text, sender selection, and actions.  The first slice decodes
-entities and renders user, channel, special mention, date, safe link, and code
-references from stable protocol IDs.  Missing resources retain explicit ID
-fallbacks and later resource arrival invalidates dependent rows.
+handling, clock text, sender selection, and actions.  It decodes entities once
+and renders user, channel, special mention, date, safe link, code, and standard
+Slack =:emoji:= tokens from stable protocol identities.  Message bodies and
+actionable reaction chips share the same display resolver while canonical text
+and reaction names remain unchanged for copy and wire operations.
 
 Room and thread rows use the shared Appkit chat presentation primitives also
 used by QQ and Disco: deterministic identity-colored sender headings,
-Telega-style two-line avatar prefixes with text fallbacks, responsive
+center-cropped two-line circular avatars with initials fallbacks, responsive
 right-aligned timestamps, full-width date/unread separators, wrapped body
-prefixes, and bounded same-sender compaction.  These are display properties;
-copied message text remains free of alignment padding and avatar placeholders.
+prefixes, actionable reaction chips, and bounded same-sender compaction.  These
+are display properties; copied message text remains free of alignment padding
+and avatar placeholders.
 
 Both chat view kinds declare the Appkit =geometry= part and enable
 =appkit-view-enable-responsive-geometry=.  A coalesced geometry invalidation
@@ -294,12 +305,15 @@ timeline key, preserving position while recalculating alignment.  Rendering a
 hidden buffer may use =fill-column= temporarily, but displaying or resizing it
 must replace that fallback without application-owned window hooks.
 
-Unsupported blocks, files, and subtypes remain visible as explicit safe rows.
-A file-only message shows available filename/type/permalink metadata without
-starting a download, preview, upload, or media process.
+Unsupported blocks and subtypes remain visible as explicit safe rows.  Slack
+file objects render typed metadata/permalink cards.  Supported public Block Kit
+image and video posters use account-owned, generation-fenced Appkit media
+resources and exact row invalidation; renderers only observe ready/loading/
+failure state.  Private =url_private=/=thumb_*= bytes remain metadata/browser
+actions because Slackit does not forward its API token or Cookie to media URLs.
 
-Initial history uses =conversations.history=.  The room owns the returned older
-cursor because Appkit deliberately does not interpret protocol cursors.
+Initial room history uses =conversations.history=.  The room owns its returned
+older cursor because Appkit deliberately does not interpret protocol cursors.
 
 - An empty first response calls
   =appkit-chat-history-window-establish-empty=.
@@ -315,9 +329,11 @@ cursor because Appkit deliberately does not interpret protocol cursors.
 ** Thread
 
 =slackit-thread-mode= is a separate Appkit chatbuf/timeline view keyed by
-=(thread CONVERSATION-ID ROOT-TS)=.  It loads the root and replies through
-=conversations.replies=, pages with its own view-owned cursor, and sends replies
-through =chat.postMessage= with =thread_ts=.  It does not use
+=(thread CONVERSATION-ID ROOT-TS)=.  It loads root/replies through
+=conversations.replies=, whose cursor advances toward newer replies rather than
+older room history.  While that cursor remains, the Appkit window has an exact
+newer edge; exhaustion attaches it to latest.  Replies are sent through
+=chat.postMessage= with =thread_ts=.  Slackit does not use
 =subscriptions.thread.*= or =client.counts=.
 
 The canonical message exists once per conversation; room and thread projections
@@ -382,15 +398,20 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-compose.el= | Draft/aux capture, structured serialization, send/edit settlement |
 | =slackit-completion.el= | Account-local user/channel candidates and structured insertion |
 | =slackit-avatar.el= | Credential-free profile image acquisition, private disk cache, resource invalidation |
+| =slackit-emoji.el= | Display-only Slack shortname to Emacs Unicode resolution |
+| =slackit-media.el= | Credential-free public poster acquisition and Appkit media-card projection |
 | =slackit-render.el= | Safe message-row rendering, Slack reference expansion, fallback rows |
 | =slackit-thread.el= | Thread view, reply history, parent/reply projection, reply send |
 | =slackit-reaction.el= | Latest-intent reaction operation ownership and REST settlement |
 | =slackit-read.el= | Known read frontier, viewed-row advancement, coalesced mark operations |
 | =slackit-actions.el= | Stable row action dispatch, edit/delete/reply/reaction entry points |
+| =slackit-evil.el= | Optional late-safe Evil state/key projection |
+| =slackit-transient.el= | Exact-view/account/message scoped command menus |
 
-Media transfer, search, notification, and full Block Kit modules are added only
-when their observable feature is implemented; the first slice does not create
-empty extension scaffolds.
+Media support remains deliberately split by capability: implemented public
+poster cards are owned by =slackit-media.el=; authenticated private downloads,
+uploads, and the remaining Block Kit surface are not represented by empty
+scaffolds.
 
 * First daily-use vertical slice
 
@@ -402,15 +423,17 @@ is complete only when one or more registered accounts can:
    persist private versioned auth, and delete the temporary capture;
 2. start independently from stable local account IDs with account-local,
    origin-bound credentials and secret-free diagnostics;
-3. consume all users/conversations cursors, project loading/error/readiness
-   honestly, and honor bounded =Retry-After= only for idempotent reads;
+3. consume every conversation cursor, seed self identity, resolve visible users
+   once on demand, project readiness honestly, and honor bounded =Retry-After=
+   only for idempotent reads;
 4. reach RTM =hello=, maintain ping/pong, adopt =reconnect_url=, reconnect with a
    generation fence, and keep user/conversation metadata current;
 5. open an Appkit directory root and the exact account-owned conversation room;
 6. load the latest exact message window, page older with the returned cursor,
    and merge pages safely against later RTM edits/deletes;
-7. render Slack text references, safe links/code, explicit unsupported content,
-   and non-fetching file summaries;
+7. render Slack references, safe links/code, standard emoji, reaction chips,
+   circular avatars, typed file cards, supported public image/video posters,
+   and explicit unsupported content;
 8. complete =@user= and =#channel= as structured exact-ID composer objects;
 9. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
    marked, user, and joined-conversation lifecycle events;
@@ -419,20 +442,21 @@ is complete only when one or more registered accounts can:
 11. open a stable thread view, load/page replies, receive reply mutations, and
     send a reply;
 12. edit and delete an owned message with revision/tombstone-safe settlement;
-13. render, add, and remove text reactions with REST/RTM race safety;
+13. render, add, and remove emoji reaction chips with REST/RTM race safety;
 14. advance and explicitly mark read only through an authoritative reached row,
     without =client.counts= or fabricated unread badges;
 15. stop with no live Slackit WebSocket, timer, request, operation, login
     capture, or view left behind; and
-16. coexist in one Emacs process with the existing =slack= package.
+16. coexist with =slack= and expose optional Evil plus exact-scope Transient menus.
 
-Deferred after this slice: rich Block Kit/attachments, rich WYSIWYG, general
-file/media download/preview/upload, custom emoji images/catalogs, global search,
-notifications, unread/modeline count summaries, typing, presence, DND,
-thread subscription/activity endpoints, pins/saved items, scheduled messages,
-workspace administration, OAuth/token refresh/Socket Mode, enterprise-token
-selection, and optimistic local timeline rows.  Unsupported content remains
-visible without silently expanding any deferred transport surface.
+Deferred after this slice: remaining rich Block Kit/attachments and WYSIWYG,
+authenticated private file/media download/preview/upload, workspace custom
+emoji images/catalogs, global search, notifications, unread/modeline count
+summaries, typing, presence, DND, thread subscription/activity endpoints,
+pins/saved items, scheduled messages, workspace administration, OAuth/token
+refresh/Socket Mode, enterprise-token selection, and optimistic local timeline
+rows.  Unsupported content remains visible without silently expanding a
+deferred transport surface.
 
 * Contract checks
 
@@ -446,7 +470,7 @@ Implementation should defend these observable contracts:
   diagnostics, and cross-origin/redirect/media URLs receive no Slack secrets;
 - avatar resources reject non-HTTPS/non-Slack hosts, never receive Web API
   credentials, deduplicate account-owned transfers, persist only private image
-  bytes, and redraw exactly dependent room/thread rows;
+  bytes, derive circular size/mtime-specific images, and redraw exact rows;
 - capture callbacks and diagnostics contain no secret values; imported auth and
   temporary capture files are private; capture files are deleted on success,
   failure, cancellation, and synchronous startup errors;
@@ -455,6 +479,9 @@ Implementation should defend these observable contracts:
 - captures with a wrong source URL, non-Slack cookie domain, duplicate/missing
   cookie, unsafe cookie value, unsupported schema, or non-=xoxc= page token are
   rejected without persisting credentials;
+- login capture requires the canonical HTTPS Slack customize origin, complete
+  team/user identity, private storage, and one global browser-session owner;
+  captured identity remains pinned through =auth.test= and =rtm.connect=;
 - two-page conversation fixtures do not become ready after page one; startup
   never calls =users.list=, and repeated visible references share one pending
   =users.info= operation;
@@ -472,8 +499,17 @@ Implementation should defend these observable contracts:
   once in both the room and thread;
 - completion serializes the selected account's exact user/conversation ID even
   when labels collide or later change;
-- send and edit response-before-RTM and RTM-before-response orders converge to
-  one server row; delete converges to one tombstone;
+- standard colon emoji resolve only at presentation, unknown names remain
+  literal, reaction chips preserve exact Slack names, and adjacent identical
+  structured mentions serialize as separate occurrences;
+- public media resources contain no raw capability URL or credential, start
+  outside rendering, and settle loading to preview/failure by exact row;
+- Evil remains optional and preserves native motions/operators plus the
+  timeline/composer boundary; Transient suffixes retain their original live
+  Appkit view/account/message generation;
+- send/edit HTTP snapshots cannot overwrite a later RTM edit or clear a
+  tombstone; response-before-RTM and RTM-before-response orders converge to one
+  server row;
 - editing text or structured objects during an in-flight write prevents stale
   success/failure from overwriting the newer composer;
 - reaction event-before-REST and REST-before-event update once; reversed

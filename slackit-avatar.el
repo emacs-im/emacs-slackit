@@ -30,7 +30,10 @@
   handle)
 
 (defvar slackit-avatar--image-cache (make-hash-table :test #'equal)
-  "Decoded image records keyed by opaque avatar resource identity.")
+  "Decoded images keyed by resource identity, pixel size, and source mtime.")
+
+(defvar slackit-avatar--sources (make-hash-table :test #'equal)
+  "Ready local avatar sources keyed by opaque resource identity.")
 
 (defvar slackit-avatar--fetches (make-hash-table :test #'equal)
   "Current account-owned avatar fetches keyed by opaque resource identity.")
@@ -90,6 +93,40 @@
            (or (nth 3 resource-key) "unknown"))
    slackit-avatar-cache-directory))
 
+(defun slackit-avatar--discard-derived-images (resource-key)
+  "Discard every decoded image derived from RESOURCE-KEY."
+  (let (keys)
+    (maphash
+     (lambda (key _image)
+       (when (equal (car-safe key) resource-key)
+         (push key keys)))
+     slackit-avatar--image-cache)
+    (dolist (key keys)
+      (remhash key slackit-avatar--image-cache))))
+
+(defun slackit-avatar--forget-source (resource-key)
+  "Forget RESOURCE-KEY's ready source and all derived images."
+  (remhash resource-key slackit-avatar--sources)
+  (slackit-avatar--discard-derived-images resource-key))
+
+(defun slackit-avatar--remember-source (resource-key file)
+  "Remember FILE as RESOURCE-KEY's ready source, returning its record.
+
+The record contains only the private local path and its modification time.
+Changing either invalidates every decoded size derived from the old source."
+  (when (stringp file)
+    (let* ((attributes (file-attributes file))
+           (mtime
+            (and attributes
+                 (null (file-attribute-type attributes))
+                 (file-attribute-modification-time attributes)))
+           (record (and mtime (list file mtime))))
+      (when record
+        (unless (equal record (gethash resource-key slackit-avatar--sources))
+          (slackit-avatar--discard-derived-images resource-key))
+        (puthash resource-key record slackit-avatar--sources)
+        record))))
+
 (defun slackit-avatar--delete-stale-cache-files (resource-key keep-file)
   "Delete old profile image versions for RESOURCE-KEY except KEEP-FILE."
   (when (file-directory-p slackit-avatar-cache-directory)
@@ -148,15 +185,17 @@
   "Settle avatar fetch OWNER with private cache FILE."
   (let* ((current-p (slackit-avatar--owner-current-p owner))
          (app (slackit-avatar-fetch-app owner))
-         (resource-key (slackit-avatar-fetch-resource-key owner)))
+         (resource-key (slackit-avatar-fetch-resource-key owner))
+         source)
     (when (and (file-regular-p file)
                (not (memq system-type '(ms-dos windows-nt cygwin))))
       (set-file-modes file #o600))
     (when current-p
       (slackit-avatar--delete-stale-cache-files resource-key file)
+      (setq source (slackit-avatar--remember-source resource-key file))
       (remhash resource-key slackit-avatar--failures))
     (slackit-avatar--retire-fetch owner)
-    (when current-p
+    (when (and current-p source)
       (slackit-runtime-publish-resource app resource-key))))
 
 (defun slackit-avatar--fetch-failure (owner _error)
@@ -204,44 +243,77 @@
         (error (slackit-avatar--fetch-failure owner nil)))
       owner)))
 
-(defun slackit-avatar--cached-image (resource-key cache-base)
-  "Return decoded cached image for RESOURCE-KEY below CACHE-BASE."
-  (let* ((record (gethash resource-key slackit-avatar--image-cache))
-         (record-file (car-safe record))
-         (record-mtime (cadr record))
-         (record-image (caddr record))
-         (record-attributes
-          (and record-file (file-attributes record-file))))
-    (if (and record-attributes
-             (equal record-mtime
-                    (file-attribute-modification-time record-attributes)))
-        record-image
-      (when-let* ((file
-                   (appkit-media-image-cache-existing-file cache-base))
-                  (attributes (file-attributes file))
-                  (mtime (file-attribute-modification-time attributes))
-                  (image
-                   (ignore-errors
-                     (create-image file nil nil :ascent 'center))))
-        (puthash resource-key (list file mtime image)
-                 slackit-avatar--image-cache)
-        image))))
+(defun slackit-avatar--normalize-pixel-size (pixel-size)
+  "Return PIXEL-SIZE rounded to a positive integer, or nil."
+  (when (and (numberp pixel-size) (> pixel-size 0))
+    (max 1 (round pixel-size))))
 
-(defun slackit-avatar-image (app user)
-  "Return cached profile image for APP USER and start acquisition if absent."
-  (when (and slackit-show-avatars
-             (display-graphic-p)
-             (appkit-app-live-p app))
+(defun slackit-avatar--source-image (file pixel-size)
+  "Decode FILE as a circular PIXEL-SIZE image, with a square fallback."
+  (or (appkit-media-circular-image-from-file file pixel-size)
+      (ignore-errors
+        (create-image file nil nil
+                      :width pixel-size
+                      :height pixel-size
+                      :ascent 'center))))
+
+(defun slackit-avatar-cached-image (app user pixel-size)
+  "Return APP USER's ready avatar at PIXEL-SIZE, or nil.
+
+This lookup is deterministic and never discovers or acquires a source.  In
+particular, a resource absent from `slackit-avatar--sources' causes no file
+or network operation.  Call `slackit-avatar-ensure' separately to discover
+an existing private disk entry or start its account-owned acquisition."
+  (when-let* ((resource-key (slackit-avatar-resource-key app user))
+              (size (slackit-avatar--normalize-pixel-size pixel-size))
+              (source (gethash resource-key slackit-avatar--sources))
+              (file (car source))
+              (mtime (cadr source)))
+    (let ((cache-key (list resource-key size mtime)))
+      (or (gethash cache-key slackit-avatar--image-cache)
+          (when-let* ((image (slackit-avatar--source-image file size)))
+            (puthash cache-key image slackit-avatar--image-cache)
+            image)))))
+
+(defun slackit-avatar-ensure (app user)
+  "Ensure APP USER's avatar source is ready or being acquired.
+
+Disk discovery, private-cache preparation, retry backoff, and deduplicated
+network transfer all belong to this acquisition boundary."
+  (when (appkit-app-live-p app)
     (when-let* ((resource-key (slackit-avatar-resource-key app user)))
-      (slackit-avatar--prepare-cache-directory)
-      (let* ((cache-base (slackit-avatar--cache-base resource-key))
-             (image (slackit-avatar--cached-image resource-key cache-base)))
-        (unless image
-          (slackit-avatar--ensure-fetch app user resource-key))
-        image))))
+      (or (and (gethash resource-key slackit-avatar--sources)
+               resource-key)
+          (gethash resource-key slackit-avatar--fetches)
+          (progn
+            (slackit-avatar--prepare-cache-directory)
+            (let* ((cache-base (slackit-avatar--cache-base resource-key))
+                   (file
+                    (appkit-media-image-cache-existing-file cache-base)))
+              (if file
+                  (let ((source
+                         (slackit-avatar--remember-source resource-key file)))
+                    (if source
+                        (progn
+                          (unless
+                              (memq system-type
+                                    '(ms-dos windows-nt cygwin))
+                            (set-file-modes file #o600))
+                          (slackit-avatar--delete-stale-cache-files
+                           resource-key file)
+                          (slackit-runtime-publish-resource
+                           app resource-key)
+                          resource-key)
+                      (slackit-avatar--forget-source resource-key)
+                      (slackit-avatar--ensure-fetch
+                       app user resource-key)))
+                (slackit-avatar--forget-source resource-key)
+                (slackit-avatar--ensure-fetch
+                 app user resource-key))))))))
+
 
 (defun slackit-avatar-clear-memory-cache ()
-  "Clear decoded Slack avatar images and retry state for this Emacs session."
+  "Clear every decoded Slack avatar descriptor and retry state."
   (clrhash slackit-avatar--image-cache)
   (clrhash slackit-avatar--failures))
 

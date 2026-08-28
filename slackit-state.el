@@ -128,11 +128,15 @@
   "Return a stable display name for USER-ID in STATE."
   (let* ((user (slackit-state-user state user-id))
          (profile (slackit-normalize-get user 'profile)))
-    (or (slackit-normalize-get profile 'display_name)
-        (slackit-normalize-get profile 'real_name)
-        (slackit-normalize-get user 'real_name)
-        (slackit-normalize-get user 'name)
-        user-id
+    (or (cl-loop
+         for value in
+         (list (slackit-normalize-get profile 'display_name)
+               (slackit-normalize-get profile 'real_name)
+               (slackit-normalize-get user 'real_name)
+               (slackit-normalize-get user 'name)
+               user-id)
+         when (and (stringp value) (not (string-blank-p value)))
+         return value)
         "unknown")))
 
 (defun slackit-state--merge-alists (old new)
@@ -185,6 +189,16 @@
      (conversation-id conversation-id)
      (t "unknown"))))
 
+(defun slackit-state-conversation-label (state conversation-id)
+  "Return presentation label for CONVERSATION-ID in STATE."
+  (let ((conversation
+         (slackit-state-conversation state conversation-id))
+        (name (slackit-state-conversation-name state conversation-id)))
+    (if (or (slackit-normalize-get conversation 'is_im)
+            (slackit-normalize-get conversation 'is_mpim))
+        name
+      (concat "#" name))))
+
 (defun slackit-state-joined-conversation-ids (state)
   "Return visible joined conversation IDs in stable STATE order."
   (seq-filter
@@ -215,11 +229,21 @@
 
 (defun slackit-state--sorted-insert (key keys)
   "Insert string KEY into sorted unique KEYS."
-  (sort (cl-adjoin key keys :test #'equal) #'string<))
+  (cond
+   ((null keys) (list key))
+   ((equal key (car keys)) keys)
+   ((string< key (car keys)) (cons key keys))
+   (t
+    (let ((tail keys))
+      (while (and (cdr tail) (string< (cadr tail) key))
+        (setq tail (cdr tail)))
+      (unless (and (cdr tail) (equal key (cadr tail)))
+        (setcdr tail (cons key (cdr tail))))
+      keys))))
 
 (defun slackit-state--index-remove (table key value)
   "Remove VALUE from TABLE's sequence at KEY."
-  (let ((values (delete value (copy-sequence (gethash key table)))))
+  (let ((values (delete value (gethash key table))))
     (if values (puthash key values table) (remhash key table))))
 
 (defun slackit-state--remove-message-indexes (state conversation-id ts old)
@@ -252,13 +276,13 @@
                  (slackit-account-state-replies state))))
     (list :reply-p reply-p :top-level-p top-level-p :root-ts thread-ts)))
 
-(defun slackit-state-upsert-message (state conversation-id message &optional revision)
-  "Upsert MESSAGE in CONVERSATION-ID and return a change descriptor.
+(defun slackit-state--upsert-normalized-message
+    (state conversation-id normalized &optional revision)
+  "Upsert NORMALIZED in CONVERSATION-ID and return a change descriptor.
 
 REVISION, when non-nil, is the page settlement revision applied to the
 message; ordinary realtime and write results allocate a new revision."
-  (let* ((normalized (slackit-normalize-message message conversation-id))
-         (ts (slackit-normalize-get normalized 'ts)))
+  (let ((ts (slackit-normalize-get normalized 'ts)))
     (when (and conversation-id ts)
       (let* ((table (slackit-state--message-table state conversation-id t))
              (old (gethash ts table))
@@ -279,6 +303,47 @@ message; ordinary realtime and write results allocate a new revision."
                       :ts ts)
                 (slackit-state--add-message-indexes
                  state conversation-id ts merged))))))
+
+(defun slackit-state-upsert-message (state conversation-id message &optional revision)
+  "Normalize and upsert MESSAGE in CONVERSATION-ID.
+
+Return a canonical change descriptor.  REVISION, when non-nil, is the page
+settlement revision; ordinary realtime and write results allocate one."
+  (slackit-state--upsert-normalized-message
+   state conversation-id
+   (slackit-normalize-message message conversation-id)
+   revision))
+
+(defun slackit-state-message-revision (state conversation-id ts)
+  "Return STATE revision for message identity CONVERSATION-ID and TS."
+  (gethash
+   (slackit-state--message-key conversation-id ts)
+   (slackit-account-state-message-revisions state)))
+
+(defun slackit-state-merge-write-snapshot
+    (state conversation-id message captured-revision)
+  "Merge HTTP write MESSAGE without crossing newer canonical mutations.
+
+CAPTURED-REVISION is the target message revision observed when an edit began.
+For a newly posted message it is nil, so an RTM echo that arrived first remains
+authoritative.  No HTTP write response may clear an observed tombstone."
+  (let* ((normalized (slackit-normalize-message message conversation-id))
+         (ts (slackit-normalize-get normalized 'ts))
+         (key (and ts (slackit-state--message-key conversation-id ts)))
+         (current-revision
+          (and key
+               (gethash key
+                        (slackit-account-state-message-revisions state))))
+         (tombstoned-p
+          (and key (gethash key (slackit-account-state-tombstones state)))))
+    (when (and ts
+               (not tombstoned-p)
+               (if captured-revision
+                   (or (null current-revision)
+                       (<= current-revision captured-revision))
+                 (null current-revision)))
+      (slackit-state--upsert-normalized-message
+       state conversation-id normalized))))
 
 (defun slackit-state-delete-message (state conversation-id ts)
   "Delete message TS from CONVERSATION-ID and record a tombstone."
@@ -308,17 +373,18 @@ message; ordinary realtime and write results allocate a new revision."
       (let* ((normalized (slackit-normalize-message message conversation-id))
              (ts (slackit-normalize-get normalized 'ts))
              (key (slackit-state--message-key conversation-id ts))
-             (message-revision (gethash key
-                                        (slackit-account-state-message-revisions state)
-                                        -1))
-             (tombstone-revision (gethash key
-                                          (slackit-account-state-tombstones state)
-                                          -1)))
+             (message-revision
+              (gethash key
+                       (slackit-account-state-message-revisions state)
+                       -1))
+             (tombstoned-p
+              (gethash key (slackit-account-state-tombstones state))))
         (when (and ts
                    (<= message-revision captured-revision)
-                   (<= tombstone-revision captured-revision))
-          (when-let* ((change (slackit-state-upsert-message
-                               state conversation-id normalized page-revision)))
+                   (not tombstoned-p))
+          (when-let* ((change
+                       (slackit-state--upsert-normalized-message
+                        state conversation-id normalized page-revision)))
             (push change changes)))))))
 
 (defun slackit-state-top-level-keys (state conversation-id)

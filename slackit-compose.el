@@ -48,9 +48,8 @@
                       position appkit-chatbuf-input-object-property input))
              (object-text (get-text-property
                            position appkit-chatbuf-input-object-text-property input))
-             (next (or (next-single-property-change
-                        position appkit-chatbuf-input-object-property input length)
-                       length))
+             (next (appkit-chatbuf-next-input-object-change
+                    position input length))
              (text (substring input position next)))
         (push (if object
                   (concat
@@ -102,14 +101,14 @@
 
 (defun slackit-compose--settle-success
     (app operation view revision input aux conversation-id wire-text
-         thread-ts old-message body)
+         thread-ts old-message captured-message-revision body)
   "Converge a successful composer OPERATION and queue view settlement."
   (when (slackit-runtime-operation-current-p app operation)
     (let* ((state (slackit-runtime-state app))
            (message (slackit-compose--response-message
                      state conversation-id wire-text thread-ts body old-message))
-           (change (slackit-state-upsert-message
-                    state conversation-id message)))
+           (change (slackit-state-merge-write-snapshot
+                    state conversation-id message captured-message-revision)))
       (slackit-runtime-operation-end app operation)
       (when change (slackit-runtime-publish-changes app (list change)))
       (slackit-compose--queue-settlement
@@ -149,6 +148,10 @@
          (old-message (and message-ts
                            (slackit-state-message
                             state conversation-id message-ts)))
+         (captured-message-revision
+          (and message-ts
+               (slackit-state-message-revision
+                state conversation-id message-ts)))
          (key (slackit-compose--operation-key view revision)))
     (when (string-empty-p (string-trim wire-text))
       (user-error "slackit: message is empty"))
@@ -172,7 +175,7 @@
                (slackit-compose--settle-success
                 app operation view revision input aux conversation-id
                 wire-text (slackit-normalize-get old-message 'thread_ts)
-                old-message body))
+                old-message captured-message-revision body))
              :on-error
              (lambda (error-data)
                (slackit-compose--settle-failure
@@ -184,7 +187,7 @@
          (lambda (body)
            (slackit-compose--settle-success
             app operation view revision input aux conversation-id wire-text
-            root-ts nil body))
+            root-ts nil nil body))
          :on-error
          (lambda (error-data)
            (slackit-compose--settle-failure
@@ -210,9 +213,17 @@
 (defun slackit-compose-cancel-context ()
   "Cancel the current reply/edit context and clear its operation draft."
   (interactive)
-  (when (appkit-chatbuf-aux-active-p)
-    (appkit-chatbuf-input-set-text "")
-    (appkit-chatbuf-aux-reset)))
+  (let* ((view (appkit-current-view))
+         (view-id (and (appkit-view-live-p view)
+                       (appkit-view-id view))))
+    (unless (and view-id
+                 (eq (appkit-app-kind (appkit-view-app view))
+                     'slackit-account)
+                 (memq (car-safe view-id) '(room thread)))
+      (user-error "slackit: no live room or thread view"))
+    (when (appkit-chatbuf-aux-active-p)
+      (appkit-chatbuf-input-set-text "")
+      (appkit-chatbuf-aux-reset))))
 
 (provide 'slackit-compose)
 

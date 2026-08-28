@@ -13,6 +13,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'url-parse)
 (require 'slackit-customize)
 
 (defconst slackit-auth--schema-version 1
@@ -28,6 +29,7 @@
 (cl-defstruct (slackit-auth-capture
                (:constructor slackit-auth-capture-create))
   account-id
+  url
   file
   process
   restart-running-p
@@ -134,38 +136,78 @@
       value)))
 
 (defun slackit-auth--valid-identity-p (value)
-  "Return non-nil when optional Slack identity VALUE is safe."
-  (or (null value)
-      (and (stringp value)
-           (string-match-p "\\`[[:alnum:]]+\\'" value))))
+  "Return non-nil when Slack identity VALUE is nonempty and safe."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (string-match-p "\\`[[:alnum:]]+\\'" value)))
 
-(defun slackit-auth--capture-payload (account-id capture-file)
-  "Map private browser-session CAPTURE-FILE to Slack auth for ACCOUNT-ID."
+(defun slackit-auth--canonical-capture-url (value)
+  "Return canonical Slack customize URL for VALUE, or nil when invalid."
+  (when-let* ((raw (slackit-auth--nonblank-string value))
+              (parsed
+               (condition-case nil
+                   (url-generic-parse-url raw)
+                 (error nil)))
+              (host (url-host parsed)))
+    (let ((scheme (downcase (or (url-type parsed) "")))
+          (canonical-host (downcase host))
+          (port (url-port parsed)))
+      (when (and (equal scheme "https")
+                 (slackit-auth--slack-domain-p canonical-host)
+                 (string-match-p
+                  (concat
+                   "\\`[a-z0-9]\\(?:[a-z0-9-]*[a-z0-9]\\)?"
+                   "\\(?:\\.[a-z0-9]"
+                   "\\(?:[a-z0-9-]*[a-z0-9]\\)?\\)*\\'")
+                  canonical-host)
+                 (not (url-user parsed))
+                 (not (url-password parsed))
+                 (or (null port) (= port 443))
+                 (equal (url-filename parsed) "/customize")
+                 (null (url-target parsed)))
+        (format "https://%s/customize" canonical-host)))))
+
+(defun slackit-auth--validated-login-url ()
+  "Return `slackit-login-url' as a canonical safe capture URL."
+  (or (slackit-auth--canonical-capture-url slackit-login-url)
+      (user-error
+       "slackit: login URL must be an HTTPS Slack customize URL")))
+
+(defun slackit-auth--capture-payload
+    (account-id capture-file &optional expected-url)
+  "Map private browser-session CAPTURE-FILE to Slack auth for ACCOUNT-ID.
+EXPECTED-URL defaults to the validated configured Slack login URL."
   (unless (slackit-auth--private-mode-p capture-file)
     (error "Slack browser-session capture is not private"))
   (let* ((capture (browser-session-read capture-file))
          (source (alist-get 'source capture))
-         (page (alist-get 'page capture))
-         (source-url (alist-get 'url source))
-         (token (and (listp page) (alist-get 'token page)))
-         (team-id (and (listp page) (alist-get 'teamId page)))
-         (user-id (and (listp page) (alist-get 'userId page)))
-         (d (slackit-auth--captured-cookie capture "d"))
-         (d-s (slackit-auth--captured-cookie capture "d-s"))
-         (lc (slackit-auth--captured-cookie capture "lc")))
-    (unless (equal source-url slackit-login-url)
+         (source-url
+          (slackit-auth--canonical-capture-url (alist-get 'url source)))
+         (canonical-expected-url
+          (slackit-auth--canonical-capture-url
+           (or expected-url (slackit-auth--validated-login-url)))))
+    (unless (and source-url
+                 canonical-expected-url
+                 (equal source-url canonical-expected-url))
       (error "Slack browser-session capture has the wrong source URL"))
-    (unless (slackit-auth--valid-token-p token)
-      (error "Slack browser session did not provide a valid xoxc token"))
-    (unless (and (slackit-auth--valid-identity-p team-id)
-                 (slackit-auth--valid-identity-p user-id))
-      (error "Slack browser session contains an invalid account identity"))
-    `((schema . ,slackit-auth--schema-version)
-      (account-id . ,account-id)
-      (team-id . ,team-id)
-      (user-id . ,user-id)
-      (token . ,token)
-      (cookies . ((d . ,d) (d-s . ,d-s) (lc . ,lc))))))
+    (let* ((page (alist-get 'page capture))
+           (token (and (listp page) (alist-get 'token page)))
+           (team-id (and (listp page) (alist-get 'teamId page)))
+           (user-id (and (listp page) (alist-get 'userId page)))
+           (d (slackit-auth--captured-cookie capture "d"))
+           (d-s (slackit-auth--captured-cookie capture "d-s"))
+           (lc (slackit-auth--captured-cookie capture "lc")))
+      (unless (slackit-auth--valid-token-p token)
+        (error "Slack browser session did not provide a valid xoxc token"))
+      (unless (and (slackit-auth--valid-identity-p team-id)
+                   (slackit-auth--valid-identity-p user-id))
+        (error "Slack browser session contains an invalid account identity"))
+      `((schema . ,slackit-auth--schema-version)
+        (account-id . ,account-id)
+        (team-id . ,team-id)
+        (user-id . ,user-id)
+        (token . ,token)
+        (cookies . ((d . ,d) (d-s . ,d-s) (lc . ,lc)))))))
 
 (defun slackit-auth--cookie-header (cookies)
   "Return Slack Cookie header value from validated COOKIES alist."
@@ -201,8 +243,10 @@
     (slackit-auth-file account-id) "Slackit account auth file")))
 
 (defun slackit-auth-available-p (account-id)
-  "Return non-nil when ACCOUNT-ID has a readable private auth file."
-  (file-readable-p (slackit-auth-file account-id)))
+  "Return non-nil when ACCOUNT-ID has readable private auth."
+  (let ((file (slackit-auth-file account-id)))
+    (and (file-readable-p file)
+         (slackit-auth--private-mode-p file))))
 
 (defun slackit-auth-credential (account-id)
   "Return runtime credential plist for browser-imported ACCOUNT-ID."
@@ -238,18 +282,22 @@
 
 (defun slackit-auth--assert-same-established-identity (account-id payload)
   "Reject PAYLOAD when it changes ACCOUNT-ID's established Slack identity."
-  (when (slackit-auth-available-p account-id)
+  (when (file-exists-p (slackit-auth-file account-id))
     (let ((current (slackit-auth--read-payload account-id)))
-      (dolist (key '(team-id user-id))
-        (let ((old (alist-get key current))
-              (new (alist-get key payload)))
-          (when (and old new (not (equal old new)))
-            (error "Slack browser session belongs to a different account")))))))
+      (unless (and (equal (alist-get 'team-id current)
+                          (alist-get 'team-id payload))
+                   (equal (alist-get 'user-id current)
+                          (alist-get 'user-id payload)))
+        (error "Slack browser session belongs to a different account")))))
 
-(defun slackit-auth-import-capture (account-id capture-file)
+(defun slackit-auth-import-capture
+    (account-id capture-file &optional expected-url)
   "Import private browser-session CAPTURE-FILE for local ACCOUNT-ID.
+EXPECTED-URL, when non-nil, is the capture owner's canonical login URL.
 Return the resulting runtime credential plist."
-  (let ((payload (slackit-auth--capture-payload account-id capture-file)))
+  (let ((payload
+         (slackit-auth--capture-payload
+          account-id capture-file expected-url)))
     (slackit-auth--assert-same-established-identity account-id payload)
     (slackit-auth--write-payload account-id payload)
     (slackit-auth-credential account-id)))
@@ -268,11 +316,15 @@ Return the resulting runtime credential plist."
                     (delete-dups (delq nil (list loaded source))))
         (user-error "slackit: Slack browser session script is not readable"))))
 
+(defun slackit-auth--captures-directory ()
+  "Return the directory reserved for temporary capture files."
+  (expand-file-name "captures/" slackit-auth-directory))
+
 (defun slackit-auth--capture-file ()
   "Create and return one private temporary browser-session capture file."
-  (let ((directory (slackit-auth--prepare-private-directory
-                    (expand-file-name "captures/"
-                                      slackit-auth-directory))))
+  (let ((directory
+         (slackit-auth--prepare-private-directory
+          (slackit-auth--captures-directory))))
     (let ((file (make-temp-file
                  (expand-file-name ".browser-session-" directory)
                  nil ".json")))
@@ -283,6 +335,40 @@ Return the resulting runtime credential plist."
   "Delete private temporary capture FILE when it exists."
   (when (and (stringp file) (file-exists-p file))
     (ignore-errors (delete-file file))))
+
+(defun slackit-auth--active-capture-owner ()
+  "Return an active Slackit capture owner, or nil."
+  (let (active)
+    (maphash
+     (lambda (_account-id owner)
+       (when (and (not active)
+                  (slackit-auth-capture-p owner)
+                  (slackit-auth-capture-active-p owner))
+         (setq active owner)))
+     slackit-auth--captures)
+    active))
+
+(defun slackit-auth--sweep-orphan-capture-files ()
+  "Delete only unowned private Slackit browser-session capture files."
+  (let ((directory (slackit-auth--captures-directory))
+        owned)
+    (maphash
+     (lambda (_account-id owner)
+       (when (and (slackit-auth-capture-p owner)
+                  (slackit-auth-capture-active-p owner)
+                  (stringp (slackit-auth-capture-file owner)))
+         (push (expand-file-name (slackit-auth-capture-file owner)) owned)))
+     slackit-auth--captures)
+    (when (file-directory-p directory)
+      (dolist (file
+               (directory-files
+                directory t
+                "\\`\\.browser-session-[[:alnum:]]+\\.json\\'" t))
+        (when (and (file-regular-p file)
+                   (not (file-symlink-p file))
+                   (slackit-auth--private-mode-p file)
+                   (not (member (expand-file-name file) owned)))
+          (slackit-auth--delete-capture-file file))))))
 
 (defun slackit-auth-capturing-account-ids ()
   "Return stable account IDs with active browser-session captures."
@@ -328,20 +414,28 @@ Return the resulting runtime credential plist."
     (let ((file (slackit-auth-capture-file owner))
           credential
           failure)
-      (condition-case error-data
+      (condition-case nil
           (setq credential
                 (slackit-auth-import-capture
-                 (slackit-auth-capture-account-id owner) file))
+                 (slackit-auth-capture-account-id owner)
+                 file
+                 (slackit-auth-capture-url owner)))
         (error
          (setq failure
-               `((code . "invalid-slack-session")
-                 (message . ,(error-message-string error-data))))))
+               '((code . "invalid-slack-session")
+                 (message . "Slack browser session could not be imported")))))
       (slackit-auth--retire-owner owner)
       (slackit-auth--delete-capture-file file)
       (if failure
           (slackit-auth--deliver-error owner failure)
         (when-let* ((callback (slackit-auth-capture-callback owner)))
-          (funcall callback credential))))))
+          (condition-case nil
+              (funcall callback credential)
+            (error
+             (slackit-auth--deliver-error
+              owner
+              '((code . "capture-callback-failure")
+                (message . "Slack credential callback failed"))))))))))
 
 (defun slackit-auth--restart-required-p (error)
   "Return non-nil when browser-session ERROR requests a browser restart."
@@ -375,40 +469,45 @@ Return the resulting runtime credential plist."
 When RESTART-RUNNING is non-nil, permit browser-session's supported explicit
 browser restart.  CALLBACK receives a runtime credential plist.  ERRORBACK
 receives a structured non-secret error alist."
-  (when (slackit-auth-capture-running-p account-id)
-    (user-error "slackit: browser login is already running for %s" account-id))
-  (let* ((file (slackit-auth--capture-file))
-         (owner (slackit-auth-capture-create
-                 :account-id account-id
-                 :file file
-                 :restart-running-p restart-running
-                 :callback callback
-                 :errorback errorback
-                 :active-p t)))
-    (puthash account-id owner slackit-auth--captures)
-    (condition-case error-data
-        (let ((process
-               (browser-session-capture
-                :url slackit-login-url
-                :cookies slackit-auth--cookie-names
-                :output-file file
-                :browser slackit-login-browser
-                :profile-root (slackit-auth--profile-root account-id)
-                :script-file (slackit-auth--session-script-file)
-                :restart-running restart-running
-                :callback (apply-partially
-                           #'slackit-auth--finish-success owner)
-                :errorback (apply-partially
-                            #'slackit-auth--finish-error owner))))
-          (if (slackit-auth--owner-current-p owner)
-              (setf (slackit-auth-capture-process owner) process)
-            (when (and (processp process) (process-live-p process))
-              (delete-process process)))
-          process)
-      (error
-       (slackit-auth--retire-owner owner)
-       (slackit-auth--delete-capture-file file)
-       (signal (car error-data) (cdr error-data))))))
+  (when (slackit-auth--active-capture-owner)
+    (user-error "slackit: another browser login is already running"))
+  (let* ((url (slackit-auth--validated-login-url))
+         (profile-root (slackit-auth--profile-root account-id))
+         (script-file (slackit-auth--session-script-file)))
+    (slackit-auth--sweep-orphan-capture-files)
+    (let* ((file (slackit-auth--capture-file))
+           (owner (slackit-auth-capture-create
+                   :account-id account-id
+                   :url url
+                   :file file
+                   :restart-running-p restart-running
+                   :callback callback
+                   :errorback errorback
+                   :active-p t)))
+      (puthash account-id owner slackit-auth--captures)
+      (condition-case error-data
+          (let ((process
+                 (browser-session-capture
+                  :url url
+                  :cookies slackit-auth--cookie-names
+                  :output-file file
+                  :browser slackit-login-browser
+                  :profile-root profile-root
+                  :script-file script-file
+                  :restart-running restart-running
+                  :callback (apply-partially
+                             #'slackit-auth--finish-success owner)
+                  :errorback (apply-partially
+                              #'slackit-auth--finish-error owner))))
+            (if (slackit-auth--owner-current-p owner)
+                (setf (slackit-auth-capture-process owner) process)
+              (when (and (processp process) (process-live-p process))
+                (delete-process process)))
+            process)
+        (error
+         (slackit-auth--retire-owner owner)
+         (slackit-auth--delete-capture-file file)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun slackit-auth-cancel-capture (account-id)
   "Cancel ACCOUNT-ID's current browser-session capture."
@@ -429,6 +528,8 @@ receives a structured non-secret error alist."
     (dolist (account-id account-ids)
       (slackit-auth-cancel-capture account-id)))
   t)
+
+(add-hook 'kill-emacs-hook #'slackit-auth-cancel-all)
 
 (defun slackit-auth-clear (account-id)
   "Delete provider auth for ACCOUNT-ID without changing its browser profile."

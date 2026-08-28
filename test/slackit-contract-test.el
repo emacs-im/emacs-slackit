@@ -764,6 +764,327 @@
             (should (string-match-p "reply" (buffer-string)))
             (should (appkit-chatbuf-prompt-button-live-p))))))))
 
+(ert-deftest slackit-contract-emoji-renders-body-and-actionable-reactions ()
+  (slackit-test-with-app (app "emoji")
+    (let* ((state (slackit-runtime-state app))
+           (message
+            '((channel . "C1")
+              (ts . "1.000001")
+              (user . "U2")
+              (text . "please :pray: :slightly_smiling_face: :unknown:")
+              (reactions
+               . (((name . "pray") (count . 2) (users . ("U1"))))))))
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-user state '((id . "U2") (name . "alice")))
+      (with-temp-buffer
+        (let ((slackit-show-avatars nil)
+              toggled)
+          (cl-letf (((symbol-function 'slackit-reaction-toggle)
+                     (lambda (&rest arguments)
+                       (setq toggled arguments))))
+            (slackit-render-message-row
+             app state message
+             (slackit-room--message-context nil message))
+            (should (string-match-p
+                     "🙏.*🙂.*:unknown:" (buffer-string)))
+            (let ((button (next-button (point-min))))
+              (should button)
+              (button-activate button)
+              (should (equal (list app "C1" "1.000001" "pray")
+                             toggled)))))
+        (should (equal "please :pray: :slightly_smiling_face: :unknown:"
+                       (slackit-normalize-get message 'text)))))))
+
+(ert-deftest slackit-contract-avatar-prefers-circular-derived-image ()
+  (let ((file (make-temp-file "slackit-round-avatar-" nil ".png")))
+    (unwind-protect
+        (slackit-test-with-app (app "round-avatar")
+          (let* ((user
+                  '((id . "U1")
+                    (profile
+                     . ((image_72
+                         . "https://ca.slack-edge.com/avatar.png")))))
+                 (key (slackit-avatar-resource-key app user))
+                 (mtime (file-attribute-modification-time
+                         (file-attributes file))))
+            (clrhash slackit-avatar--sources)
+            (clrhash slackit-avatar--image-cache)
+            (puthash key (list file mtime) slackit-avatar--sources)
+            (cl-letf (((symbol-function
+                        'appkit-media-circular-image-from-file)
+                       (lambda (source size)
+                         (should (equal source file))
+                         (should (= size 32))
+                         'circular-image))
+                      ((symbol-function 'create-image)
+                       (lambda (&rest _arguments)
+                         (ert-fail "square fallback should not run"))))
+              (should (eq 'circular-image
+                          (slackit-avatar-cached-image app user 32))))))
+      (clrhash slackit-avatar--sources)
+      (clrhash slackit-avatar--image-cache)
+      (when (file-exists-p file) (delete-file file)))))
+
+(ert-deftest slackit-contract-media-cards-fetch-only-public-posters ()
+  (slackit-test-with-app (app "media")
+    (let* ((root (make-temp-file "slackit-media-test-" t))
+           (slackit-media-cache-directory
+            (expand-file-name "media/" root))
+           (public-url "https://cdn.example.invalid/public-image.png")
+           (private-url
+            "https://files.slack.com/files-pri/T1/private-image.png")
+           (message
+            `((channel . "C1")
+              (ts . "1.000001")
+              (blocks
+               . (((type . "image")
+                   (block_id . "B1")
+                   (title . ((type . "plain_text")
+                             (text . "Public image")))
+                   (alt_text . "preview")
+                   (image_url . ,public-url))))
+              (files
+               . (((id . "F1")
+                   (name . "private.png")
+                   (mimetype . "image/png")
+                   (permalink . "https://workspace.slack.com/files/U1/F1")
+                   (url_private . ,private-url))))))
+           source)
+      (unwind-protect
+          (progn
+            (clrhash slackit-media--fetches)
+            (clrhash slackit-media--failures)
+            (clrhash slackit-media--image-cache)
+            (cl-letf
+                (((symbol-function
+                   'appkit-media-inline-image-rendering-available-p)
+                  (lambda () t))
+                 ((symbol-function
+                   'appkit-media-cache-image-resource-async)
+                  (lambda (resource _cache _success _failure &rest arguments)
+                    (should-not arguments)
+                    (setq source (alist-get 'url resource))
+                    nil)))
+              (slackit-media-ensure-message app message)
+              (should-not
+               (string-match-p
+                (regexp-quote private-url)
+                (prin1-to-string
+                 (slackit-media-message-resource-keys app message))))
+              (with-temp-buffer
+                (slackit-media-insert-message-cards app message)
+                (should (string-match-p "Public image" (buffer-string)))
+                (should (string-match-p "private.png" (buffer-string)))
+                (should-not (string-match-p
+                             (regexp-quote private-url)
+                             (buffer-string))))))
+        (clrhash slackit-media--fetches)
+        (clrhash slackit-media--failures)
+        (clrhash slackit-media--image-cache)
+        (when (file-directory-p root) (delete-directory root t))))))
+
+(ert-deftest slackit-contract-entity-decoding-is-one-pass ()
+  (should
+   (equal "&lt; < > &"
+          (slackit-render-decode-entities
+           "&amp;lt; &lt; &gt; &amp;"))))
+
+(ert-deftest slackit-contract-adjacent-identical-mentions-stay-distinct ()
+  (let* ((mention
+          (appkit-chatbuf-input-object-string
+           "@same" '(:type user :id "U1" :label "same")))
+         (input (concat mention mention)))
+    (should (equal "<@U1> <@U1> "
+                   (slackit-compose-serialize input)))))
+(ert-deftest slackit-contract-http-write-snapshot-cannot-regress-rtm ()
+  (let ((state (slackit-state-create)))
+    (slackit-state-upsert-message
+     state "C1" '((ts . "1.000001") (text . "old")))
+    (let ((captured
+           (slackit-state-message-revision state "C1" "1.000001")))
+      (slackit-state-upsert-message
+       state "C1" '((ts . "1.000001") (text . "newer RTM edit")))
+      (should-not
+       (slackit-state-merge-write-snapshot
+        state "C1" '((ts . "1.000001") (text . "stale HTTP edit"))
+        captured))
+      (should
+       (equal "newer RTM edit"
+              (slackit-normalize-get
+               (slackit-state-message state "C1" "1.000001") 'text))))
+    (slackit-state-delete-message state "C1" "1.000001")
+    (should-not
+     (slackit-state-merge-write-snapshot
+      state "C1" '((ts . "1.000001") (text . "late HTTP receipt")) nil))
+    (should-not (slackit-state-message state "C1" "1.000001"))))
+
+(ert-deftest slackit-contract-thread-cursor-appends-newer-replies ()
+  (slackit-test-with-app (app "thread-pages")
+    (let ((state (slackit-runtime-state app)))
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-conversation
+       state '((id . "C1") (name . "general")
+               (is_channel . t) (is_member . t)))
+      (slackit-state-upsert-message
+       state "C1" '((channel . "C1") (ts . "1.000001")
+                    (user . "U1") (text . "root")))
+      (cl-letf
+          (((symbol-function 'slackit-api-conversation-replies)
+            (lambda (_app _conversation _root &rest arguments)
+              (let ((cursor (plist-get arguments :cursor)))
+                (funcall
+                 (plist-get arguments :on-success)
+                 (if cursor
+                     '((messages
+                        . (((channel . "C1") (ts . "1.000003")
+                            (thread_ts . "1.000001") (user . "U1")
+                            (text . "later reply"))))
+                       (response_metadata . ((next_cursor . ""))))
+                   '((messages
+                      . (((channel . "C1") (ts . "1.000001")
+                          (user . "U1") (text . "root"))
+                         ((channel . "C1") (ts . "1.000002")
+                          (thread_ts . "1.000001") (user . "U1")
+                          (text . "early reply"))))
+                     (response_metadata . ((next_cursor . "next"))))))))))
+        (let ((view (slackit-thread-open app "C1" "1.000001" nil)))
+          (with-current-buffer (appkit-view-buffer view)
+            (should (equal "1.000001"
+                           (appkit-chat-history-window-first-key)))
+            (should (equal "1.000002"
+                           (appkit-chat-history-window-last-key)))
+            (slackit-room-load-older)
+            (appkit-sync-invalidations view)
+            (should-not (appkit-chat-history-window-last-key))
+            (should (equal '("1.000001" "1.000002" "1.000003")
+                           (appkit-chat-timeline-keys)))
+            (should (string-match-p "later reply" (buffer-string)))))))))
+
+(ert-deftest slackit-contract-dm-labels-never-pretend-to-be-channels ()
+  (let ((state (slackit-state-create)))
+    (slackit-state-put-user state '((id . "U2") (name . "alice")))
+    (slackit-state-put-conversation
+     state '((id . "D1") (user . "U2") (is_im . t) (is_member . t)))
+    (should (equal "alice" (slackit-state-conversation-label state "D1")))
+    (should-not
+     (string-prefix-p "#"
+                      (slackit-room--header state "D1")))))
+
+(ert-deftest slackit-contract-capture-rejects-unsafe-origin-and-missing-identity ()
+  (slackit-test-with-auth-directory (root)
+    (let ((slackit-login-url "http://my.slack.com/customize")
+          called)
+      (cl-letf (((symbol-function 'browser-session-capture)
+                 (lambda (&rest _arguments) (setq called t))))
+        (should-error (slackit-auth-capture "work") :type 'user-error)
+        (should-not called)))
+    (let ((capture (make-temp-file
+                    (expand-file-name "capture-" root) nil ".json")))
+      (slackit-test--write-private-json
+       capture (slackit-test--capture-payload :team-id nil))
+      (should-error (slackit-auth-import-capture "work" capture))
+      (should-not (slackit-auth-available-p "work"))
+      (delete-file capture))))
+
+(ert-deftest slackit-contract-browser-capture-is-globally-serialized ()
+  (slackit-test-with-auth-directory (_root)
+    (cl-letf (((symbol-function 'browser-session-capture)
+               (lambda (&rest _arguments) nil)))
+      (slackit-auth-capture "first")
+      (should-error (slackit-auth-capture "second") :type 'user-error)
+      (should (slackit-auth-capture-running-p "first"))
+      (should-not (slackit-auth-capture-running-p "second")))))
+
+(ert-deftest slackit-contract-pinned-auth-identity-rejects-bootstrap-mismatch ()
+  (let* ((app
+          (slackit-runtime-start-account
+           "identity"
+           (list :token "xoxp-CANARY"
+                 :cookie "xoxd-CANARY"
+                 :team-id "T1"
+                 :user-id "U1")))
+         (operation
+          (slackit-runtime-operation-begin app '(bootstrap))))
+    (unwind-protect
+        (progn
+          (slackit--bootstrap-identity-success
+           app operation
+           '((team_id . "T2") (user_id . "U2")
+             (team . "wrong") (user . "wrong")))
+          (should
+           (equal "identity_mismatch"
+                  (slackit-account-state-bootstrap-error
+                   (slackit-runtime-state app))))
+          (should-not
+           (slackit-state-self-id (slackit-runtime-state app))))
+      (slackit-runtime-stop-account app))))
+
+(ert-deftest slackit-contract-evil-preserves-native-motions-and-composer ()
+  (unless (require 'evil nil t)
+    (ert-skip "Evil development dependency unavailable"))
+  (require 'slackit-evil)
+  (slackit-evil-setup)
+  (with-temp-buffer
+    (slackit-room-mode)
+    (evil-normal-state)
+    (slackit-room-timeline-mode 1)
+    (appkit-evil-normalize-keymaps)
+    (should (eq (key-binding (kbd "g g")) #'evil-goto-first-line))
+    (should (eq (key-binding (kbd "e")) #'evil-forward-word-end))
+    (should (eq (key-binding (kbd "i")) #'appkit-chatbuf-focus-input))
+    (should (eq (key-binding (kbd "E")) #'slackit-actions-edit))
+    (slackit-room-timeline-mode -1)
+    (appkit-evil-normalize-keymaps)
+    (should (eq (key-binding (kbd "i")) #'evil-insert))))
+
+(ert-deftest slackit-contract-transients-retain-exact-message-scope ()
+  (slackit-test-with-app (app "transient")
+    (let ((state (slackit-runtime-state app))
+          (kill-ring nil))
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-conversation
+       state '((id . "C1") (name . "general")
+               (is_channel . t) (is_member . t)))
+      (cl-letf
+          (((symbol-function 'slackit-api-conversation-history)
+            (lambda (_app _conversation &rest arguments)
+              (funcall
+               (plist-get arguments :on-success)
+               '((messages
+                  . (((channel . "C1") (ts . "1.000001")
+                      (user . "U1") (text . "scoped text"))))
+                 (response_metadata . ((next_cursor . ""))))))))
+        (let* ((view (slackit-room-open app "C1" nil))
+               scope)
+          (with-current-buffer (appkit-view-buffer view)
+            (goto-char (point-min))
+            (let ((match
+                   (text-property-search-forward
+                    slackit-message-key-property "1.000001" #'equal)))
+              (should match)
+              (goto-char (prop-match-beginning match)))
+            (setq scope (slackit-transient--capture-room-scope t)))
+          (with-temp-buffer
+            (slackit-transient-actions-copy-text scope))
+          (should (equal "scoped text" (current-kill 0 t)))
+          (slackit-runtime-stop-account app)
+          (should-error
+           (slackit-transient-actions-copy-text scope)
+           :type 'user-error))))))
+
+(ert-deftest slackit-contract-mpim-mark-events-normalize-read-state ()
+  (should
+   (equal '(:kind conversation-mark
+            :conversation-id "G1"
+            :ts "2.000001")
+          (slackit-normalize-event
+           '((type . "mpim_marked")
+             (channel . "G1")
+             (ts . "2.000001"))))))
+
 (provide 'slackit-contract-test)
 
 ;;; slackit-contract-test.el ends here

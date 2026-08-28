@@ -16,6 +16,10 @@
 (depends-on "browser-session" :file "../browser-session")
 (depends-on "plz" "0.8")
 (depends-on "websocket" "1.16")
+(depends-on "transient" "0.7")
+
+(development
+ (depends-on "evil"))
 
 (script "test" "eask test ert --quiet test/*.el")
 (script "test-local"

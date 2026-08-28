@@ -176,7 +176,8 @@
               :ts (slackit-normalize--string-field item 'ts)
               :reaction (slackit-normalize--string-field payload 'reaction)
               :user-id (slackit-normalize--string-field payload 'user))))
-     ((member type '("channel_marked" "group_marked" "im_marked"))
+     ((member type '("channel_marked" "group_marked" "im_marked"
+                     "mpim_marked"))
       (list :kind 'conversation-mark
             :conversation-id (slackit-normalize--string-field payload 'channel)
             :ts (slackit-normalize--string-field payload 'ts)))

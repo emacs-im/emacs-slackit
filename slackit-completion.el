@@ -14,6 +14,7 @@
 (require 'subr-x)
 (require 'appkit-chatbuf)
 (require 'appkit-chat-completion)
+(require 'slackit-render)
 (require 'slackit-runtime)
 (require 'slackit-state)
 
@@ -88,8 +89,7 @@
      (plist-get bounds :start)
      (plist-get bounds :end)
      candidates
-     :insert-function #'slackit-completion--insert-candidate
-     :suffix " ")))
+     :insert-function #'slackit-completion--insert-candidate)))
 
 (defun slackit-completion-user-capf ()
   "Complete an @user token in the current composer."
@@ -105,7 +105,6 @@
     (appkit-chatbuf-focus-input))
   (slackit-completion--insert-candidate
    (appkit-chat-completion-read prompt candidates))
-  (insert " ")
   (appkit-chatbuf-input-state-sync))
 
 (defun slackit-completion-user ()
@@ -120,13 +119,6 @@
   (slackit-completion--insert-read-candidate
    "Mention channel: " (slackit-completion--channel-candidates)))
 
-(defun slackit-completion--decode-entities (text)
-  "Decode Slack entities in editable TEXT."
-  (let ((result (or text "")))
-    (dolist (entry '(("&amp;" . "&") ("&lt;" . "<") ("&gt;" . ">")))
-      (setq result (replace-regexp-in-string
-                    (regexp-quote (car entry)) (cdr entry) result t t)))
-    result))
 
 (defun slackit-completion-decode-wire (state text)
   "Return Slack wire TEXT with known references as structured objects."
@@ -136,7 +128,7 @@
                 (string-match
                  "<\\([@#]\\)\\([[:alnum:]]+\\)\\(?:|[^>]*\\)?>"
                  text position))
-      (push (slackit-completion--decode-entities
+      (push (slackit-render-decode-entities
              (substring text position (match-beginning 0)))
             parts)
       (let* ((kind (if (equal (match-string 1 text) "@") 'user 'channel))
@@ -151,7 +143,7 @@
       (when (and (< position (length text))
                  (eq (aref text position) ?\s))
         (setq position (1+ position))))
-    (push (slackit-completion--decode-entities
+    (push (slackit-render-decode-entities
            (substring (or text "") position))
           parts)
     (apply #'concat (nreverse parts))))

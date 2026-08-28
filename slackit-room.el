@@ -23,6 +23,8 @@
 (require 'slackit-history)
 (require 'slackit-runtime)
 (require 'slackit-state)
+(require 'slackit-avatar)
+(require 'slackit-media)
 
 (declare-function slackit-compose-submit "slackit-compose" ())
 (declare-function slackit-compose-apply-settlement "slackit-compose" (event))
@@ -33,6 +35,8 @@
 (declare-function slackit-render-message-row
                   "slackit-render" (app state message context))
 (declare-function slackit-render-reference-dependencies "slackit-render" (text))
+(declare-function slackit-render-avatar-subject
+                  "slackit-render" (state message))
 (declare-function slackit-actions-open-thread "slackit-actions" ())
 (declare-function slackit-actions-edit "slackit-actions" ())
 (declare-function slackit-actions-delete "slackit-actions" ())
@@ -43,6 +47,9 @@
                   "slackit-runtime" (app user-id))
 (declare-function slackit-avatar-resource-key
                   "slackit-avatar" (app user))
+(declare-function slackit-avatar-ensure "slackit-avatar" (app user))
+(declare-function slackit-room-transient "slackit-transient" (&optional scope))
+(declare-function slackit-actions-transient "slackit-transient" (&optional scope))
 
 (defconst slackit-message-key-property 'slackit-message-ts
   "Text property identifying one rendered Slack message row.")
@@ -50,19 +57,26 @@
 (defvar-local slackit-room--conversation-id nil
   "Exact Slack conversation ID owned by this room buffer.")
 
-(defvar-local slackit-room--app nil
-  "Exact Slackit application owned by this room buffer.")
+
+(defun slackit-room-current-view ()
+  "Return the exact live Slackit room or thread view."
+  (let* ((view (appkit-current-view))
+         (id (and (appkit-view-p view) (appkit-view-id view)))
+         (app (and (appkit-view-p view) (appkit-view-app view))))
+    (unless (and (appkit-view-live-p view)
+                 (eq (appkit-app-kind app) 'slackit-account)
+                 (memq (car-safe id) '(room thread))
+                 (eq (appkit-view-buffer view) (current-buffer)))
+      (user-error "slackit: this command requires a live Slackit chat view"))
+    view))
 
 (defun slackit-room-current-app ()
   "Return the current room's live Slackit application."
-  (or (and (appkit-app-live-p slackit-room--app) slackit-room--app)
-      (when-let* ((view (appkit-current-view))) (appkit-view-app view))
-      (user-error "slackit: room has no live account")))
+  (appkit-view-app (slackit-room-current-view)))
 
 (defun slackit-room-current-conversation-id ()
   "Return the current room's exact conversation ID."
-  (or slackit-room--conversation-id
-      (user-error "slackit: room has no conversation")))
+  (nth 1 (appkit-view-id (slackit-room-current-view))))
 
 (defun slackit-room-message-ts-at-point ()
   "Return Slack message timestamp at point, or nil."
@@ -83,6 +97,7 @@
     (define-key map (kbd "g") #'slackit-room-refresh)
     (define-key map (kbd "M-p") #'slackit-room-load-older)
     (define-key map (kbd "q") #'quit-window)
+    (define-key map (kbd "?") #'slackit-actions-transient)
     map)
   "Keymap active over Slackit room generated content.")
 
@@ -98,6 +113,8 @@
     (define-key map (kbd "C-c C-o") #'slackit-room-load-older)
     (define-key map (kbd "C-c C-u") #'slackit-completion-user)
     (define-key map (kbd "C-c #") #'slackit-completion-channel)
+    (define-key map (kbd "C-c ?") #'slackit-room-transient)
+    (define-key map (kbd "C-c m") #'slackit-actions-transient)
     (define-key map (kbd "TAB") #'appkit-chat-completion-complete)
     map)
   "Keymap for `slackit-room-mode'.")
@@ -112,9 +129,9 @@
 
 (defun slackit-room--header (state conversation-id)
   "Return room header for STATE and CONVERSATION-ID."
-  (let* ((name (slackit-state-conversation-name state conversation-id))
-         (status (slackit-account-state-connection-status state)))
-    (propertize (format "#%s   [%s]\n\n" name status)
+  (let ((label (slackit-state-conversation-label state conversation-id))
+        (status (slackit-account-state-connection-status state)))
+    (propertize (format "%s   [%s]\n\n" label status)
                 'read-only t)))
 
 (defun slackit-room--footer ()
@@ -126,7 +143,11 @@
                  "Message action")
       :cancel-action #'slackit-compose-cancel-context))
    (appkit-chat-history-delimiter-string
-    (max 20 (or fill-column 80))
+    (max 20
+         (or (appkit-view-responsive-width
+              slackit-room-auto-fill-margin-columns)
+             fill-column
+             80))
     :loading-text "loading Slack history…")
    (when slackit-history--error
      (format "\nHistory error: %s" slackit-history--error))
@@ -171,12 +192,29 @@
                   (slackit-state-message state conversation-id ts))
                 (slackit-state-top-level-keys state conversation-id))))
 
-(defun slackit-room--ensure-user-resources (app resources)
-  "Request unknown Slack users named by Appkit RESOURCES for APP."
-  (dolist (resource resources)
-    (when (eq (car-safe resource) :user)
-      (slackit-runtime-ensure-user app (cadr resource))))
-  resources)
+(defun slackit-room--message-resources (app state message)
+  "Return and ensure opaque Appkit resources for APP MESSAGE from STATE."
+  (let* ((user-id (slackit-normalize-get message 'user))
+         (subject (slackit-render-avatar-subject state message))
+         (resources
+          (delete-dups
+           (delq nil
+                 (append
+                  (list
+                   (and user-id (list :user user-id))
+                   (and subject
+                        (slackit-avatar-resource-key app subject)))
+                  (slackit-render-reference-dependencies
+                   (slackit-normalize-get message 'text))
+                  (slackit-media-message-resource-keys app message))))))
+    (when user-id
+      (slackit-runtime-ensure-user app user-id))
+    (when (and slackit-show-avatars
+               (display-graphic-p)
+               subject)
+      (slackit-avatar-ensure app subject))
+    (slackit-media-ensure-message app message)
+    resources))
 
 (defun slackit-room--message-epoch (message)
   "Return numeric presentation time for MESSAGE's opaque Slack timestamp."
@@ -250,19 +288,7 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
          (slackit-room--message-context previous message first-unread)))
      :dependencies-function
      (lambda (message)
-       (let* ((user-id (slackit-normalize-get message 'user))
-              (user (and user-id (slackit-state-user state user-id)))
-              (dependencies
-               (delete-dups
-                (delq nil
-                      (append
-                       (list
-                        (and user-id (list :user user-id))
-                        (and user
-                             (slackit-avatar-resource-key app user)))
-                       (slackit-render-reference-dependencies
-                        (slackit-normalize-get message 'text)))))))
-         (slackit-room--ensure-user-resources app dependencies))))))
+       (slackit-room--message-resources app state message)))))
 
 (defun slackit-room--render (&optional force-keys resources)
   "Synchronize the current room, forcing FORCE-KEYS and RESOURCES."
@@ -350,24 +376,23 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
      (slackit-room--invalidation-force-keys invalidations)
      (appkit-invalidations-resource-keys invalidations))))
 
-(defun slackit-room--setup (conversation-id app _view)
-  "Initialize a newly attached room for CONVERSATION-ID and APP."
-  (setq-local slackit-room--conversation-id conversation-id
-              slackit-room--app app)
+(defun slackit-room--setup (conversation-id _app _view)
+  "Initialize a newly attached room for CONVERSATION-ID."
+  (setq-local slackit-room--conversation-id conversation-id)
   (slackit-history-init))
 
 (defun slackit-room-open (app conversation-id &optional select)
   "Open APP's CONVERSATION-ID room and optionally SELECT it."
   (let* ((state (slackit-runtime-state app))
-         (name (slackit-state-conversation-name state conversation-id))
+         (label (slackit-state-conversation-label state conversation-id))
          (view-id (list 'room conversation-id))
          (existing (appkit-view-for-id app view-id))
          (view (appkit-open-view
                 :app app
                 :id view-id
                 :mode 'slackit-room-mode
-                :buffer-name (format "*Slackit:%s:#%s*"
-                                     (appkit-app-id app) name)
+                :buffer-name (format "*Slackit:%s:%s*"
+                                     (appkit-app-id app) label)
                 :state conversation-id
                 :sync-function #'slackit-room--sync
                 :parts '(frame timeline composer geometry)
@@ -377,8 +402,7 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
     (slackit-room--configure-responsive-view
      view #'slackit-room--sync)
     (with-current-buffer (appkit-view-buffer view)
-      (setq-local slackit-room--conversation-id conversation-id
-                  slackit-room--app app)
+      (setq-local slackit-room--conversation-id conversation-id)
       (unless existing
         (slackit-history-load-latest view conversation-id)
         (appkit-invalidate view :structure t)
@@ -387,10 +411,9 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
     view))
 
 (defun slackit-room-load-older ()
-  "Load the current room's next older history page."
+  "Load the current room-history or thread-replies next page."
   (interactive)
-  (let* ((view (or (appkit-current-view)
-                   (user-error "slackit: no live room view")))
+  (let* ((view (slackit-room-current-view))
          (id (appkit-view-id view))
          (root-ts (and (eq (car-safe id) 'thread) (nth 2 id))))
     (slackit-history-load-older
@@ -398,10 +421,9 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
     (appkit-request-sync view :part 'frame)))
 
 (defun slackit-room-refresh ()
-  "Replace current room exact history with a fresh latest page."
+  "Replace current room or thread history with a fresh first page."
   (interactive)
-  (let* ((view (or (appkit-current-view)
-                   (user-error "slackit: no live room view")))
+  (let* ((view (slackit-room-current-view))
          (id (appkit-view-id view))
          (root-ts (and (eq (car-safe id) 'thread) (nth 2 id))))
     (appkit-chat-history-window-clear)

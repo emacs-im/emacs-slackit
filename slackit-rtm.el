@@ -366,15 +366,21 @@
 (defun slackit-rtm--capability-success (app generation body)
   "Open APP RTM capability when connection GENERATION remains current."
   (when (slackit-rtm--generation-current-p app generation)
-    (let ((url (slackit-normalize-get body 'url))
-          (team (slackit-normalize-get body 'team))
-          (self (slackit-normalize-get body 'self)))
-      (when (and team self)
-        (slackit-state-put-team-self (slackit-runtime-state app) team self))
-      (if (slackit-rtm-valid-url-p url)
-          (slackit-rtm--open app url)
+    (let* ((url (slackit-normalize-get body 'url))
+           (team (slackit-normalize-get body 'team))
+           (self (slackit-normalize-get body 'self))
+           (team-id (slackit-normalize-get team 'id))
+           (user-id (slackit-normalize-get self 'id)))
+      (cond
+       ((not (slackit-runtime-credential-identity-matches-p
+              app team-id user-id))
+        (slackit-rtm--publish-connection app 'protocol-error))
+       ((slackit-rtm-valid-url-p url)
+        (slackit-state-put-team-self (slackit-runtime-state app) team self)
+        (slackit-rtm--open app url))
+       (t
         (slackit-rtm--publish-connection app 'protocol-error)
-        (slackit-rtm--schedule-reconnect app)))))
+        (slackit-rtm--schedule-reconnect app))))))
 
 (defun slackit-rtm--request-capability (app)
   "Request and open a fresh RTM capability for APP."

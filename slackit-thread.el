@@ -22,8 +22,8 @@
 (require 'slackit-room)
 (require 'slackit-runtime)
 (require 'slackit-state)
-(declare-function slackit-room--ensure-user-resources
-                  "slackit-room" (app resources))
+(declare-function slackit-room--message-resources
+                  "slackit-room" (app state message))
 (declare-function slackit-room--message-context
                   "slackit-room" (previous message &optional unread-divider))
 (declare-function slackit-room--configure-responsive-view
@@ -47,14 +47,16 @@
 
 (defun slackit-thread--header (state conversation-id root-ts)
   "Return header for thread ROOT-TS in CONVERSATION-ID from STATE."
-  (let* ((room (slackit-state-conversation-name state conversation-id))
+  (let* ((room-label
+          (slackit-state-conversation-label state conversation-id))
          (root (slackit-state-message state conversation-id root-ts))
          (sender (and root
                       (slackit-state-user-name
                        state (slackit-normalize-get root 'user)))))
     (propertize
-     (format "#%s thread %s%s   [%s]\n\n"
-             room root-ts (if sender (format " — %s" sender) "")
+     (format "%s thread %s%s   [%s]\n\n"
+             room-label root-ts
+             (if sender (format " — %s" sender) "")
              (slackit-account-state-connection-status state))
      'read-only t)))
 
@@ -66,7 +68,7 @@
                 (slackit-state-reply-keys state conversation-id root-ts))))
 
 (defun slackit-thread--project (app state messages)
-  "Project thread MESSAGES from STATE into stable Appkit rows owned by APP."
+  "Project thread MESSAGES into stable Appkit rows owned by APP."
   (appkit-chat-timeline-project
    messages
    (lambda (message) (slackit-normalize-get message 'ts))
@@ -75,19 +77,7 @@
      (slackit-room--message-context previous message))
    :dependencies-function
    (lambda (message)
-     (let* ((user-id (slackit-normalize-get message 'user))
-            (user (and user-id (slackit-state-user state user-id)))
-            (dependencies
-             (delete-dups
-              (delq nil
-                    (append
-                     (list
-                      (and user-id (list :user user-id))
-                      (and user
-                           (slackit-avatar-resource-key app user)))
-                     (slackit-render-reference-dependencies
-                      (slackit-normalize-get message 'text)))))))
-       (slackit-room--ensure-user-resources app dependencies)))))
+     (slackit-room--message-resources app state message))))
 
 (defun slackit-thread--ensure-timeline ()
   "Ensure the current thread owns one Appkit timeline."
@@ -175,10 +165,9 @@
      (slackit-room--invalidation-force-keys invalidations)
      (appkit-invalidations-resource-keys invalidations))))
 
-(defun slackit-thread--setup (app conversation-id root-ts _view)
-  "Initialize one newly attached APP thread view."
-  (setq-local slackit-room--app app
-              slackit-room--conversation-id conversation-id
+(defun slackit-thread--setup (_app conversation-id root-ts _view)
+  "Initialize one newly attached thread view."
+  (setq-local slackit-room--conversation-id conversation-id
               slackit-thread--root-ts root-ts)
   (slackit-history-init))
 
@@ -187,7 +176,7 @@
   (unless (slackit-state-message
            (slackit-runtime-state app) conversation-id root-ts)
     (user-error "slackit: thread root no longer exists"))
-  (let* ((name (slackit-state-conversation-name
+  (let* ((label (slackit-state-conversation-label
                 (slackit-runtime-state app) conversation-id))
          (view-id (list 'thread conversation-id root-ts))
          (existing (appkit-view-for-id app view-id))
@@ -195,8 +184,8 @@
                 :app app
                 :id view-id
                 :mode 'slackit-thread-mode
-                :buffer-name (format "*Slackit:%s:#%s:thread %s*"
-                                     (appkit-app-id app) name root-ts)
+                :buffer-name (format "*Slackit:%s:%s:thread %s*"
+                                     (appkit-app-id app) label root-ts)
                 :state (cons conversation-id root-ts)
                 :sync-function #'slackit-thread--sync
                 :parts '(frame timeline composer geometry)
@@ -207,8 +196,7 @@
     (slackit-room--configure-responsive-view
      view #'slackit-thread--sync)
     (with-current-buffer (appkit-view-buffer view)
-      (setq-local slackit-room--app app
-                  slackit-room--conversation-id conversation-id
+      (setq-local slackit-room--conversation-id conversation-id
                   slackit-thread--root-ts root-ts)
       (unless existing
         (slackit-history-load-latest view conversation-id root-ts)
@@ -217,15 +205,6 @@
       (appkit-view-refresh-responsive-geometry))
     view))
 
-(defun slackit-thread-load-older ()
-  "Load next older page in the current thread."
-  (interactive)
-  (let ((view (or (appkit-current-view)
-                  (user-error "slackit: no live thread view"))))
-    (slackit-history-load-older
-     view (slackit-room-current-conversation-id)
-     (slackit-thread-current-root-ts))
-    (appkit-request-sync view :part 'frame)))
 
 (provide 'slackit-thread)
 

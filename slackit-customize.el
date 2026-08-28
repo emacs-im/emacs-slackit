@@ -78,8 +78,8 @@ must not be logged."
   :type 'integer
   :group 'slackit)
 
-(defcustom slackit-show-avatars (display-graphic-p)
-  "When non-nil, show cached Slack profile images in room message rows."
+(defcustom slackit-show-avatars t
+  "When non-nil, show Slack profile images in graphical room views."
   :type 'boolean
   :group 'slackit)
 

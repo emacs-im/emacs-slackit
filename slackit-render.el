@@ -21,17 +21,27 @@
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'slackit-avatar)
+(require 'slackit-emoji)
+(require 'slackit-media)
 (require 'slackit-normalize)
 (require 'slackit-state)
 
-(defun slackit-render--decode-entities (text)
-  "Decode Slack's supported HTML entities in TEXT."
-  (let ((result (or text "")))
-    (dolist (entry '(("&amp;" . "&") ("&lt;" . "<") ("&gt;" . ">")
-                     ("&quot;" . "\"") ("&#39;" . "'")))
-      (setq result (replace-regexp-in-string
-                    (regexp-quote (car entry)) (cdr entry) result t t)))
-    result))
+(declare-function slackit-reaction-toggle
+                  "slackit-reaction"
+                  (app conversation-id ts name))
+
+(defun slackit-render-decode-entities (text)
+  "Decode Slack's supported HTML entities in TEXT exactly once."
+  (replace-regexp-in-string
+   "&\\(?:amp\\|lt\\|gt\\|quot\\|#39\\);"
+   (lambda (entity)
+     (pcase entity
+       ("&amp;" "&")
+       ("&lt;" "<")
+       ("&gt;" ">")
+       ("&quot;" "\"")
+       ("&#39;" "'")))
+   (or text "") t t))
 
 (defun slackit-render--safe-link-p (url)
   "Return non-nil when URL has an explicitly supported safe scheme."
@@ -56,21 +66,27 @@
       (list 'text (concat "@" (slackit-state-user-name state id)))))
    ((string-match "\\`#\\([[:alnum:]]+\\)\\(?:|\\(.*\\)\\)?\\'" token)
     (let* ((id (match-string 1 token))
-           (fallback (match-string 2 token))
+           (fallback (and (match-string 2 token)
+                          (slackit-render-decode-entities
+                           (match-string 2 token))))
            (known (slackit-state-conversation state id)))
       (list 'text (concat "#" (if known
                                   (slackit-state-conversation-name state id)
                                 (or fallback id))))))
    ((string-match "\\`!subteam\\^\\([^|]+\\)\\(?:|\\(.*\\)\\)?\\'" token)
-    (list 'text (or (match-string 2 token)
-                    (concat "@" (match-string 1 token)))))
+    (list 'text
+          (if-let* ((fallback (match-string 2 token)))
+              (slackit-render-decode-entities fallback)
+            (concat "@" (match-string 1 token)))))
    ((string-match "\\`!date\\^[^|]+|\\(.*\\)\\'" token)
-    (list 'text (match-string 1 token)))
+    (list 'text (slackit-render-decode-entities (match-string 1 token))))
    ((string-match "\\`!\\(channel\\|here\\|everyone\\)\\'" token)
     (list 'text (concat "@" (match-string 1 token))))
    ((string-match "\\`\\(https?://[^|]+\\|mailto:[^|]+\\)\\(?:|\\(.*\\)\\)?\\'" token)
-    (let ((url (match-string 1 token))
-          (label (match-string 2 token)))
+    (let* ((url (slackit-render-decode-entities (match-string 1 token)))
+           (label (and (match-string 2 token)
+                       (slackit-render-decode-entities
+                        (match-string 2 token)))))
       (list 'link (or label url) url)))
    (t (list 'text (concat "<" token ">")))))
 
@@ -93,11 +109,11 @@
           (if end
               (progn
                 (insert (propertize
-                         (slackit-render--decode-entities
+                         (slackit-render-decode-entities
                           (substring source (+ position 3) end))
                          'face 'font-lock-comment-face))
                 (setq position (+ end 3)))
-            (insert (slackit-render--decode-entities
+            (insert (slackit-render-decode-entities
                      (substring source position)))
             (setq position length))))
        ((eq (aref source position) ?`)
@@ -105,7 +121,7 @@
           (if end
               (progn
                 (insert (propertize
-                         (slackit-render--decode-entities
+                         (slackit-render-decode-entities
                           (substring source (1+ position) end))
                          'face 'font-lock-constant-face))
                 (setq position (1+ end)))
@@ -124,8 +140,10 @@
         (let* ((next-angle (or (cl-position ?< source :start position) length))
                (next-code (or (cl-position ?` source :start position) length))
                (end (min next-angle next-code)))
-          (insert (slackit-render--decode-entities
-                   (substring source position end)))
+          (insert
+           (slackit-emoji-substitute
+            (slackit-render-decode-entities
+             (substring source position end))))
           (setq position end)))))))
 
 (defun slackit-render-reference-dependencies (text)
@@ -155,6 +173,21 @@
       (slackit-normalize-get message 'username)
       (slackit-normalize-get message 'bot_id)
       "unknown"))
+
+(defun slackit-render-avatar-subject (state message)
+  "Return canonical avatar subject for MESSAGE from STATE, or nil."
+  (or (when-let* ((user-id (slackit-normalize-get message 'user)))
+        (slackit-state-user state user-id))
+      (let* ((bot-profile (slackit-normalize-get message 'bot_profile))
+             (icons (slackit-normalize-get bot-profile 'icons))
+             (bot-id (or (slackit-normalize-get message 'bot_id)
+                         (slackit-normalize-get bot-profile 'id))))
+        (when (and bot-id icons)
+          `((id . ,bot-id)
+            (profile
+             . ((image_72 . ,(slackit-normalize-get icons 'image_72))
+                (image_48 . ,(slackit-normalize-get icons 'image_48))
+                (image_32 . ,(slackit-normalize-get icons 'image_32)))))))))
 
 (defun slackit-render--sender-face (state message)
   "Return deterministic highlighted sender face for MESSAGE in STATE."
@@ -204,23 +237,28 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
     (format "[%s]" (upcase (concat (or first "?") (or second ""))))))
 
 (defun slackit-render--avatar-prefixes (app state message)
-  "Return Telega-style avatar prefixes for APP MESSAGE in STATE."
-  (let* ((user-id (slackit-normalize-get message 'user))
-         (user (and user-id (slackit-state-user state user-id)))
+  "Return two-line circular avatar prefixes for APP MESSAGE in STATE."
+  (let* ((subject (slackit-render-avatar-subject state message))
+         (subject-id (and subject (slackit-normalize-get subject 'id)))
          (name (slackit-render--sender-name state message))
-         (image (and user (slackit-avatar-image app user)))
+         (pixel-size (appkit-chat-avatar-two-line-pixel-size))
+         (image
+          (and slackit-show-avatars
+               (display-graphic-p)
+               subject
+               (slackit-avatar-cached-image app subject pixel-size)))
          (prefixes
           (appkit-chat-avatar-prefixes
            image
            (slackit-render--avatar-placeholder name)
-           :pixel-size (appkit-chat-avatar-two-line-pixel-size)
-           :resize t)))
+           :pixel-size pixel-size
+           :resize nil)))
     (dolist (key '(:header :first-body))
       (let ((prefix (copy-sequence (plist-get prefixes key))))
         (when (and (stringp prefix) (> (length prefix) 0))
           (add-text-properties
            0 (length prefix)
-           (list 'slackit-user-id user-id
+           (list 'slackit-user-id subject-id
                  'help-echo name
                  'mouse-face 'highlight)
            prefix))
@@ -232,40 +270,53 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
   (appkit-chat-ins-insert-divider-row
    text face (slackit-render--line-fill-column)))
 
-(defun slackit-render--insert-files (message)
-  "Insert safe non-fetching file summaries for MESSAGE."
-  (dolist (file (or (slackit-normalize-get message 'files) nil))
-    (let* ((name (or (slackit-normalize-get file 'name)
-                     (slackit-normalize-get file 'title)
-                     (slackit-normalize-get file 'id)
-                     "file"))
-           (type (or (slackit-normalize-get file 'pretty_type)
-                     (slackit-normalize-get file 'mimetype)
-                     (slackit-normalize-get file 'filetype)))
-           (permalink (or (slackit-normalize-get file 'permalink)
-                          (slackit-normalize-get file 'permalink_public))))
-      (insert "  [file] ")
-      (if permalink
-          (slackit-render--insert-link name permalink)
-        (insert name))
-      (when type (insert (format " (%s)" type)))
-      (insert "\n"))))
+(defun slackit-render--reaction-label (reaction)
+  "Return one display label for normalized REACTION."
+  (let* ((name (or (slackit-normalize-get reaction 'name) "?"))
+         (emoji (slackit-emoji-display-string name))
+         (count (or (slackit-normalize-get reaction 'count) 0)))
+    (format "%s %s" (or emoji (format ":%s:" name)) count)))
 
-(defun slackit-render--insert-reactions (state message)
-  "Insert text reaction summary for MESSAGE using STATE self identity."
-  (let ((self-id (slackit-state-self-id state))
-        (reactions (slackit-normalize-get message 'reactions)))
-    (when reactions
-      (insert "  ")
-      (dolist (reaction reactions)
-        (let* ((name (or (slackit-normalize-get reaction 'name) "?"))
-               (count (or (slackit-normalize-get reaction 'count) 0))
-               (self-p (member self-id
-                               (slackit-normalize-get reaction 'users))))
-          (insert (propertize
-                   (format ":%s: %s%s  " name count (if self-p "*" ""))
-                   'face 'slackit-reaction))))
-      (insert "\n"))))
+(defun slackit-render--reaction-selected-p (self-id reaction)
+  "Return non-nil when SELF-ID selected normalized REACTION."
+  (and self-id
+       (member self-id (slackit-normalize-get reaction 'users))))
+
+(defun slackit-render--reaction-help (self-id reaction)
+  "Return action help for SELF-ID and normalized REACTION."
+  (let ((name (or (slackit-normalize-get reaction 'name) "?")))
+    (format "%s :%s:"
+            (if (slackit-render--reaction-selected-p self-id reaction)
+                "Remove reaction"
+              "Add reaction")
+            name)))
+
+(defun slackit-render--toggle-reaction
+    (app conversation-id ts reaction)
+  "Toggle normalized REACTION on exact APP CONVERSATION-ID and TS."
+  (when-let* ((name (slackit-normalize-get reaction 'name)))
+    (slackit-reaction-toggle app conversation-id ts name)))
+
+(defun slackit-render--insert-reactions (app state message)
+  "Insert actionable emoji reaction chips for APP MESSAGE using STATE."
+  (let ((reactions (slackit-normalize-get message 'reactions))
+        (self-id (slackit-state-self-id state))
+        (conversation-id (slackit-normalize-get message 'channel))
+        (ts (slackit-normalize-get message 'ts)))
+    (appkit-chat-ins-insert-reaction-line
+     reactions
+     :prefix "  "
+     :selected-face '(slackit-reaction bold)
+     :unselected-face 'slackit-reaction
+     :label-function #'slackit-render--reaction-label
+     :selected-p-function
+     (apply-partially #'slackit-render--reaction-selected-p self-id)
+     :action-function
+     (and conversation-id ts
+          (apply-partially
+           #'slackit-render--toggle-reaction app conversation-id ts))
+     :help-echo-function
+     (apply-partially #'slackit-render--reaction-help self-id))))
 
 (defun slackit-render--insert-primary-content (state message)
   "Insert MESSAGE subtype marker and primary content from STATE."
@@ -275,7 +326,8 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
                (not (member subtype '("thread_broadcast" "me_message"))))
       (insert (propertize (format "[%s] " subtype) 'face 'slackit-status)))
     (if (string-empty-p text)
-        (when (slackit-normalize-get message 'blocks)
+        (when (and (slackit-normalize-get message 'blocks)
+                   (not (slackit-media-message-media-only-p message)))
           (insert (propertize "[Unsupported Block Kit content]"
                               'face 'slackit-status)))
       (when (equal subtype "me_message") (insert "* "))
@@ -343,12 +395,12 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
            (car time-span) (cdr time-span)
            (list 'help-echo (slackit-render--clock timestamp)))))
       (insert "\n")
-      (slackit-render--insert-files message)
+      (slackit-media-insert-message-cards app message)
       (when-let* ((count (slackit-normalize-get message 'reply_count)))
         (when (> (or count 0) 0)
           (insert (propertize (format "  [%d replies]\n" count)
                               'face 'slackit-status))))
-      (slackit-render--insert-reactions state message)
+      (slackit-render--insert-reactions app state message)
       (appkit-ui-apply-line-prefix
        body-start (point) body-prefix-state))))
 

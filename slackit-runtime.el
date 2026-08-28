@@ -21,7 +21,9 @@
 (cl-defstruct (slackit-credential
                (:constructor slackit-credential-create))
   token
-  cookie)
+  cookie
+  team-id
+  user-id)
 
 (cl-defstruct (slackit-transport
                (:constructor slackit-transport-create))
@@ -85,6 +87,24 @@
     (error "slackit: invalid account transport"))
   (appkit-app-transport app))
 
+(defun slackit-runtime-credential-identity-matches-p
+    (app team-id user-id)
+  "Return non-nil when TEAM-ID and USER-ID match APP's pinned identity.
+
+Session-only credentials without pinned identity accept any nonempty identity."
+  (let* ((transport (slackit-runtime-transport app))
+         (credential (slackit-transport-credential transport))
+         (expected-team-id
+          (and credential (slackit-credential-team-id credential)))
+         (expected-user-id
+          (and credential (slackit-credential-user-id credential))))
+    (and (stringp team-id)
+         (not (string-empty-p team-id))
+         (stringp user-id)
+         (not (string-empty-p user-id))
+         (or (null expected-team-id) (equal expected-team-id team-id))
+         (or (null expected-user-id) (equal expected-user-id user-id)))))
+
 (defun slackit-runtime-generation (app)
   "Return APP's account-lifecycle callback generation."
   (slackit-transport-generation (slackit-runtime-transport app)))
@@ -103,10 +123,12 @@
               (= generation (slackit-transport-generation transport))))))
 
 (defun slackit-runtime--clear-credential (transport)
-  "Erase secret references held by TRANSPORT."
+  "Erase credential references held by TRANSPORT."
   (when-let* ((credential (slackit-transport-credential transport)))
     (setf (slackit-credential-token credential) nil
-          (slackit-credential-cookie credential) nil))
+          (slackit-credential-cookie credential) nil
+          (slackit-credential-team-id credential) nil
+          (slackit-credential-user-id credential) nil))
   (setf (slackit-transport-credential transport) nil
         (slackit-transport-capability-url transport) nil
         (slackit-transport-reconnect-url transport) nil))
@@ -137,14 +159,19 @@
     (user-error "slackit: account ID must be a non-empty string"))
   (or (slackit-runtime-account account-id)
       (let* ((token (plist-get credential :token))
-             (cookie (plist-get credential :cookie)))
+             (cookie (plist-get credential :cookie))
+             (team-id (plist-get credential :team-id))
+             (user-id (plist-get credential :user-id)))
         (unless (and (stringp token) (not (string-empty-p token)))
           (user-error "slackit: account %s has no token" account-id))
         (let* ((state (slackit-state-create))
                (transport
                 (slackit-transport-create
                  :credential (slackit-credential-create
-                              :token token :cookie cookie)
+                              :token token
+                              :cookie cookie
+                              :team-id team-id
+                              :user-id user-id)
                  :generation 1
                  :connection-generation 0
                  :reconnect-attempt 0
@@ -310,23 +337,42 @@ already cached or is not a Slack user identity."
   "Enqueue canonical CHANGE and invalidate matching live VIEW."
   (let* ((id (appkit-view-id view))
          (view-kind (car-safe id))
+         (chat-p (memq view-kind '(room thread)))
          (kind (plist-get change :kind))
          (conversation-id (plist-get change :conversation-id))
+         (conversation-match-p
+          (slackit-runtime--view-matches-conversation-p
+           view conversation-id))
          (ts (plist-get change :ts))
          (user-id (plist-get change :user-id)))
     (cond
      ((eq view-kind 'root)
-      (when (memq kind '(connection bootstrap user conversation read))
+      (cond
+       ((and conversation-id
+             (memq kind
+                   '(message-create message-update message-delete read)))
         (appkit-view-enqueue-event view change)
-        (appkit-request-sync view :structure t)))
-     ((and (slackit-runtime--view-matches-conversation-p
-            view conversation-id)
-           (memq kind '(message-create message-update message-delete reaction read)))
+        (appkit-request-sync view :entry conversation-id))
+       ((memq kind '(connection bootstrap user conversation))
+        (appkit-view-enqueue-event view change)
+        (appkit-request-sync view :structure t))))
+     ((and conversation-match-p
+           (memq kind
+                 '(message-create message-update message-delete reaction read)))
       (appkit-view-enqueue-event view change)
       (if (memq kind '(message-create message-delete))
           (appkit-request-sync view :structure t :position t)
         (appkit-request-sync view :entry ts :position t)))
-     ((and (memq view-kind '(room thread)) (eq kind 'user))
+     ((and chat-p (eq kind 'connection))
+      (appkit-view-enqueue-event view change)
+      (appkit-request-sync view :part 'frame))
+     ((and chat-p (eq kind 'conversation))
+      (appkit-view-enqueue-event view change)
+      (appkit-request-sync
+       view
+       :part (and conversation-match-p 'frame)
+       :resource (list :conversation conversation-id)))
+     ((and chat-p (eq kind 'user))
       (appkit-view-enqueue-event view change)
       (appkit-request-sync view :resource (list :user user-id))))))
 

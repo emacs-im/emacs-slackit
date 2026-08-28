@@ -5,7 +5,7 @@
 ;; Author: Slackit contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (appkit "0.2.18") (browser-session "0.1.0") (plz "0.8") (websocket "1.16"))
+;; Package-Requires: ((emacs "29.1") (appkit "0.2.18") (browser-session "0.1.0") (plz "0.8") (transient "0.7") (websocket "1.16"))
 ;; URL: https://github.com/emacs-slack/emacs-slackit
 
 ;;; Commentary:
@@ -28,6 +28,8 @@
 (require 'slackit-api)
 (require 'slackit-rtm)
 (require 'slackit-history)
+(require 'slackit-emoji)
+(require 'slackit-media)
 (require 'slackit-render)
 (require 'slackit-completion)
 (require 'slackit-compose)
@@ -37,6 +39,10 @@
 (require 'slackit-read)
 (require 'slackit-actions)
 (require 'slackit-root)
+(require 'slackit-transient)
+
+(with-eval-after-load 'evil
+  (require 'slackit-evil))
 
 (defun slackit--bootstrap-failure (app operation error-data)
   "Settle APP bootstrap OPERATION with redacted ERROR-DATA."
@@ -58,15 +64,21 @@
 (defun slackit--bootstrap-identity-success (app operation body)
   "Reduce auth.test BODY for current APP bootstrap OPERATION."
   (when (slackit-runtime-operation-current-p app operation)
-    (let* ((state (slackit-runtime-state app))
-           (team `((id . ,(slackit-normalize-get body 'team_id))
-                   (name . ,(slackit-normalize-get body 'team))))
-           (self `((id . ,(slackit-normalize-get body 'user_id))
-                   (name . ,(slackit-normalize-get body 'user)))))
-      (slackit-state-put-team-self state team self)
-      (slackit-state-put-user state self)
-      (slackit-state-set-bootstrap-complete state 'identity)
-      (slackit--bootstrap-maybe-complete app operation))))
+    (let ((team-id (slackit-normalize-get body 'team_id))
+          (user-id (slackit-normalize-get body 'user_id)))
+      (if (not (slackit-runtime-credential-identity-matches-p
+                app team-id user-id))
+          (slackit--bootstrap-failure
+           app operation '(:code "identity_mismatch"))
+        (let* ((state (slackit-runtime-state app))
+               (team `((id . ,team-id)
+                       (name . ,(slackit-normalize-get body 'team))))
+               (self `((id . ,user-id)
+                       (name . ,(slackit-normalize-get body 'user)))))
+          (slackit-state-put-team-self state team self)
+          (slackit-state-put-user state self)
+          (slackit-state-set-bootstrap-complete state 'identity)
+          (slackit--bootstrap-maybe-complete app operation))))))
 
 
 (defun slackit--bootstrap-conversations-page (app operation conversations)
@@ -232,6 +244,8 @@ When CREDENTIAL is nil, resolve it through
       (if (string-empty-p value)
           (user-error "slackit: account ID is required")
         value))))
+  (when (slackit-auth-capture-running-p account-id)
+    (user-error "slackit: browser login is running for %s" account-id))
   (when (yes-or-no-p
          (format "Delete private Slackit auth for %s? " account-id))
     (when-let* ((app (slackit-runtime-account account-id)))
