@@ -49,10 +49,19 @@
   (slackit-state-set-connection-status (slackit-runtime-state app) status)
   (slackit-runtime-publish-changes app (list (list :kind 'connection))))
 
+(defun slackit-rtm--generation-current-p (app generation)
+  "Return non-nil when APP owns RTM connection GENERATION."
+  (and (appkit-app-live-p app)
+       (let ((transport (appkit-app-transport app)))
+         (and (slackit-transport-p transport)
+              (not (slackit-transport-stopping-p transport))
+              (= generation
+                 (slackit-transport-connection-generation transport))))))
+
 (defun slackit-rtm--timer-current-p (owner field)
   "Return non-nil when timer OWNER is current in transport FIELD."
   (and (slackit-rtm-timer-p owner)
-       (slackit-runtime-current-p
+       (slackit-rtm--generation-current-p
         (slackit-rtm-timer-app owner)
         (slackit-rtm-timer-generation owner))
        (eq owner
@@ -72,7 +81,7 @@
   "Create an APP-owned timer of KIND calling CALLBACK with its owner."
   (let* ((owner (slackit-rtm-timer-create
                  :app app
-                 :generation (slackit-runtime-generation app)
+                 :generation (slackit-runtime-connection-generation app)
                  :kind kind
                  :token token))
          (handle (appkit-register-handle
@@ -140,7 +149,7 @@
          (transport (and (appkit-app-p app) (appkit-app-transport app)))
          (owned (slackit-rtm-connection-websocket connection))
          (handle (slackit-rtm-connection-handle connection)))
-    (and (slackit-runtime-current-p
+    (and (slackit-rtm--generation-current-p
           app (slackit-rtm-connection-generation connection))
          (slackit-transport-p transport)
          (eq connection (slackit-transport-connection transport))
@@ -174,12 +183,12 @@
   "Revoke the old socket generation and begin one APP connection attempt."
   (let ((transport (slackit-runtime-transport app)))
     (slackit-rtm--disconnect-current app)
-    (setf (slackit-transport-generation transport)
-          (1+ (slackit-transport-generation transport))
+    (setf (slackit-transport-connection-generation transport)
+          (1+ (slackit-transport-connection-generation transport))
           (slackit-transport-ready-p transport) nil
           (slackit-transport-stopping-p transport) nil)
     (slackit-rtm--publish-connection app 'connecting)
-    (slackit-transport-generation transport)))
+    (slackit-transport-connection-generation transport)))
 
 (defun slackit-rtm--send-json (app payload)
   "Send PAYLOAD through APP's current open WebSocket."
@@ -300,7 +309,7 @@
   "Open APP WebSocket using exact validated capability URL."
   (unless (slackit-rtm-valid-url-p url)
     (error "slackit: rejected RTM capability URL"))
-  (let* ((generation (slackit-runtime-generation app))
+  (let* ((generation (slackit-runtime-connection-generation app))
          (transport (slackit-runtime-transport app))
          (connection (slackit-rtm-connection-create
                       :app app :generation generation))
@@ -355,8 +364,8 @@
        nil))))
 
 (defun slackit-rtm--capability-success (app generation body)
-  "Open APP RTM capability from BODY when GENERATION remains current."
-  (when (slackit-runtime-current-p app generation)
+  "Open APP RTM capability when connection GENERATION remains current."
+  (when (slackit-rtm--generation-current-p app generation)
     (let ((url (slackit-normalize-get body 'url))
           (team (slackit-normalize-get body 'team))
           (self (slackit-normalize-get body 'self)))
@@ -369,13 +378,13 @@
 
 (defun slackit-rtm--request-capability (app)
   "Request and open a fresh RTM capability for APP."
-  (let ((generation (slackit-runtime-generation app)))
+  (let ((generation (slackit-runtime-connection-generation app)))
     (slackit-api-rtm-connect
      app
      :on-success (lambda (body)
                    (slackit-rtm--capability-success app generation body))
      :on-error (lambda (_error)
-                 (when (slackit-runtime-current-p app generation)
+                 (when (slackit-rtm--generation-current-p app generation)
                    (slackit-rtm--publish-connection app 'disconnected)
                    (slackit-rtm--schedule-reconnect app))))))
 
@@ -402,8 +411,8 @@
 (defun slackit-rtm--schedule-reconnect (app)
   "Schedule at most one bounded reconnect attempt for APP."
   (let ((transport (slackit-runtime-transport app)))
-    (when (and (slackit-runtime-current-p
-                app (slackit-runtime-generation app))
+    (when (and (slackit-rtm--generation-current-p
+                app (slackit-runtime-connection-generation app))
                (null (slackit-transport-reconnect-timer transport)))
       (let* ((attempt (slackit-transport-reconnect-attempt transport))
              (delay (slackit-rtm--reconnect-delay attempt))

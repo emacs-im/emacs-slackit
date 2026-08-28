@@ -41,49 +41,70 @@ needed for the first slice.
 * Account identity and credentials
 
 One registered Slack account owns one =slackit-account= Appkit application.
-The public registration shape is:
+=ACCOUNT-ID= is required, local, stable, and chosen by the user.  It identifies
+the Appkit application and appears in buffer names.  A Slack team ID and self
+user ID learned during capture/bootstrap are protocol facts, not lifecycle
+identities: one workspace can contain more than one configured user account.
+
+The default interactive entry point is:
 
 #+begin_src emacs-lisp
-(slackit-register-account
- :id "work"
- :token (auth-source-pick-first-password
-         :host "work.slack.com"
-         :user "me@example.com")
- :cookie (auth-source-pick-first-password
-          :host "work.slack.com"
-          :user "me@example.com^cookie"))
+(slackit-login "work")
 #+end_src
 
-=:id= is required, local, stable, and chosen by the user.  It identifies the
-Appkit application and appears in buffer names.  A Slack team ID and self user
-ID learned during connection are protocol facts, not lifecycle identities:
-they may be unavailable before bootstrap and one workspace can contain more
-than one configured user account.
+Slackit uses the required =browser-session= package to open an account-isolated
+login profile at =https://my.slack.com/customize=.  That page exposes the
+=TS.boot_data= contract consumed by =slackit-session.js=; the
+=https://app.slack.com/= landing page may authenticate successfully without
+exposing the token and therefore must not be the capture target.
+=browser-session= owns browser discovery, CDP/BiDi, isolated profile lifecycle,
+cookie capture, and the private versioned capture file.  Slackit owns the
+explicit =d=/=d-s=/=lc= allowlist, provider page script, Slack
+origin/domain/value validation, and mapping to its own credential schema.
+Provider logic never enters =browser-session=.
+
+The provider page script returns nil until =TS.boot_data.api_token= exposes an
+=xoxc-= token; when Slack exposes team/user IDs, the script records those too.
+Cookie values and the page result exist only in the private capture file.
+=browser-session= callbacks receive non-secret metadata.
+
+After capture, Slackit explicitly reads the file, requires the configured
+source URL, exactly one secure root-path cookie of each allowed name from a
+=slack.com= domain, a valid =xoxc-= token, and compatible previously established
+team/user identities.  It atomically writes a schema-versioned per-account auth
+file with mode =0600= beneath =slackit-auth-directory=, then deletes the capture
+file.  Per-account browser profiles remain available for later reauthentication;
+clearing Slackit auth does not silently sign the browser out.
+
+=M-x slackit= starts browser login when the selected account lacks private auth.
+=M-x slackit-register-account= remains a session-only headless fallback, and
+=slackit-credential-function= remains replaceable for deliberate auth-source or
+automation integrations.  Manual token/cookie input is not the recommended
+desktop workflow.
 
 Credentials are an account-local bundle, never global URL-library state.
-Tokens, cookies, RTM capability URLs, and response bodies are never used in
-Appkit IDs, view IDs, state keys, buffer names, errors, or logs.  Diagnostics
-redact headers, URL queries/fragments, request/response bodies, and WebSocket
-URLs before formatting them.
+Tokens, cookies, RTM capability URLs, capture contents, and response bodies are
+never used in Appkit IDs, view IDs, state keys, buffer names, errors, or logs.
+Diagnostics redact headers, URL queries/fragments, request/response bodies, and
+WebSocket URLs before formatting them.
 
 The credential router is origin- and endpoint-class-aware.  Only fixed Web API
 requests to =https://slack.com/api/= receive the account bearer token and
-optional =xoxc= cookie.  Redirects, media URLs, and presigned upload URLs never
-inherit those credentials.  Cookies are account-local, so two =xoxc= accounts
-cannot share a cookie jar.
+=xoxc= cookie bundle.  Redirects, media URLs, and presigned upload URLs never
+inherit those credentials.  Cookies and login profiles are account-local.
 
 The first realtime transport calls =rtm.connect=, validates the returned URL as
 an allowed =wss= Slack capability URL, opens that exact URL, and treats receipt
 of RTM =hello= as connection readiness.  The capability URL is secret and is
-never logged.  Heartbeat/pong timeout, =reconnect_url= adoption, bounded
+never logged.  Hello/heartbeat/pong timeout, =reconnect_url= adoption, bounded
 reconnect backoff, and one pending reconnect attempt per live generation are
-part of the first delivery, not later reliability work.
+part of the first delivery.
 
 Only idempotent reads may honor server =Retry-After= automatically, with a
 bounded account/view-owned delay.  =chat.postMessage= and every other write are
 sent once; timeout or an unknown outcome is surfaced without automatic retry.
-Interactive OAuth, token refresh, Socket Mode, and enterprise-token selection
-are outside the first slice.
+OAuth, token refresh, Socket Mode, and enterprise-token selection remain
+outside the first slice; browser-session imports an existing browser login.
 
 * Ownership model
 
@@ -92,19 +113,27 @@ are outside the first slice.
 The Appkit application owns:
 
 - one canonical =slackit-account-state=;
-- one =slackit-transport= with connection generation, WebSocket, capability
-  URL, heartbeat/reconnect timers, and connection status;
+- one =slackit-transport= with distinct account-lifecycle and RTM-connection
+  generations, WebSocket, capability URL, heartbeat/reconnect timers, and
+  connection status;
 - cursor-complete account bootstrap for users and joined conversations;
 - account-wide writes, including send, edit, delete, reaction, and mark-read
-  operations, which must settle even if their originating room closes;
+  operations, which must settle even if their originating room closes or RTM
+  reconnects;
 - the root, room, and thread views for that account.
 
-Stopping an account increments its transport generation before calling
+HTTP requests and account operations capture the account-lifecycle generation.
+RTM capability callbacks, WebSockets, and liveness/reconnect timers capture the
+independent RTM-connection generation.  Beginning a socket attempt increments
+only the latter; otherwise RTM startup/reconnect would silently retire
+in-flight bootstrap, history, and write callbacks.
+
+Stopping an account increments both generations before calling
 =appkit-stop-app=.  Appkit then cancels its WebSocket, timers, HTTP processes,
-and views.  The generation bump cannot live only in the app-kind shutdown
-callback because Appkit invokes that callback after normal owner cleanup.  A
-callback captures the exact application object and generation; matching only a
-reused local account ID is insufficient.
+and views.  Generation bumps cannot live only in the app-kind shutdown callback
+because Appkit invokes that callback after normal owner cleanup.  A callback
+captures the exact application object and its owning generation; matching only
+a reused local account ID is insufficient.
 
 There is no dynamically global “current Slack team” for callbacks.  Interactive
 commands may remember a default account ID for selection, but every operation
@@ -315,6 +344,7 @@ controllers become a =disco-room.el=-sized unit.
 |--------+-----------|
 | =slackit.el= | Package entry point, registration/start/stop commands, cursor-complete bootstrap |
 | =slackit-customize.el= | User options, faces, and redacted diagnostic policy |
+| =slackit-auth.el= | Browser capture ownership, Slack mapping, private auth persistence, credential loading |
 | =slackit-runtime.el= | Account registry, Appkit apps, operation ownership, view invalidation dispatch |
 | =slackit-state.el= | Canonical account store, revisions, tombstones, idempotent reducers, queries |
 | =slackit-normalize.el= | JSON normalization, safe file/reaction summaries, message/event classification |
@@ -341,39 +371,42 @@ empty extension scaffolds.
 The first delivery is intentionally larger than a transport demonstration.  It
 is complete only when one or more registered accounts can:
 
-1. start independently from stable local account IDs with account-local,
+1. capture an existing Slack browser login through account-isolated
+   =browser-session= profiles, import only =d=/=d-s=/=lc= plus the page token,
+   persist private versioned auth, and delete the temporary capture;
+2. start independently from stable local account IDs with account-local,
    origin-bound credentials and secret-free diagnostics;
-2. consume all users/conversations cursors, project loading/error/readiness
+3. consume all users/conversations cursors, project loading/error/readiness
    honestly, and honor bounded =Retry-After= only for idempotent reads;
-3. reach RTM =hello=, maintain ping/pong, adopt =reconnect_url=, reconnect with a
+4. reach RTM =hello=, maintain ping/pong, adopt =reconnect_url=, reconnect with a
    generation fence, and keep user/conversation metadata current;
-4. open an Appkit directory root and the exact account-owned conversation room;
-5. load the latest exact message window, page older with the returned cursor,
+5. open an Appkit directory root and the exact account-owned conversation room;
+6. load the latest exact message window, page older with the returned cursor,
    and merge pages safely against later RTM edits/deletes;
-6. render Slack text references, safe links/code, explicit unsupported content,
+7. render Slack text references, safe links/code, explicit unsupported content,
    and non-fetching file summaries;
-7. complete =@user= and =#channel= as structured exact-ID composer objects;
-8. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
+8. complete =@user= and =#channel= as structured exact-ID composer objects;
+9. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
    marked, user, and joined-conversation lifecycle events;
-9. send room text and reconcile HTTP/RTM arrival in either order without an
-   optimistic row or automatic write retry;
-10. open a stable thread view, load/page replies, receive reply mutations, and
+10. send room text and reconcile HTTP/RTM arrival in either order without an
+    optimistic row or automatic write retry;
+11. open a stable thread view, load/page replies, receive reply mutations, and
     send a reply;
-11. edit and delete an owned message with revision/tombstone-safe settlement;
-12. render, add, and remove text reactions with REST/RTM race safety;
-13. advance and explicitly mark read only through an authoritative reached row,
+12. edit and delete an owned message with revision/tombstone-safe settlement;
+13. render, add, and remove text reactions with REST/RTM race safety;
+14. advance and explicitly mark read only through an authoritative reached row,
     without =client.counts= or fabricated unread badges;
-14. stop with no live Slackit WebSocket, timer, request, operation, or view left
-    behind; and
-15. coexist in one Emacs process with the existing =slack= package.
+15. stop with no live Slackit WebSocket, timer, request, operation, login
+    capture, or view left behind; and
+16. coexist in one Emacs process with the existing =slack= package.
 
 Deferred after this slice: rich Block Kit/attachments, rich WYSIWYG, file/media
 download/preview/upload, avatars, custom emoji images/catalogs, global search,
 notifications, unread/modeline count summaries, typing, presence, DND,
 thread subscription/activity endpoints, pins/saved items, scheduled messages,
-workspace administration, interactive OAuth/token refresh/Socket Mode, and
-optimistic local timeline rows.  Unsupported content remains visible without
-silently expanding any deferred transport surface.
+workspace administration, OAuth/token refresh/Socket Mode, enterprise-token
+selection, and optimistic local timeline rows.  Unsupported content remains
+visible without silently expanding any deferred transport surface.
 
 * Contract checks
 
@@ -385,6 +418,14 @@ Implementation should defend these observable contracts:
   state, requests, operations, completions, marks, or views;
 - canary credentials never appear in identities, rendered buffers, errors, or
   diagnostics, and cross-origin/redirect/media URLs receive no Slack secrets;
+- capture callbacks and diagnostics contain no secret values; imported auth and
+  temporary capture files are private; capture files are deleted on success,
+  failure, cancellation, and synchronous startup errors;
+- two accounts never share a browser profile root or auth path, and a later
+  capture cannot silently replace an established different team/user identity;
+- captures with a wrong source URL, non-Slack cookie domain, duplicate/missing
+  cookie, unsafe cookie value, unsupported schema, or non-=xoxc= page token are
+  rejected without persisting credentials;
 - two-page users and conversations fixtures do not become ready after page one;
 - RTM readiness requires =hello=; only one reconnect attempt exists per live
   generation; stop/restart makes every prior callback inert;

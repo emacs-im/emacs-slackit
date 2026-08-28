@@ -8,13 +8,41 @@
 
 ;;; Code:
 
-(require 'auth-source)
 (require 'subr-x)
+
+(declare-function slackit-auth-credential "slackit-auth" (account-id))
 
 (defgroup slackit nil
   "Appkit-based Slack client."
   :group 'applications
   :prefix "slackit-")
+
+(defcustom slackit-auth-directory
+  (locate-user-emacs-file "slackit/accounts/")
+  "Directory containing Slackit's private per-account auth files."
+  :type 'directory
+  :group 'slackit)
+
+(defcustom slackit-login-url "https://my.slack.com/customize"
+  "Slack page opened for browser-session login capture.
+The customize page exposes the `TS.boot_data' contract consumed by
+`slackit-session.js'; the app client landing page does not."
+  :type 'string
+  :group 'slackit)
+
+(defcustom slackit-login-browser nil
+  "Browser executable or browser-session browser name used for Slack login.
+When nil, browser-session selects its supported default browser."
+  :type '(choice (const :tag "Automatic" nil) string)
+  :group 'slackit)
+
+(defcustom slackit-browser-session-profile-root
+  (locate-user-emacs-file "slackit/browser-session/")
+  "Root containing account-isolated browser-session login profiles.
+Slackit appends a hash of the stable local account ID.  This must not name an
+ordinary browser profile directory."
+  :type 'directory
+  :group 'slackit)
 
 (defcustom slackit-account-ids nil
   "Stable local account IDs offered by `slackit'.
@@ -25,11 +53,13 @@ cookies."
   :type '(repeat string)
   :group 'slackit)
 
-(defcustom slackit-credential-function #'slackit-auth-source-credential
+(defcustom slackit-credential-function #'slackit-auth-credential
   "Function called with a local account ID to obtain credentials.
 
-The function returns a plist containing `:token' and optionally
-`:cookie'.  Returned values are account-local and must not be logged."
+The default reads Slackit's private browser-imported auth file.  Advanced
+headless users may replace it with an auth-source resolver.  The function
+returns a plist containing `:token' and optionally `:cookie'; returned values
+must not be logged."
   :type 'function
   :group 'slackit)
 
@@ -109,23 +139,6 @@ The function returns a plist containing `:token' and optionally
   "Face for Slackit loading and connection status."
   :group 'slackit)
 
-(defun slackit-auth-source-credential (account-id)
-  "Return credentials for ACCOUNT-ID from auth-source.
-
-The lookup uses host `slack.com' and ACCOUNT-ID as the user.  The
-secret is the Slack token.  An optional nonstandard `cookie' field is
-accepted for xoxc accounts."
-  (let* ((entry (car (auth-source-search :host "slack.com"
-                                         :user account-id
-                                         :max 1
-                                         :require '(:secret))))
-         (secret (plist-get entry :secret))
-         (token (if (functionp secret) (funcall secret) secret))
-         (cookie (plist-get entry :cookie)))
-    (unless (and (stringp token) (not (string-empty-p token)))
-      (user-error "slackit: no auth-source token for account %s" account-id))
-    (list :token token
-          :cookie (and (stringp cookie) cookie))))
 
 (provide 'slackit-customize)
 

@@ -24,6 +24,7 @@
                (:constructor slackit-transport-create))
   credential
   generation
+  connection-generation
   websocket
   connection
   capability-url
@@ -82,8 +83,13 @@
   (appkit-app-transport app))
 
 (defun slackit-runtime-generation (app)
-  "Return APP's current transport generation."
+  "Return APP's account-lifecycle callback generation."
   (slackit-transport-generation (slackit-runtime-transport app)))
+
+(defun slackit-runtime-connection-generation (app)
+  "Return APP's RTM connection-attempt generation."
+  (slackit-transport-connection-generation
+   (slackit-runtime-transport app)))
 
 (defun slackit-runtime-current-p (app generation)
   "Return non-nil when APP and GENERATION still own callback publication."
@@ -137,6 +143,7 @@
                  :credential (slackit-credential-create
                               :token token :cookie cookie)
                  :generation 1
+                 :connection-generation 0
                  :reconnect-attempt 0
                  :next-message-id 1
                  :ready-p nil
@@ -150,21 +157,25 @@
           app))))
 
 (defun slackit-runtime-revoke-generation (app)
-  "Revoke all callbacks in APP's current transport generation."
+  "Revoke account callbacks and RTM connection ownership for APP."
   (let ((transport (slackit-runtime-transport app)))
     (setf (slackit-transport-stopping-p transport) t
           (slackit-transport-ready-p transport) nil
           (slackit-transport-generation transport)
-          (1+ (slackit-transport-generation transport)))
+          (1+ (slackit-transport-generation transport))
+          (slackit-transport-connection-generation transport)
+          (1+ (slackit-transport-connection-generation transport)))
     (slackit-state-set-connection-status
      (slackit-runtime-state app) 'stopped)
     (slackit-transport-generation transport)))
 
 (defun slackit-runtime-begin-generation (app)
-  "Begin a fresh callback generation for live APP."
+  "Begin a fresh account lifecycle and RTM generation for live APP."
   (let ((transport (slackit-runtime-transport app)))
     (setf (slackit-transport-generation transport)
           (1+ (slackit-transport-generation transport))
+          (slackit-transport-connection-generation transport)
+          (1+ (slackit-transport-connection-generation transport))
           (slackit-transport-stopping-p transport) nil
           (slackit-transport-ready-p transport) nil
           (slackit-transport-reconnect-attempt transport) 0)

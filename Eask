@@ -11,11 +11,12 @@
 (source "gnu")
 (source 'melpa)
 
-(depends-on "emacs" "28.1")
+(depends-on "emacs" "29.1")
 (depends-on "appkit" :file "../appkit.el")
+(depends-on "browser-session" :file "../browser-session")
 (depends-on "plz" "0.8")
 (depends-on "websocket" "1.16")
 
 (script "test" "eask test ert --quiet test/*.el")
 (script "test-local"
-        "eask -f install-file ../appkit.el && eask recompile && eask test ert --quiet test/*.el")
+        "eask -f install-file ../appkit.el && eask -f install-file ../browser-session && eask recompile && eask test ert --quiet test/*.el")

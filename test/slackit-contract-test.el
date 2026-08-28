@@ -24,6 +24,178 @@
        (dolist (buffer buffers)
          (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
+(cl-defmacro slackit-test-with-auth-directory ((root) &rest body)
+  "Run BODY with isolated Slackit auth/profile storage under ROOT."
+  (declare (indent 1))
+  `(let* ((,root (make-temp-file "slackit-auth-test-" t))
+          (slackit-auth-directory (expand-file-name "accounts/" ,root))
+          (slackit-browser-session-profile-root
+           (expand-file-name "profiles/" ,root))
+          (slackit-login-url "https://my.slack.com/customize"))
+     (unwind-protect
+         (progn ,@body)
+       (slackit-auth-cancel-all)
+       (when (file-directory-p ,root)
+         (delete-directory ,root t)))))
+
+(cl-defun slackit-test--capture-payload
+    (&key
+     (token "xoxc-CAPTURE-CANARY")
+     (domain ".slack.com")
+     (team-id "T1")
+     (user-id "U1")
+     cookies)
+  "Return synthetic browser-session payload with optional overrides."
+  `((schema . 1)
+    (source . ((browser . "fake")
+               (url . "https://my.slack.com/customize")
+               (user_agent . "test")))
+    (cookies
+     . ,(or cookies
+            (mapcar
+             (lambda (entry)
+               `((name . ,(car entry))
+                 (value . ,(cdr entry))
+                 (domain . ,domain)
+                 (path . "/")
+                 (expires . 0)
+                 (secure . t)
+                 (httpOnly . t)))
+             '(("d" . "xoxd-COOKIE-CANARY")
+               ("d-s" . "DS-COOKIE-CANARY")
+               ("lc" . "LC-COOKIE-CANARY")))))
+    (page . ((token . ,token)
+             (teamId . ,team-id)
+             (userId . ,user-id)))))
+
+(defun slackit-test--write-private-json (file payload)
+  "Write synthetic private PAYLOAD to FILE."
+  (let ((json-encoding-pretty-print nil))
+    (with-temp-file file
+      (insert (json-encode payload) "\n")))
+  (unless (eq system-type 'windows-nt)
+    (set-file-modes file #o600))
+  file)
+
+(ert-deftest slackit-contract-login-url-exposes-token-bootstrap ()
+  (should
+   (equal "https://my.slack.com/customize"
+          (default-value 'slackit-login-url))))
+
+(ert-deftest slackit-contract-browser-capture-imports-private-account-auth ()
+  (slackit-test-with-auth-directory (root)
+    (let ((capture (make-temp-file
+                    (expand-file-name "capture-" root) nil ".json")))
+      (slackit-test--write-private-json
+       capture (slackit-test--capture-payload))
+      (let* ((credential (slackit-auth-import-capture "work" capture))
+             (auth-file (slackit-auth-file "work"))
+             (cookie (plist-get credential :cookie)))
+        (should (slackit-auth-available-p "work"))
+        (should (string-prefix-p "xoxc-" (plist-get credential :token)))
+        (should (string-match-p "\\`d=[^;]+; d-s=[^;]+; lc=[^;]+\\'" cookie))
+        (unless (eq system-type 'windows-nt)
+          (should (zerop (logand (file-modes auth-file) #o077))))
+        (should (equal "T1" (plist-get credential :team-id)))
+        (should (equal "U1" (plist-get credential :user-id))))
+      (delete-file capture))))
+
+(ert-deftest slackit-contract-browser-capture-rejects-cross-origin-cookie ()
+  (slackit-test-with-auth-directory (root)
+    (let* ((capture (make-temp-file
+                     (expand-file-name "capture-" root) nil ".json"))
+           (payload (slackit-test--capture-payload
+                     :domain ".slack.com.evil.invalid"))
+           error-text)
+      (slackit-test--write-private-json capture payload)
+      (condition-case error-data
+          (slackit-auth-import-capture "work" capture)
+        (error (setq error-text (error-message-string error-data))))
+      (should error-text)
+      (should-not (string-match-p "CAPTURE-CANARY" error-text))
+      (should-not (string-match-p "COOKIE-CANARY" error-text))
+      (should-not (slackit-auth-available-p "work"))
+      (delete-file capture))))
+
+(ert-deftest slackit-contract-browser-capture-preserves-established-identity ()
+  (slackit-test-with-auth-directory (root)
+    (let ((first (make-temp-file
+                  (expand-file-name "capture-first-" root) nil ".json"))
+          (second (make-temp-file
+                   (expand-file-name "capture-second-" root) nil ".json")))
+      (slackit-test--write-private-json
+       first (slackit-test--capture-payload :team-id "T1" :user-id "U1"))
+      (slackit-auth-import-capture "work" first)
+      (slackit-test--write-private-json
+       second (slackit-test--capture-payload :team-id "T2" :user-id "U2"))
+      (should-error (slackit-auth-import-capture "work" second))
+      (let ((credential (slackit-auth-credential "work")))
+        (should (equal "T1" (plist-get credential :team-id)))
+        (should (equal "U1" (plist-get credential :user-id))))
+      (delete-file first)
+      (delete-file second))))
+
+(ert-deftest slackit-contract-browser-capture-lifecycle-deletes-temporary-file ()
+  (slackit-test-with-auth-directory (_root)
+    (let (arguments output credential)
+      (cl-letf (((symbol-function 'browser-session-capture)
+                 (lambda (&rest supplied)
+                   (setq arguments supplied
+                         output (plist-get supplied :output-file))
+                   (slackit-test--write-private-json
+                    output (slackit-test--capture-payload))
+                   (funcall (plist-get supplied :callback)
+                            '((browser . "fake")))
+                   nil)))
+        (slackit-auth-capture
+         "work" :callback (lambda (value) (setq credential value))))
+      (should credential)
+      (should (equal '("d" "d-s" "lc")
+                     (plist-get arguments :cookies)))
+      (should (string-suffix-p
+               (slackit-auth--account-key "work")
+               (directory-file-name (plist-get arguments :profile-root))))
+      (should (file-readable-p (plist-get arguments :script-file)))
+      (should-not (file-exists-p output))
+      (should-not (slackit-auth-capture-running-p "work")))))
+
+(ert-deftest slackit-contract-browser-capture-failure-cleans-ownership ()
+  (slackit-test-with-auth-directory (_root)
+    (let (output failure)
+      (cl-letf (((symbol-function 'browser-session-capture)
+                 (lambda (&rest supplied)
+                   (setq output (plist-get supplied :output-file))
+                   (funcall
+                    (plist-get supplied :errorback)
+                    '((code . "auth-required")
+                      (message . "Login required")))
+                   nil)))
+        (slackit-auth-capture
+         "work" :errorback (lambda (error) (setq failure error))))
+      (should (equal "auth-required" (alist-get 'code failure)))
+      (should-not (file-exists-p output))
+      (should-not (slackit-auth-capture-running-p "work")))))
+
+(ert-deftest slackit-contract-login-command-starts-imported-account ()
+  (let ((slackit-account-ids nil)
+        capture-callback
+        started)
+    (cl-letf (((symbol-function 'slackit-auth-capture-running-p)
+               (lambda (_account-id) nil))
+              ((symbol-function 'slackit-auth-capture)
+               (lambda (_account-id &rest arguments)
+                 (setq capture-callback (plist-get arguments :callback))
+                 'capture-process))
+              ((symbol-function 'slackit-start-account)
+               (lambda (account-id credential)
+                 (setq started (list account-id credential)))))
+      (slackit-login "work")
+      (funcall capture-callback
+               '(:token "xoxc-LOGIN-CANARY"
+                 :cookie "d=xoxd-LOGIN-CANARY; d-s=DS; lc=LC")))
+    (should (equal "work" (car started)))
+    (should (member "work" slackit-account-ids))))
+
 (ert-deftest slackit-contract-account-state-is-isolated ()
   (slackit-test-with-app (left "left")
     (slackit-test-with-app (right "right")
@@ -46,6 +218,48 @@
                        "C1" "1710000000.000001")
                       'text)))
       (should-not (eq (appkit-app-state left) (appkit-app-state right))))))
+
+(ert-deftest slackit-contract-rtm-reconnect-preserves-account-work ()
+  (slackit-test-with-app (app "generation")
+    (let* ((account-generation (slackit-runtime-generation app))
+           (connection-generation
+            (slackit-runtime-connection-generation app))
+           (operation
+            (slackit-runtime-operation-begin app '(bootstrap))))
+      (slackit-rtm--begin-attempt app)
+      (should (= account-generation (slackit-runtime-generation app)))
+      (should (slackit-runtime-current-p app account-generation))
+      (should (slackit-runtime-operation-current-p app operation))
+      (should (= (1+ connection-generation)
+                 (slackit-runtime-connection-generation app)))
+      (let ((first-connection-generation
+             (slackit-runtime-connection-generation app)))
+        (slackit-rtm--begin-attempt app)
+        (should (= account-generation (slackit-runtime-generation app)))
+        (should-not
+         (slackit-rtm--generation-current-p
+          app first-connection-generation))
+        (should
+         (slackit-rtm--generation-current-p
+          app (slackit-runtime-connection-generation app)))))))
+
+(ert-deftest slackit-contract-stale-http-response-retires-handle ()
+  (slackit-test-with-app (app "stale-http")
+    (let* ((request
+            (slackit-http-request-create
+             :app app
+             :owner app
+             :generation (slackit-runtime-generation app)
+             :active-p t))
+           (handle
+            (appkit-register-handle
+             app 'slackit-http request #'slackit-http--cancel-request)))
+      (setf (slackit-http-request-handle request) handle)
+      (slackit-runtime-begin-generation app)
+      (slackit-http--handle-success request nil)
+      (should-not (slackit-http-request-active-p request))
+      (should-not (appkit-handle-alive-p handle))
+      (should-not (memq handle (appkit-app-handles app))))))
 
 (ert-deftest slackit-contract-credentials-are-origin-bound-and-redacted ()
   (slackit-test-with-app (app "security")

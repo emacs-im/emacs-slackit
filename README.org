@@ -6,9 +6,10 @@ Slackit is an independent Appkit-based Slack client for Emacs.  Its
 slice includes multi-account roots, room/thread history, RTM updates,
 structured mentions, send/edit/delete, reactions, and explicit read marking.
 
-Configure stable IDs in =slackit-account-ids= with matching =auth-source=
-entries (host =slack.com=, user =ACCOUNT-ID=, secret =TOKEN=), then run
-=M-x slackit=.  =M-x slackit-register-account= accepts session-only credentials.
+Slackit requires Emacs 29.1, the =browser-session= package, and its helper
+executable.  Configure optional stable IDs in =slackit-account-ids= and run
+=M-x slackit=; an account without private auth opens an isolated browser login.
+=M-x slackit-register-account= remains a session-only headless fallback.
 
 Architecture, security, lifecycle, and deferred-scope contracts are in
 [[file:docs/architecture.org][docs/architecture.org]].

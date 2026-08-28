@@ -168,24 +168,26 @@
            (run-at-time
             delay nil
             (lambda ()
-              (when (slackit-http--request-current-p request)
-                (setf (slackit-http-request-timer request) nil)
-                (slackit-http--dispatch request))))))
+              (if (slackit-http--request-current-p request)
+                  (progn
+                    (setf (slackit-http-request-timer request) nil)
+                    (slackit-http--dispatch request))
+                (slackit-http--retire-request request))))))
       (setf (slackit-http-request-timer request) timer))))
 
 (defun slackit-http--handle-success (request response)
   "Handle successful plz RESPONSE for REQUEST."
-  (when (slackit-http--request-current-p request)
+  (if (not (slackit-http--request-current-p request))
+      (slackit-http--retire-request request)
     (let ((body (slackit-http--decode-body (plz-response-body response)))
           (callback (slackit-http-request-on-success request)))
       (slackit-http--retire-request request)
-      (if body
-          (when callback (funcall callback body))
-        (when callback (funcall callback nil))))))
+      (when callback (funcall callback body)))))
 
 (defun slackit-http--handle-failure (request error-object)
   "Handle plz ERROR-OBJECT for REQUEST without exposing response bodies."
-  (when (slackit-http--request-current-p request)
+  (if (not (slackit-http--request-current-p request))
+      (slackit-http--retire-request request)
     (let* ((response (slackit-http--error-response error-object))
            (status (or (and response (plz-response-status response)) 0))
            (body (and response
