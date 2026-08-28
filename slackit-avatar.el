@@ -311,7 +311,6 @@ network transfer all belong to this acquisition boundary."
                 (slackit-avatar--ensure-fetch
                  app user resource-key))))))))
 
-
 (defun slackit-avatar-clear-memory-cache ()
   "Clear every decoded Slack avatar descriptor and retry state."
   (clrhash slackit-avatar--image-cache)

@@ -396,14 +396,23 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
            (car time-span) (cdr time-span)
            (list 'help-echo (slackit-render--clock timestamp)))))
       (insert "\n")
-      (slackit-media-insert-message-cards app message)
+      (appkit-ui-apply-line-prefix
+       body-start (point) body-prefix-state))
+    ;; Media prefixes replace the last body-indent column with their border.
+    ;; Applying the body prefix over the finished card would instead add a
+    ;; second four-column indent and misalign the card with message text.
+    (let ((appkit-ui-card-indent-prefix-state body-prefix-state)
+          (appkit-ui-card-indent-prefix
+           (appkit-ui-prefix-string body-prefix-state nil "  ")))
+      (slackit-media-insert-message-cards app message))
+    (let ((details-start (point)))
       (when-let* ((count (slackit-normalize-get message 'reply_count)))
         (when (> (or count 0) 0)
           (insert (propertize (format "  [%d replies]\n" count)
                               'face 'slackit-status))))
       (slackit-render--insert-reactions app state message)
       (appkit-ui-apply-line-prefix
-       body-start (point) body-prefix-state))))
+       details-start (point) body-prefix-state))))
 
 (provide 'slackit-render)
 

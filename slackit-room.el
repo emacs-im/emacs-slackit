@@ -120,6 +120,7 @@
     map)
   "Keymap for `slackit-room-mode'.")
 
+
 (define-derived-mode slackit-room-mode appkit-chatbuf-mode "Slackit-Room"
   "Writable Slackit room with an Appkit timeline and composer."
   (slackit-history-init)

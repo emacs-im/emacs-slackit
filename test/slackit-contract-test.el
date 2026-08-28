@@ -529,6 +529,7 @@
         (with-current-buffer (appkit-view-buffer view)
           (should appkit-view--responsive-geometry-p))))))
 
+
 (ert-deftest slackit-contract-geometry-redraws-timestamps-at-new-width ()
   (with-temp-buffer
     (let ((invalidations (appkit-invalidations-create))
@@ -784,9 +785,10 @@
             '((channel . "C1")
               (ts . "1.000001")
               (user . "U2")
-              (text . "please :pray: :laughing: :slightly_smiling_face: :unknown:")
+              (text . "please :pray: :laughing: :slightly_smiling_face: :+1::skin-tone-3: :unknown:")
               (reactions
-               . (((name . "laughing") (count . 2) (users . ("U1"))))))))
+               . (((name . "laughing") (count . 2) (users . ("U1")))
+                  ((name . "+1::skin-tone-3") (count . 1) (users . ("U2"))))))))
       (slackit-state-put-team-self
        state '((id . "T1")) '((id . "U1") (name . "self")))
       (slackit-state-put-user state '((id . "U2") (name . "alice")))
@@ -800,14 +802,15 @@
              app state message
              (slackit-room--message-context nil message))
             (should (string-match-p
-                     "🙏.*😆.*🙂.*:unknown:" (buffer-string)))
+                     "🙏.*😆.*🙂.*👍🏼.*:unknown:" (buffer-string)))
+            (should (string-match-p "😆 2 👍🏼 1" (buffer-string)))
             (let ((button (next-button (point-min))))
               (should button)
               (button-activate button)
               (should (equal (list app "C1" "1.000001" "laughing")
                              toggled)))))
         (should (equal
-                 "please :pray: :laughing: :slightly_smiling_face: :unknown:"
+                 "please :pray: :laughing: :slightly_smiling_face: :+1::skin-tone-3: :unknown:"
                  (slackit-normalize-get message 'text)))))))
 
 (ert-deftest slackit-contract-avatar-prefers-circular-derived-image ()
@@ -869,7 +872,8 @@
                    (thumb_1024 . ,thumbnail-url))))))
            public-source
            private-source
-           private-headers)
+           private-headers
+           opened-file)
       (unwind-protect
           (progn
             (clrhash slackit-media--fetches)
@@ -909,7 +913,14 @@
                  ((symbol-function 'appkit-media-insert-image-slices)
                   (lambda (image &rest _arguments)
                     (should (eq image 'decoded-private-image))
-                    (insert "[decoded private preview]"))))
+                    (insert "[decoded private preview]")))
+                 ((symbol-function 'appkit-media-open-resource)
+                  (lambda (resource &rest arguments)
+                    (should (eq 'image (plist-get arguments :kind)))
+                    (should (equal "slackit"
+                                   (plist-get arguments :client-label)))
+                    (should-not (alist-get 'url resource))
+                    (setq opened-file (alist-get 'file resource)))))
               (slackit-media-ensure-message app message)
               (should (equal public-url public-source))
               (should (equal thumbnail-url private-source))
@@ -927,6 +938,27 @@
                 (regexp-quote private-url)
                 (prin1-to-string
                  (slackit-media-message-resource-keys app message))))
+              (let* ((private-item
+                      (seq-find
+                       (lambda (item)
+                         (eq (plist-get item :class) 'file))
+                       (slackit-media--message-items app message)))
+                     (context (slackit-media--item-context private-item))
+                     (action (plist-get context :open-action))
+                     (context-text (prin1-to-string context))
+                     (key (plist-get private-item :resource-key))
+                     (cached-file (slackit-media--cached-file key)))
+                (should (functionp action))
+                (should (file-regular-p cached-file))
+                (unless (memq system-type '(ms-dos windows-nt cygwin))
+                  (should (= #o600
+                             (logand #o777 (file-modes cached-file)))))
+                (should-not
+                 (string-match-p (regexp-quote private-url) context-text))
+                (should-not
+                 (string-match-p (regexp-quote thumbnail-url) context-text))
+                (funcall action)
+                (should (equal cached-file opened-file)))
               (should-not
                (slackit-media--private-source-p
                 "https://files.slack.com.attacker.invalid/files-tmb/T1-F1/x.png"))

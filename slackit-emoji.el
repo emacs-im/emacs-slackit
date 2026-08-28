@@ -19,12 +19,10 @@
 (require 'slackit-api)
 (require 'slackit-emoji-data)
 (require 'slackit-media)
-(require 'slackit-normalize)
-(require 'slackit-runtime)
 (require 'slackit-state)
 
 (defconst slackit-emoji--token-regexp
-  ":[+[:alnum:]_-]+:"
+  ":\\([+[:alnum:]_'-]+\\(?:::skin-tone-[2-6]\\)?\\):"
   "Regexp matching one complete Slack emoji token.")
 
 (defconst slackit-emoji--max-alias-hops 10
@@ -142,6 +140,21 @@ SEEN and HOPS guard malformed alias cycles."
        'help-echo (format ":%s:" name)
        'rear-nonsticky '(display help-echo)))))
 
+(defun slackit-emoji--standard-glyph (name)
+  "Return the Unicode glyph for Slack standard or skin-tone NAME."
+  (or (gethash name (slackit-emoji--glyph-table))
+      (when (string-match
+             "\\`\\(.+\\)::\\(skin-tone-[2-6]\\)\\'" name)
+        (when-let* ((base
+                     (gethash
+                      (match-string 1 name)
+                      (slackit-emoji--glyph-table)))
+                    (modifier
+                     (gethash
+                      (match-string 2 name)
+                      (slackit-emoji--glyph-table))))
+          (concat base modifier)))))
+
 (defun slackit-emoji--resolve (app name &optional seen hops)
   "Resolve APP Slack shortname NAME to a Unicode or image display string."
   (let ((custom (slackit-emoji--custom-value app name)))
@@ -154,7 +167,7 @@ SEEN and HOPS guard malformed alias cycles."
            app target (cons name seen) (1+ (or hops 0))))))
      ((stringp custom)
       (slackit-emoji--inline-image app name custom))
-     (t (gethash name (slackit-emoji--glyph-table))))))
+     (t (slackit-emoji--standard-glyph name)))))
 
 (defun slackit-emoji-display-string (app name)
   "Return a detached display string for APP Slack shortname NAME, or nil."
@@ -169,8 +182,9 @@ Unknown tokens are preserved byte-for-byte, and TEXT itself is never modified."
   (replace-regexp-in-string
    slackit-emoji--token-regexp
    (lambda (token)
-     (or (slackit-emoji--resolve app (substring token 1 -1))
-         token))
+     (save-match-data
+       (or (slackit-emoji--resolve app (substring token 1 -1))
+           token)))
    text t t))
 
 (defun slackit-emoji--message-names (message)

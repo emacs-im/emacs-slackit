@@ -395,6 +395,22 @@
   "Return RESOURCE-KEY's decoded image without starting acquisition."
   (slackit-media--cached-image resource-key))
 
+(defun slackit-media--cached-file (resource-key)
+  "Return RESOURCE-KEY's existing local cache file, or nil."
+  (and resource-key
+       (appkit-media-image-cache-existing-file
+        (slackit-media--cache-base resource-key))))
+
+(defun slackit-media--open-cached-image (resource-key)
+  "Open RESOURCE-KEY's cached image locally inside Emacs."
+  (let ((file (slackit-media--cached-file resource-key)))
+    (unless (appkit-media-file-present-p file)
+      (user-error "slackit: cached image is unavailable"))
+    (appkit-media-open-resource
+     (appkit-media-resource-create :file file)
+     :kind 'image
+     :client-label "slackit")))
+
 (defun slackit-media--source-extension (source)
   "Return a safe image filename extension inferred from SOURCE."
   (condition-case nil
@@ -660,11 +676,18 @@ deterministic operation in `slackit-media-insert-message-cards'."
 
 (defun slackit-media--item-context (item)
   "Return backend-neutral card context for ITEM."
-  (let ((action (slackit-media--browser-action
-                 (plist-get item :page-url))))
+  (let* ((kind (plist-get item :kind))
+         (key (plist-get item :resource-key))
+         (action
+          (if (eq kind 'photo)
+              (and (slackit-media--cached-file key)
+                   (apply-partially
+                    #'slackit-media--open-cached-image key))
+            (slackit-media--browser-action
+             (plist-get item :page-url)))))
     (appkit-media-card-context-create
      :payload (slackit-media--safe-context-payload item)
-     :kind (plist-get item :kind)
+     :kind kind
      :title (plist-get item :title)
      :open-action action)))
 
@@ -686,7 +709,8 @@ deterministic operation in `slackit-media-insert-message-cards'."
           (appkit-media-insert-image-slices
            display-image action nil
            (if video-p "[video]" "[image]")
-           (if action "Open in browser" "Media preview"))
+           (and video-p
+                (if action "Open in browser" "Media preview")))
         (error (insert "[preview unavailable]")))
       (insert "\n"))
      ((gethash key slackit-media--fetches)
@@ -712,9 +736,11 @@ deterministic operation in `slackit-media-insert-message-cards'."
      :meta-face 'shadow
      :properties properties
      :context context
-     :open-help-echo (if (plist-get context :open-action)
-                         "Open exact Slack media page in browser"
-                       "Media page unavailable")
+     :open-help-echo
+     (and (not (eq (plist-get item :kind) 'photo))
+          (if (plist-get context :open-action)
+              "Open exact Slack media page in browser"
+            "Media page unavailable"))
      :body-inserter
      (and preview-p
           (lambda (prefix-state)
