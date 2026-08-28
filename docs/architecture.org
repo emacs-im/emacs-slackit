@@ -116,7 +116,8 @@ The Appkit application owns:
 - one =slackit-transport= with distinct account-lifecycle and RTM-connection
   generations, WebSocket, capability URL, heartbeat/reconnect timers, and
   connection status;
-- cursor-complete account bootstrap for users and joined conversations;
+- cursor-complete identity and joined-conversation bootstrap plus an on-demand
+  user cache;
 - account-wide writes, including send, edit, delete, reaction, and mark-read
   operations, which must settle even if their originating room closes or RTM
   reconnects;
@@ -236,12 +237,22 @@ channels.  Entry keys are conversation IDs; activation opens the exact account
 room.  User and conversation changes invalidate dependent entries without
 rebuilding unrelated rows.
 
-Bootstrap consumes every =users.list= and =conversations.list= cursor before
-declaring the account directory ready.  The root remains usable while showing
-real connection/loading/retryable-error state, but never presents a partial
-collection as complete.  RTM =user_change=/=team_join= and joined-conversation
+Bootstrap consumes every =conversations.list= cursor before declaring the
+account directory ready.  It never scans the workspace-wide =users.list=
+collection: visible direct messages, message senders, and =<@USER>= references
+request exact =users.info= records through account-owned, deduplicated
+operations.  Until a lookup settles, renderers expose the opaque user ID rather
+than blocking startup.  RTM =user_change=/=team_join= and joined-conversation
 join/leave/rename/archive events keep existing rows and sender dependencies
 current.
+
+Canonical user records are an in-memory account cache, matching
+=emacs-slack='s team-local user table; Slackit does not persist a second stale
+directory of workspace profile metadata.  Public profile image bytes are the
+expensive reusable part, so =slackit-avatar.el= caches them on disk under
+account-qualified SHA-256 identities.  The cache directory is private on Unix,
+downloads carry no Slack bearer or Cookie credentials, and view rows depend on
+opaque avatar resource keys for exact redraw after acquisition.
 
 The root does not call =client.userBoot= or =client.counts= and does not invent
 unread or mention badges.  It may mark a row unread only after the selected
@@ -260,14 +271,21 @@ chat timeline.  It uses:
   auxiliary state, and structured mention/channel objects;
 - =appkit-chat-completion= for account-local =@user= and =#channel=
   candidates;
-- resource dependencies for sender, user/channel references, thread parent,
-  and later avatar/emoji/media invalidation.
+- resource dependencies for senders, user/channel references, and account-local
+  avatar images, with exact row invalidation after lazy resource arrival.
 
 Slackit owns the row payload, Slack mrkdwn/reference interpretation, subtype
 handling, clock text, sender selection, and actions.  The first slice decodes
 entities and renders user, channel, special mention, date, safe link, and code
 references from stable protocol IDs.  Missing resources retain explicit ID
 fallbacks and later resource arrival invalidates dependent rows.
+
+Room and thread rows use the shared Appkit chat presentation primitives also
+used by QQ and Disco: deterministic identity-colored sender headings,
+Telega-style two-line avatar prefixes with text fallbacks, responsive
+right-aligned timestamps, full-width date/unread separators, wrapped body
+prefixes, and bounded same-sender compaction.  These are display properties;
+copied message text remains free of alignment padding and avatar placeholders.
 
 Unsupported blocks, files, and subtypes remain visible as explicit safe rows.
 A file-only message shows available filename/type/permalink metadata without
@@ -342,7 +360,7 @@ controllers become a =disco-room.el=-sized unit.
 
 | Module | Ownership |
 |--------+-----------|
-| =slackit.el= | Package entry point, registration/start/stop commands, cursor-complete bootstrap |
+| =slackit.el= | Package entry point, registration/start/stop commands, identity/conversation bootstrap |
 | =slackit-customize.el= | User options, faces, and redacted diagnostic policy |
 | =slackit-auth.el= | Browser capture ownership, Slack mapping, private auth persistence, credential loading |
 | =slackit-runtime.el= | Account registry, Appkit apps, operation ownership, view invalidation dispatch |
@@ -356,6 +374,7 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-history.el= | Initial/older paging and exact Appkit history-window transitions |
 | =slackit-compose.el= | Draft/aux capture, structured serialization, send/edit settlement |
 | =slackit-completion.el= | Account-local user/channel candidates and structured insertion |
+| =slackit-avatar.el= | Credential-free profile image acquisition, private disk cache, resource invalidation |
 | =slackit-render.el= | Safe message-row rendering, Slack reference expansion, fallback rows |
 | =slackit-thread.el= | Thread view, reply history, parent/reply projection, reply send |
 | =slackit-reaction.el= | Latest-intent reaction operation ownership and REST settlement |
@@ -400,8 +419,8 @@ is complete only when one or more registered accounts can:
     capture, or view left behind; and
 16. coexist in one Emacs process with the existing =slack= package.
 
-Deferred after this slice: rich Block Kit/attachments, rich WYSIWYG, file/media
-download/preview/upload, avatars, custom emoji images/catalogs, global search,
+Deferred after this slice: rich Block Kit/attachments, rich WYSIWYG, general
+file/media download/preview/upload, custom emoji images/catalogs, global search,
 notifications, unread/modeline count summaries, typing, presence, DND,
 thread subscription/activity endpoints, pins/saved items, scheduled messages,
 workspace administration, OAuth/token refresh/Socket Mode, enterprise-token
@@ -418,6 +437,9 @@ Implementation should defend these observable contracts:
   state, requests, operations, completions, marks, or views;
 - canary credentials never appear in identities, rendered buffers, errors, or
   diagnostics, and cross-origin/redirect/media URLs receive no Slack secrets;
+- avatar resources reject non-HTTPS/non-Slack hosts, never receive Web API
+  credentials, deduplicate account-owned transfers, persist only private image
+  bytes, and redraw exactly dependent room/thread rows;
 - capture callbacks and diagnostics contain no secret values; imported auth and
   temporary capture files are private; capture files are deleted on success,
   failure, cancellation, and synchronous startup errors;
@@ -426,7 +448,9 @@ Implementation should defend these observable contracts:
 - captures with a wrong source URL, non-Slack cookie domain, duplicate/missing
   cookie, unsafe cookie value, unsupported schema, or non-=xoxc= page token are
   rejected without persisting credentials;
-- two-page users and conversations fixtures do not become ready after page one;
+- two-page conversation fixtures do not become ready after page one; startup
+  never calls =users.list=, and repeated visible references share one pending
+  =users.info= operation;
 - RTM readiness requires =hello=; only one reconnect attempt exists per live
   generation; stop/restart makes every prior callback inert;
 - timestamp ordering remains correct for fixed-width decimal strings;

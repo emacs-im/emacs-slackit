@@ -261,6 +261,21 @@
       (should-not (appkit-handle-alive-p handle))
       (should-not (memq handle (appkit-app-handles app))))))
 
+(ert-deftest slackit-contract-root-projection-is-repeatable ()
+  (slackit-test-with-app (app "root-projection")
+    (let ((state (slackit-runtime-state app)))
+      (slackit-state-put-conversation
+       state '((id . "C1") (name . "general") (is_member . t)))
+      (let* ((first
+              (mapcar #'appkit-directory-entry-key
+                      (slackit-root--entries state)))
+             (second
+              (mapcar #'appkit-directory-entry-key
+                      (slackit-root--entries state))))
+        (should (equal first second))
+        (should (= (length second)
+                   (length (delete-dups (copy-sequence second)))))))))
+
 (ert-deftest slackit-contract-credentials-are-origin-bound-and-redacted ()
   (slackit-test-with-app (app "security")
     (let ((headers (slackit-http--headers app 'get)))
@@ -298,12 +313,12 @@
                     success
                     (if cursor
                         '((ok . t)
-                          (members . (((id . "U2"))))
+                          (channels . (((id . "C2"))))
                           (response_metadata . ((next_cursor . ""))))
                       '((ok . t)
-                        (members . (((id . "U1"))))
+                        (channels . (((id . "C1"))))
                         (response_metadata . ((next_cursor . "next"))))))))))
-      (slackit-api-users-list-all
+      (slackit-api-conversations-list-all
        'fake-app
        :on-page (lambda (items) (push items pages))
        :on-complete (lambda () (setq complete t))))
@@ -321,6 +336,166 @@
       (should-not (slackit-state-bootstrap-ready-p state))
       (slackit-state-set-bootstrap-complete state 'conversations)
       (should (slackit-state-bootstrap-ready-p state)))))
+
+(ert-deftest slackit-contract-bootstrap-skips-workspace-user-scan ()
+  (slackit-test-with-app (app "lazy-bootstrap")
+    (let (users-list-called)
+      (cl-letf
+          (((symbol-function 'slackit-api-auth-test)
+            (lambda (_app &rest arguments)
+              (funcall
+               (plist-get arguments :on-success)
+               '((ok . t) (team_id . "T1") (team . "Team")
+                 (user_id . "U0") (user . "self")))))
+           ((symbol-function 'slackit-api-conversations-list-all)
+            (lambda (_app &rest arguments)
+              (funcall (plist-get arguments :on-page) nil)
+              (funcall (plist-get arguments :on-complete))))
+           ((symbol-function 'slackit-api-users-list-all)
+            (lambda (&rest _arguments)
+              (setq users-list-called t))))
+        (slackit-bootstrap-account app))
+      (let ((state (slackit-runtime-state app)))
+        (should-not users-list-called)
+        (should (slackit-state-bootstrap-ready-p state))
+        (should (slackit-state-user state "U0"))
+        (should-not
+         (gethash '(bootstrap) (appkit-app-request-table app)))))))
+
+(ert-deftest slackit-contract-lazy-user-lookups-are-deduplicated ()
+  (slackit-test-with-app (app "lazy-user")
+    (let (calls success)
+      (cl-letf (((symbol-function 'slackit-api-user-info)
+                 (lambda (_app user-id &rest arguments)
+                   (push user-id calls)
+                   (setq success (plist-get arguments :on-success)))))
+        (let ((first (slackit-runtime-ensure-user app "U1"))
+              (second (slackit-runtime-ensure-user app "U1")))
+          (should (eq first second))
+          (should (equal '("U1") calls))
+          (funcall success
+                   '((ok . t)
+                     (user . ((id . "U1") (name . "alice")))))
+          (should (equal "alice"
+                         (slackit-state-user-name
+                          (slackit-runtime-state app) "U1")))
+          (should-not (slackit-runtime-ensure-user app "U1"))
+          (should-not
+           (gethash '(user "U1") (appkit-app-request-table app))))))))
+
+(ert-deftest slackit-contract-avatar-cache-is-private-and-deduplicated ()
+  (let* ((root (make-temp-file "slackit-avatar-test-" t))
+         (slackit-avatar-cache-directory
+          (expand-file-name "avatars/" root))
+         (user
+          '((id . "U1")
+            (profile
+             . ((image_48
+                 . "https://ca.slack-edge.com/avatar-canary.png")))))
+         calls
+         success)
+    (unwind-protect
+        (slackit-test-with-app (app "avatar")
+          (clrhash slackit-avatar--fetches)
+          (clrhash slackit-avatar--failures)
+          (slackit-avatar--prepare-cache-directory)
+          (let ((resource-key (slackit-avatar-resource-key app user)))
+            (should resource-key)
+            (should-not
+             (string-match-p "avatar-canary"
+                             (prin1-to-string resource-key)))
+            (should-not
+             (slackit-avatar-resource-key
+              app
+              '((id . "U2")
+                (profile
+                 . ((image_48 . "https://evil.invalid/avatar.png"))))))
+            (cl-letf
+                (((symbol-function
+                   'appkit-media-cache-image-resource-async)
+                  (lambda (resource cache-base callback _error &rest arguments)
+                    (push (list resource cache-base arguments) calls)
+                    (setq success callback)
+                    nil)))
+              (let ((first
+                     (slackit-avatar--ensure-fetch
+                      app user resource-key))
+                    (second
+                     (slackit-avatar--ensure-fetch
+                      app user resource-key)))
+                (should first)
+                (should-not second)
+                (should (= 1 (length calls)))
+                (should-not
+                 (string-match-p
+                  "CANARY-TOKEN\\|CANARY-COOKIE\\|Authorization\\|Cookie"
+                  (prin1-to-string calls)))
+                (let ((file (concat (cadar calls) ".png")))
+                  (with-temp-file file (insert "synthetic-image"))
+                  (funcall success file)
+                  (unless (memq system-type '(ms-dos windows-nt cygwin))
+                    (should (= #o700
+                               (logand #o777
+                                       (file-modes
+                                        slackit-avatar-cache-directory))))
+                    (should (= #o600
+                               (logand #o777 (file-modes file))))))))))
+      (clrhash slackit-avatar--fetches)
+      (clrhash slackit-avatar--failures)
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest slackit-contract-room-rows-use-rich-chat-layout ()
+  (slackit-test-with-app (app "rich-room")
+    (let* ((state (slackit-runtime-state app))
+           (first
+            '((ts . "1710000000.000001")
+              (user . "U1")
+              (text . "first message")))
+           (second
+            '((ts . "1710000060.000001")
+              (user . "U1")
+              (text . "second message")))
+           (first-context
+            (slackit-room--message-context nil first))
+           (second-context
+            (slackit-room--message-context first second)))
+      (slackit-state-put-user
+       state '((id . "U1") (name . "alice")
+               (profile . ((display_name . "Alice")))))
+      (should (plist-get first-context :date-separator))
+      (should (eq t (plist-get second-context :compact)))
+      (with-temp-buffer
+        (let ((slackit-show-avatars nil)
+              (slackit-right-align-timestamps t)
+              (fill-column 60))
+          (cl-letf (((symbol-function 'appkit-view-responsive-width)
+                     (lambda (&rest _arguments) 60))
+                    ((symbol-function
+                      'appkit-chat-avatar-two-line-pixel-size)
+                     (lambda () 32)))
+            (slackit-render-message-row app state first first-context)
+            (slackit-render-message-row app state second second-context)))
+        (goto-char (point-min))
+        (should (search-forward "Alice" nil t))
+        (let* ((name-position (match-beginning 0))
+               (face (get-text-property name-position 'face))
+               (prefix (get-text-property name-position 'line-prefix)))
+          (should (memq 'slackit-sender face))
+          (should (memq (appkit-name-color-face "U1") face))
+          (should (stringp prefix))
+          (should (string-match-p "\\[A\\]" prefix)))
+        (goto-char (point-min))
+        (should (= 1 (how-many "Alice" (point-min) (point-max))))
+        (should (search-forward "first message" nil t))
+        (should (search-forward "second message" nil t))
+        (goto-char (point-min))
+        (should (text-property-search-forward
+                 'face 'slackit-timestamp
+                 (lambda (value expected)
+                   (if (listp value)
+                       (memq expected value)
+                     (eq value expected)))))))))
 
 (ert-deftest slackit-contract-delayed-history-cannot-overwrite-or-resurrect ()
   (let* ((state (slackit-state-create))

@@ -15,6 +15,9 @@
 (require 'appkit-invalidation)
 (require 'slackit-state)
 
+(declare-function slackit-api-user-info "slackit-api"
+                  (app user-id &rest arguments))
+
 (cl-defstruct (slackit-credential
                (:constructor slackit-credential-create))
   token
@@ -253,6 +256,49 @@
     (remhash (slackit-operation-key operation) (appkit-app-request-table app))
     t))
 
+(defun slackit-runtime--user-info-success (app operation body)
+  "Settle current lazy user OPERATION for APP from API BODY."
+  (when (slackit-runtime-operation-current-p app operation)
+    (let* ((state (slackit-runtime-state app))
+           (requested-id (slackit-operation-payload operation))
+           (user (slackit-normalize-get body 'user))
+           (returned-id (slackit-normalize-get user 'id)))
+      (slackit-runtime-operation-end app operation)
+      (when (and user (equal requested-id returned-id))
+        (slackit-state-put-user state user)
+        (slackit-runtime-publish-changes
+         app (list (list :kind 'user :user-id requested-id)))))))
+
+(defun slackit-runtime--user-info-failure (app operation _error)
+  "Settle failed lazy user OPERATION for APP without exposing its response."
+  (slackit-runtime-operation-end app operation))
+
+(defun slackit-runtime-ensure-user (app user-id)
+  "Fetch unknown Slack USER-ID once for live APP.
+
+Return the existing pending operation, a new operation, or nil when USER-ID is
+already cached or is not a Slack user identity."
+  (when (and (appkit-app-live-p app)
+             (stringp user-id)
+             (not (string-empty-p user-id))
+             (not (string-prefix-p "B" user-id))
+             (not (slackit-state-user (slackit-runtime-state app) user-id)))
+    (let* ((key (list 'user user-id))
+           (pending (gethash key (appkit-app-request-table app))))
+      (if (slackit-runtime-operation-current-p app pending)
+          pending
+        (let ((operation
+               (slackit-runtime-operation-begin app key nil nil user-id)))
+          (slackit-api-user-info
+           app user-id
+           :on-success
+           (apply-partially
+            #'slackit-runtime--user-info-success app operation)
+           :on-error
+           (apply-partially
+            #'slackit-runtime--user-info-failure app operation))
+          operation)))))
+
 (defun slackit-runtime--view-matches-conversation-p (view conversation-id)
   "Return non-nil when VIEW belongs to CONVERSATION-ID."
   (let ((id (appkit-view-id view)))
@@ -294,6 +340,16 @@
            (slackit-runtime--publish-change-to-view view change))))
      (appkit-app-view-registry app)))
   changes)
+
+(defun slackit-runtime-publish-resource (app resource)
+  "Invalidate opaque RESOURCE in every live view owned by APP."
+  (when (appkit-app-live-p app)
+    (maphash
+     (lambda (_id view)
+       (when (appkit-view-live-p view)
+         (appkit-request-sync view :resource resource)))
+     (appkit-app-view-registry app)))
+  resource)
 
 (defun slackit-runtime-reduce-event (app event)
   "Reduce normalized EVENT into APP and request view synchronization."

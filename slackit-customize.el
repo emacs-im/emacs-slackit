@@ -78,6 +78,48 @@ must not be logged."
   :type 'integer
   :group 'slackit)
 
+(defcustom slackit-show-avatars (display-graphic-p)
+  "When non-nil, show cached Slack profile images in room message rows."
+  :type 'boolean
+  :group 'slackit)
+
+(defcustom slackit-avatar-cache-directory
+  (locate-user-emacs-file "slackit/avatars/")
+  "Directory containing account-isolated cached Slack profile images."
+  :type 'directory
+  :group 'slackit)
+
+(defcustom slackit-avatar-retry-delay 60
+  "Seconds before a failed Slack profile image may be requested again."
+  :type 'number
+  :group 'slackit)
+
+(defcustom slackit-group-messages t
+  "When non-nil, compact consecutive messages from the same sender."
+  :type 'boolean
+  :group 'slackit)
+
+(defcustom slackit-group-messages-timespan 300
+  "Maximum seconds between messages eligible for sender compaction."
+  :type 'number
+  :group 'slackit)
+
+(defcustom slackit-right-align-timestamps t
+  "When non-nil, align room message timestamps to the timeline right edge."
+  :type 'boolean
+  :group 'slackit)
+
+(defcustom slackit-room-auto-fill-margin-columns 2
+  "Columns reserved from the responsive room timeline width."
+  :type 'integer
+  :group 'slackit)
+
+(defcustom slackit-avatar-host-regexp
+  "\\(?:\\`\\|\\.\\)\\(?:slack-edge\\.com\\|slack\\.com\\|gravatar\\.com\\)\\'"
+  "Regexp accepted for HTTPS Slack profile image hosts."
+  :type 'regexp
+  :group 'slackit)
+
 (defcustom slackit-rtm-hello-timeout 15
   "Seconds an open Slack RTM socket may wait for `hello'."
   :type 'number
@@ -127,6 +169,16 @@ must not be logged."
 (defface slackit-timestamp
   '((t :inherit shadow))
   "Face for Slackit message timestamps."
+  :group 'slackit)
+
+(defface slackit-date-separator
+  '((t :inherit shadow :weight bold))
+  "Face for Slackit room date separators."
+  :group 'slackit)
+
+(defface slackit-unread-divider
+  '((t :inherit font-lock-warning-face :weight bold))
+  "Face for the Slackit unread-message divider."
   :group 'slackit)
 
 (defface slackit-reaction

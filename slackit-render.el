@@ -15,6 +15,12 @@
 (require 'subr-x)
 (require 'url-util)
 (require 'slackit-customize)
+(require 'appkit-chat-avatar)
+(require 'appkit-chat-ins)
+(require 'appkit-name-color)
+(require 'appkit-ui)
+(require 'appkit-view)
+(require 'slackit-avatar)
 (require 'slackit-normalize)
 (require 'slackit-state)
 
@@ -135,6 +141,11 @@
       (setq position (match-end 0)))
     (delete-dups (nreverse result))))
 
+(defun slackit-render--sender-id (message)
+  "Return stable sender identity from MESSAGE, or nil."
+  (or (slackit-normalize-get message 'user)
+      (slackit-normalize-get message 'bot_id)))
+
 (defun slackit-render--sender-name (state message)
   "Return sender display name for MESSAGE in STATE."
   (or (when-let* ((user (slackit-normalize-get message 'user)))
@@ -145,14 +156,81 @@
       (slackit-normalize-get message 'bot_id)
       "unknown"))
 
-(defun slackit-render--clock (ts)
-  "Return presentation clock for Slack timestamp TS."
+(defun slackit-render--sender-face (state message)
+  "Return deterministic highlighted sender face for MESSAGE in STATE."
+  (delq nil
+        (list
+         (appkit-name-color-face
+          (or (slackit-render--sender-id message)
+              (slackit-render--sender-name state message)))
+         'slackit-sender)))
+
+(defun slackit-render--clock (ts &optional short)
+  "Return presentation clock for Slack timestamp TS.
+
+When SHORT is non-nil, return only the local hour and minute."
   (condition-case nil
       (format-time-string
-       "%Y-%m-%d %H:%M"
+       (if short "%H:%M" "%Y-%m-%d %H:%M")
        (seconds-to-time
         (string-to-number (car (split-string (or ts "0") "\\.")))))
     (error (or ts "unknown time"))))
+
+(defun slackit-render--line-fill-column ()
+  "Return responsive target width for the current Slackit timeline."
+  (or (appkit-view-responsive-width
+       slackit-room-auto-fill-margin-columns)
+      (and (integerp fill-column) (> fill-column 0) fill-column)
+      80))
+
+(defun slackit-render--insert-right-aligned-time
+    (text &optional left-prefix-width)
+  "Insert timestamp TEXT at the room right edge.
+
+LEFT-PREFIX-WIDTH reserves display-only avatar columns."
+  (appkit-chat-ins-insert-right-aligned-text
+   text
+   (slackit-render--line-fill-column)
+   :face 'slackit-timestamp
+   :right-align-p slackit-right-align-timestamps
+   :left-prefix-width left-prefix-width))
+
+(defun slackit-render--avatar-placeholder (name)
+  "Return a compact initials placeholder for sender NAME."
+  (let* ((parts (split-string (or name "") "[^[:alnum:]]+" t))
+         (first (and parts (substring (car parts) 0 1)))
+         (second (and (> (length parts) 1)
+                      (substring (cadr parts) 0 1))))
+    (format "[%s]" (upcase (concat (or first "?") (or second ""))))))
+
+(defun slackit-render--avatar-prefixes (app state message)
+  "Return Telega-style avatar prefixes for APP MESSAGE in STATE."
+  (let* ((user-id (slackit-normalize-get message 'user))
+         (user (and user-id (slackit-state-user state user-id)))
+         (name (slackit-render--sender-name state message))
+         (image (and user (slackit-avatar-image app user)))
+         (prefixes
+          (appkit-chat-avatar-prefixes
+           image
+           (slackit-render--avatar-placeholder name)
+           :pixel-size (appkit-chat-avatar-two-line-pixel-size)
+           :resize t)))
+    (dolist (key '(:header :first-body))
+      (let ((prefix (copy-sequence (plist-get prefixes key))))
+        (when (and (stringp prefix) (> (length prefix) 0))
+          (add-text-properties
+           0 (length prefix)
+           (list 'slackit-user-id user-id
+                 'help-echo name
+                 'mouse-face 'highlight)
+           prefix))
+        (setq prefixes (plist-put prefixes key prefix))))
+    prefixes))
+
+(defun slackit-render--insert-divider (text face)
+  "Insert full-width room divider TEXT using FACE."
+  (appkit-chat-ins-insert-divider-row
+   text face (slackit-render--line-fill-column)))
 
 (defun slackit-render--insert-files (message)
   "Insert safe non-fetching file summaries for MESSAGE."
@@ -189,18 +267,10 @@
                    'face 'slackit-reaction))))
       (insert "\n"))))
 
-(defun slackit-render-message-row (state message context)
-  "Insert one canonical MESSAGE row from STATE and render CONTEXT."
-  (when (plist-get context :unread-divider)
-    (insert (propertize "──────── unread ────────\n" 'face 'slackit-status)))
-  (let* ((ts (slackit-normalize-get message 'ts))
-         (sender (slackit-render--sender-name state message))
-         (text (or (slackit-normalize-get message 'text) ""))
-         (subtype (slackit-normalize-get message 'subtype)))
-    (insert (propertize sender 'face 'slackit-sender)
-            "  "
-            (propertize (slackit-render--clock ts) 'face 'slackit-timestamp)
-            "\n")
+(defun slackit-render--insert-primary-content (state message)
+  "Insert MESSAGE subtype marker and primary content from STATE."
+  (let ((text (or (slackit-normalize-get message 'text) ""))
+        (subtype (slackit-normalize-get message 'subtype)))
     (when (and subtype
                (not (member subtype '("thread_broadcast" "me_message"))))
       (insert (propertize (format "[%s] " subtype) 'face 'slackit-status)))
@@ -209,14 +279,78 @@
           (insert (propertize "[Unsupported Block Kit content]"
                               'face 'slackit-status)))
       (when (equal subtype "me_message") (insert "* "))
-      (slackit-render-insert-text state text))
+      (slackit-render-insert-text state text))))
+
+(defun slackit-render--insert-heading
+    (state message sender timestamp header-prefix body-rest-prefix)
+  "Insert MESSAGE heading for SENDER and TIMESTAMP in STATE."
+  (let* ((start (point))
+         (sender-id (slackit-render--sender-id message))
+         (sender-start (point)))
+    (insert sender)
+    (add-text-properties
+     sender-start (point)
+     (list 'face (slackit-render--sender-face state message)
+           'slackit-user-id sender-id
+           'mouse-face 'highlight
+           'help-echo sender))
+    (let ((time-span
+           (slackit-render--insert-right-aligned-time
+            (slackit-render--clock timestamp t)
+            (string-width header-prefix))))
+      (add-text-properties
+       (car time-span) (cdr time-span)
+       (list 'help-echo (slackit-render--clock timestamp))))
     (insert "\n")
-    (slackit-render--insert-files message)
-    (when-let* ((count (slackit-normalize-get message 'reply_count)))
-      (when (> (or count 0) 0)
-        (insert (propertize (format "  [%d replies]\n" count)
-                            'face 'slackit-status))))
-    (slackit-render--insert-reactions state message)))
+    (appkit-ui-apply-line-prefix
+     start (point)
+     (appkit-ui-make-prefix-state header-prefix body-rest-prefix))))
+
+(defun slackit-render-message-row (app state message context)
+  "Insert one canonical MESSAGE row for APP from STATE and render CONTEXT."
+  (when-let* ((date (plist-get context :date-separator)))
+    (slackit-render--insert-divider date 'slackit-date-separator))
+  (when (plist-get context :unread-divider)
+    (slackit-render--insert-divider
+     "Unread messages" 'slackit-unread-divider))
+  (let* ((timestamp (slackit-normalize-get message 'ts))
+         (sender (slackit-render--sender-name state message))
+         (compact (eq (plist-get context :compact) t))
+         (avatar-prefixes
+          (slackit-render--avatar-prefixes app state message))
+         (header-prefix (or (plist-get avatar-prefixes :header) ""))
+         (first-body-prefix
+          (or (plist-get avatar-prefixes :first-body) "  "))
+         (rest-body-prefix
+          (or (plist-get avatar-prefixes :rest-body) "  "))
+         (body-prefix-state
+          (if compact
+              (appkit-ui-make-prefix-state
+               rest-body-prefix rest-body-prefix)
+            (appkit-ui-make-prefix-state
+             first-body-prefix rest-body-prefix))))
+    (unless compact
+      (slackit-render--insert-heading
+       state message sender timestamp header-prefix rest-body-prefix))
+    (let ((body-start (point)))
+      (slackit-render--insert-primary-content state message)
+      (when compact
+        (let ((time-span
+               (slackit-render--insert-right-aligned-time
+                (slackit-render--clock timestamp t)
+                (string-width rest-body-prefix))))
+          (add-text-properties
+           (car time-span) (cdr time-span)
+           (list 'help-echo (slackit-render--clock timestamp)))))
+      (insert "\n")
+      (slackit-render--insert-files message)
+      (when-let* ((count (slackit-normalize-get message 'reply_count)))
+        (when (> (or count 0) 0)
+          (insert (propertize (format "  [%d replies]\n" count)
+                              'face 'slackit-status))))
+      (slackit-render--insert-reactions state message)
+      (appkit-ui-apply-line-prefix
+       body-start (point) body-prefix-state))))
 
 (provide 'slackit-render)
 

@@ -18,6 +18,7 @@
 (require 'appkit-chat-completion)
 (require 'appkit-chat-history)
 (require 'appkit-chat-timeline)
+(require 'appkit-view)
 (require 'slackit-customize)
 (require 'slackit-history)
 (require 'slackit-runtime)
@@ -29,7 +30,8 @@
 (declare-function slackit-completion-user "slackit-completion" ())
 (declare-function slackit-completion-channel "slackit-completion" ())
 (declare-function slackit-completion-setup "slackit-completion" ())
-(declare-function slackit-render-message-row "slackit-render" (state message context))
+(declare-function slackit-render-message-row
+                  "slackit-render" (app state message context))
 (declare-function slackit-render-reference-dependencies "slackit-render" (text))
 (declare-function slackit-actions-open-thread "slackit-actions" ())
 (declare-function slackit-actions-edit "slackit-actions" ())
@@ -37,6 +39,10 @@
 (declare-function slackit-actions-react "slackit-actions" ())
 (declare-function slackit-actions-copy-text "slackit-actions" ())
 (declare-function slackit-read-mark-at-point "slackit-read" ())
+(declare-function slackit-runtime-ensure-user
+                  "slackit-runtime" (app user-id))
+(declare-function slackit-avatar-resource-key
+                  "slackit-avatar" (app user))
 
 (defconst slackit-message-key-property 'slackit-message-ts
   "Text property identifying one rendered Slack message row.")
@@ -153,7 +159,7 @@
          (context (appkit-chat-timeline-row-context row))
          (ts (appkit-chat-timeline-row-key row))
          (start (point)))
-    (slackit-render-message-row state message context)
+    (slackit-render-message-row app state message context)
     (unless (bolp) (insert "\n"))
     (add-text-properties start (point)
                          (list slackit-message-key-property ts))))
@@ -165,8 +171,68 @@
                   (slackit-state-message state conversation-id ts))
                 (slackit-state-top-level-keys state conversation-id))))
 
-(defun slackit-room--project (state messages)
-  "Project exact visible MESSAGES from STATE into timeline rows."
+(defun slackit-room--ensure-user-resources (app resources)
+  "Request unknown Slack users named by Appkit RESOURCES for APP."
+  (dolist (resource resources)
+    (when (eq (car-safe resource) :user)
+      (slackit-runtime-ensure-user app (cadr resource))))
+  resources)
+
+(defun slackit-room--message-epoch (message)
+  "Return numeric presentation time for MESSAGE's opaque Slack timestamp."
+  (let ((timestamp (slackit-normalize-get message 'ts)))
+    (when (and (stringp timestamp)
+               (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" timestamp))
+      (string-to-number timestamp))))
+
+(defun slackit-room--message-day-key (message)
+  "Return local calendar day key for MESSAGE, or nil."
+  (when-let* ((epoch (slackit-room--message-epoch message)))
+    (format-time-string "%Y-%m-%d" (seconds-to-time epoch))))
+
+(defun slackit-room--message-day-label (message)
+  "Return readable local date separator label for MESSAGE."
+  (when-let* ((epoch (slackit-room--message-epoch message)))
+    (format-time-string "%A, %B %e, %Y" (seconds-to-time epoch))))
+
+(defun slackit-room--message-sender-key (message)
+  "Return stable sender key for MESSAGE."
+  (or (slackit-normalize-get message 'user)
+      (slackit-normalize-get message 'bot_id)
+      (slackit-normalize-get message 'username)))
+
+(defun slackit-room--messages-compact-group-p (previous message)
+  "Return non-nil when MESSAGE may visually continue PREVIOUS."
+  (and slackit-group-messages
+       previous
+       (equal (slackit-room--message-sender-key previous)
+              (slackit-room--message-sender-key message))
+       (let ((previous-time (slackit-room--message-epoch previous))
+             (message-time (slackit-room--message-epoch message)))
+         (and previous-time
+              message-time
+              (<= (abs (- message-time previous-time))
+                  (max 0 slackit-group-messages-timespan))))))
+
+(defun slackit-room--message-context
+    (previous message &optional unread-divider)
+  "Return visual context for MESSAGE after PREVIOUS.
+
+UNREAD-DIVIDER marks MESSAGE as the first unread row."
+  (let* ((day (slackit-room--message-day-key message))
+         (previous-day (and previous
+                            (slackit-room--message-day-key previous)))
+         (new-day (and day (not (equal day previous-day)))))
+    (list :date-separator
+          (and new-day (slackit-room--message-day-label message))
+          :unread-divider (and unread-divider t)
+          :compact
+          (and (not new-day)
+               (not unread-divider)
+               (slackit-room--messages-compact-group-p previous message)))))
+
+(defun slackit-room--project (app state messages)
+  "Project exact visible MESSAGES from STATE into timeline rows owned by APP."
   (let ((read-ts (slackit-state-read-ts
                   state (slackit-room-current-conversation-id)))
         first-unread-seen)
@@ -174,23 +240,29 @@
      messages
      (lambda (message) (slackit-normalize-get message 'ts))
      :context-function
-     (lambda (_previous message)
-       (let* ((ts (slackit-normalize-get message 'ts))
+     (lambda (previous message)
+       (let* ((timestamp (slackit-normalize-get message 'ts))
               (first-unread
                (and (not first-unread-seen)
                     read-ts
-                    (string< read-ts ts))))
+                    (string< read-ts timestamp))))
          (when first-unread (setq first-unread-seen t))
-         (list :unread-divider first-unread)))
+         (slackit-room--message-context previous message first-unread)))
      :dependencies-function
      (lambda (message)
-       (delete-dups
-        (delq nil
-              (append
-               (list (when-let* ((user (slackit-normalize-get message 'user)))
-                       (list :user user)))
-               (slackit-render-reference-dependencies
-                (slackit-normalize-get message 'text)))))))))
+       (let* ((user-id (slackit-normalize-get message 'user))
+              (user (and user-id (slackit-state-user state user-id)))
+              (dependencies
+               (delete-dups
+                (delq nil
+                      (append
+                       (list
+                        (and user-id (list :user user-id))
+                        (and user
+                             (slackit-avatar-resource-key app user)))
+                       (slackit-render-reference-dependencies
+                        (slackit-normalize-get message 'text)))))))
+         (slackit-room--ensure-user-resources app dependencies))))))
 
 (defun slackit-room--render (&optional force-keys resources)
   "Synchronize the current room, forcing FORCE-KEYS and RESOURCES."
@@ -202,7 +274,7 @@
                        (slackit-history-slice-messages all))))
     (slackit-room--ensure-timeline)
     (appkit-chat-timeline-sync
-     (slackit-room--project state visible)
+     (slackit-room--project app state visible)
      :force-keys force-keys
      :changed-resources resources)
     (appkit-chat-timeline-set-frame
@@ -249,12 +321,26 @@
 
 (defun slackit-room--sync (view invalidations)
   "Synchronize room VIEW from coalesced INVALIDATIONS."
-  (let ((events (appkit-view-pending-events-snapshot view)))
+  (let* ((events (appkit-view-pending-events-snapshot view))
+         (parts (appkit-invalidations-parts invalidations))
+         (geometry-p (memq 'geometry parts))
+         (entries (appkit-invalidations-entry-keys invalidations))
+         (resources (appkit-invalidations-resource-keys invalidations)))
+    (when geometry-p
+      (when-let* ((width
+                   (appkit-view-responsive-width
+                    slackit-room-auto-fill-margin-columns)))
+        (setq-local fill-column width)))
     (dolist (event events) (slackit-room--apply-event view event))
     (appkit-view-acknowledge-events view (length events))
     (slackit-room--render
-     (appkit-invalidations-entry-keys invalidations)
-     (appkit-invalidations-resource-keys invalidations))))
+     (if geometry-p
+         (delete-dups
+          (append entries
+                  (and (appkit-chat-timeline-live-p)
+                       (appkit-chat-timeline-keys))))
+       entries)
+     resources)))
 
 (defun slackit-room--setup (conversation-id app _view)
   "Initialize a newly attached room for CONVERSATION-ID and APP."
@@ -276,17 +362,21 @@
                                      (appkit-app-id app) name)
                 :state conversation-id
                 :sync-function #'slackit-room--sync
-                :parts '(frame timeline composer)
+                :parts '(frame timeline composer geometry)
                 :setup (apply-partially
                         #'slackit-room--setup conversation-id app)
                 :select select)))
+    (setf (appkit-view-sync-function view) #'slackit-room--sync
+          (appkit-view-parts view) '(frame timeline composer geometry))
+    (appkit-view-enable-responsive-geometry view)
     (with-current-buffer (appkit-view-buffer view)
       (setq-local slackit-room--conversation-id conversation-id
                   slackit-room--app app)
       (unless existing
         (slackit-history-load-latest view conversation-id)
         (appkit-invalidate view :structure t)
-        (appkit-sync-invalidations view)))
+        (appkit-sync-invalidations view))
+      (appkit-view-refresh-responsive-geometry))
     view))
 
 (defun slackit-room-load-older ()

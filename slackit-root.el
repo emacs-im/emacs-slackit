@@ -20,6 +20,8 @@
 
 (declare-function slackit-bootstrap-account "slackit" (app))
 (declare-function slackit-room-open "slackit-room" (app conversation-id &optional select))
+(declare-function slackit-runtime-ensure-user
+                  "slackit-runtime" (app user-id))
 
 (defvar slackit-root-mode-map
   (let ((map (make-sparse-keymap)))
@@ -39,10 +41,8 @@
      (error-code (format "Bootstrap error: %s — press g to retry" error-code))
      ((not (slackit-state-bootstrap-ready-p state))
       (format
-       "Loading directory (identity: %s, users: %s, conversations: %s); RTM: %s"
+       "Loading directory (identity: %s, users: on-demand, conversations: %s); RTM: %s"
        (if (slackit-account-state-bootstrap-identity-complete-p state)
-           "complete" "loading")
-       (if (slackit-account-state-bootstrap-users-complete-p state)
            "complete" "loading")
        (if (slackit-account-state-bootstrap-conversations-complete-p state)
            "complete" "loading")
@@ -81,9 +81,19 @@
      :payload conversation-id
      :stamp (list name unread-p conversation))))
 
+(defun slackit-root--ensure-visible-users (app state)
+  "Request unknown direct-message users visible in APP directory STATE."
+  (dolist (conversation-id (slackit-state-joined-conversation-ids state))
+    (when-let* ((conversation
+                 (slackit-state-conversation state conversation-id))
+                (user-id (slackit-normalize-get conversation 'user)))
+      (slackit-runtime-ensure-user app (format "%s" user-id)))))
+
 (defun slackit-root--entries (state)
   "Project STATE into a flat Appkit directory entry sequence."
-  (let ((buckets `((direct . nil) (group-direct . nil) (channel . nil)))
+  (let ((buckets (list (cons 'direct nil)
+                       (cons 'group-direct nil)
+                       (cons 'channel nil)))
         entries)
     (dolist (conversation-id (slackit-state-joined-conversation-ids state))
       (let* ((conversation (slackit-state-conversation state conversation-id))
@@ -95,7 +105,9 @@
            :label (slackit-root--status-label state)
            :face 'slackit-status
            :stamp (list (slackit-account-state-connection-status state)
-                        (slackit-state-bootstrap-ready-p state)
+                        (slackit-account-state-bootstrap-identity-complete-p state)
+                        (slackit-account-state-bootstrap-users-complete-p state)
+                        (slackit-account-state-bootstrap-conversations-complete-p state)
                         (slackit-account-state-bootstrap-error state)))
           entries)
     (dolist (spec '((direct "Direct messages")
@@ -130,8 +142,10 @@
   "Synchronize root VIEW from coalesced INVALIDATIONS."
   (let ((events (appkit-view-pending-events-snapshot view)))
     (appkit-view-acknowledge-events view (length events))
-    (let ((surface (appkit-directory-surface))
-          (state (slackit-runtime-state (appkit-view-app view))))
+    (let* ((app (appkit-view-app view))
+           (surface (appkit-directory-surface))
+           (state (slackit-runtime-state app)))
+      (slackit-root--ensure-visible-users app state)
       (appkit-directory-reconcile
        surface (slackit-root--entries state)
        :force-keys (appkit-invalidations-entry-keys invalidations)

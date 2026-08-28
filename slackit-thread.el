@@ -15,12 +15,19 @@
 (require 'appkit-invalidation)
 (require 'appkit-chat-history)
 (require 'appkit-chat-timeline)
+(require 'appkit-view)
 (require 'slackit-compose)
 (require 'slackit-history)
 (require 'slackit-render)
 (require 'slackit-room)
 (require 'slackit-runtime)
 (require 'slackit-state)
+(declare-function slackit-room--ensure-user-resources
+                  "slackit-room" (app resources))
+(declare-function slackit-room--message-context
+                  "slackit-room" (previous message &optional unread-divider))
+(declare-function slackit-avatar-resource-key
+                  "slackit-avatar" (app user))
 
 (defvar-local slackit-thread--root-ts nil
   "Root Slack timestamp owned by the current thread view.")
@@ -54,20 +61,29 @@
                   (slackit-state-message state conversation-id ts))
                 (slackit-state-reply-keys state conversation-id root-ts))))
 
-(defun slackit-thread--project (messages)
-  "Project thread MESSAGES into stable Appkit rows."
+(defun slackit-thread--project (app state messages)
+  "Project thread MESSAGES from STATE into stable Appkit rows owned by APP."
   (appkit-chat-timeline-project
    messages
    (lambda (message) (slackit-normalize-get message 'ts))
+   :context-function
+   (lambda (previous message)
+     (slackit-room--message-context previous message))
    :dependencies-function
    (lambda (message)
-     (delete-dups
-      (delq nil
-            (append
-             (list (when-let* ((user (slackit-normalize-get message 'user)))
-                     (list :user user)))
-             (slackit-render-reference-dependencies
-              (slackit-normalize-get message 'text))))))))
+     (let* ((user-id (slackit-normalize-get message 'user))
+            (user (and user-id (slackit-state-user state user-id)))
+            (dependencies
+             (delete-dups
+              (delq nil
+                    (append
+                     (list
+                      (and user-id (list :user user-id))
+                      (and user
+                           (slackit-avatar-resource-key app user)))
+                     (slackit-render-reference-dependencies
+                      (slackit-normalize-get message 'text)))))))
+       (slackit-room--ensure-user-resources app dependencies)))))
 
 (defun slackit-thread--ensure-timeline ()
   "Ensure the current thread owns one Appkit timeline."
@@ -93,7 +109,7 @@
                        (slackit-history-slice-messages all))))
     (slackit-thread--ensure-timeline)
     (appkit-chat-timeline-sync
-     (slackit-thread--project visible)
+     (slackit-thread--project app state visible)
      :force-keys force-keys
      :changed-resources resources)
     (appkit-chat-timeline-set-frame
@@ -148,12 +164,26 @@
 
 (defun slackit-thread--sync (view invalidations)
   "Synchronize thread VIEW from coalesced INVALIDATIONS."
-  (let ((events (appkit-view-pending-events-snapshot view)))
+  (let* ((events (appkit-view-pending-events-snapshot view))
+         (parts (appkit-invalidations-parts invalidations))
+         (geometry-p (memq 'geometry parts))
+         (entries (appkit-invalidations-entry-keys invalidations))
+         (resources (appkit-invalidations-resource-keys invalidations)))
+    (when geometry-p
+      (when-let* ((width
+                   (appkit-view-responsive-width
+                    slackit-room-auto-fill-margin-columns)))
+        (setq-local fill-column width)))
     (dolist (event events) (slackit-thread--apply-event view event))
     (appkit-view-acknowledge-events view (length events))
     (slackit-thread--render
-     (appkit-invalidations-entry-keys invalidations)
-     (appkit-invalidations-resource-keys invalidations))))
+     (if geometry-p
+         (delete-dups
+          (append entries
+                  (and (appkit-chat-timeline-live-p)
+                       (appkit-chat-timeline-keys))))
+       entries)
+     resources)))
 
 (defun slackit-thread--setup (app conversation-id root-ts _view)
   "Initialize one newly attached APP thread view."
@@ -179,11 +209,14 @@
                                      (appkit-app-id app) name root-ts)
                 :state (cons conversation-id root-ts)
                 :sync-function #'slackit-thread--sync
-                :parts '(frame timeline composer)
+                :parts '(frame timeline composer geometry)
                 :setup (apply-partially
                         #'slackit-thread--setup
                         app conversation-id root-ts)
                 :select select)))
+    (setf (appkit-view-sync-function view) #'slackit-thread--sync
+          (appkit-view-parts view) '(frame timeline composer geometry))
+    (appkit-view-enable-responsive-geometry view)
     (with-current-buffer (appkit-view-buffer view)
       (setq-local slackit-room--app app
                   slackit-room--conversation-id conversation-id
@@ -191,7 +224,8 @@
       (unless existing
         (slackit-history-load-latest view conversation-id root-ts)
         (appkit-invalidate view :structure t)
-        (appkit-sync-invalidations view)))
+        (appkit-sync-invalidations view))
+      (appkit-view-refresh-responsive-geometry))
     view))
 
 (defun slackit-thread-load-older ()

@@ -64,16 +64,10 @@
            (self `((id . ,(slackit-normalize-get body 'user_id))
                    (name . ,(slackit-normalize-get body 'user)))))
       (slackit-state-put-team-self state team self)
+      (slackit-state-put-user state self)
       (slackit-state-set-bootstrap-complete state 'identity)
       (slackit--bootstrap-maybe-complete app operation))))
 
-(defun slackit--bootstrap-users-page (app operation users)
-  "Reduce one USERS page for current APP bootstrap OPERATION."
-  (when (slackit-runtime-operation-current-p app operation)
-    (let* ((state (slackit-runtime-state app))
-           (ids (slackit-state-put-users state users)))
-      (slackit-runtime-publish-changes
-       app (mapcar (lambda (id) (list :kind 'user :user-id id)) ids)))))
 
 (defun slackit--bootstrap-conversations-page (app operation conversations)
   "Reduce one CONVERSATIONS page for current APP bootstrap OPERATION."
@@ -93,26 +87,23 @@
     (slackit--bootstrap-maybe-complete app operation)))
 
 (defun slackit-bootstrap-account (app)
-  "Start cursor-complete identity/users/conversations bootstrap for APP."
+  "Start identity and conversation bootstrap for APP.
+
+The user cache is ready immediately and grows through exact `users.info'
+lookups requested by visible conversations and messages.  Startup never scans
+the workspace-wide `users.list' collection."
   (let* ((key '(bootstrap))
          (operation (slackit-runtime-operation-begin app key))
          (state (slackit-runtime-state app))
          (failure (apply-partially
                    #'slackit--bootstrap-failure app operation)))
     (slackit-state-bootstrap-reset state)
+    (slackit-state-set-bootstrap-complete state 'users)
     (slackit-runtime-publish-bootstrap app)
     (slackit-api-auth-test
      app
      :on-success (apply-partially
                   #'slackit--bootstrap-identity-success app operation)
-     :on-error failure)
-    (slackit-api-users-list-all
-     app
-     :on-page (apply-partially
-               #'slackit--bootstrap-users-page app operation)
-     :on-complete (apply-partially
-                   #'slackit--bootstrap-collection-complete
-                   app operation 'users)
      :on-error failure)
     (slackit-api-conversations-list-all
      app

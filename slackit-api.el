@@ -89,14 +89,15 @@
    :on-success on-success
    :on-error on-error))
 
-(cl-defun slackit-api-users-list-all
-    (app &key on-page on-complete on-error)
-  "Fetch every Slack user page for APP."
-  (slackit-api--paginate
-   app "users.list" 'members
-   :parameters '((limit . 200))
-   :on-page on-page
-   :on-complete on-complete
+(cl-defun slackit-api-user-info
+    (app user-id &key on-success on-error)
+  "Fetch exact Slack USER-ID for APP."
+  (slackit-api-request
+   app "users.info"
+   :method 'get
+   :parameters `((user . ,user-id))
+   :idempotent-p t
+   :on-success on-success
    :on-error on-error))
 
 (cl-defun slackit-api-conversations-list-all
