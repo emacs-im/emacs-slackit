@@ -136,6 +136,11 @@ Startup never scans the workspace-wide `users.list' collection."
      :on-error failure)
     operation))
 
+(defun slackit--start-authenticated-services (app)
+  "Start realtime and custom emoji services for authenticated APP."
+  (slackit-realtime-start app)
+  (slackit-emoji-load-catalog app))
+
 (defun slackit-start-account (account-id &optional credential)
   "Start ACCOUNT-ID, authenticate it, start realtime, and open its root.
 
@@ -153,7 +158,8 @@ When CREDENTIAL is nil, resolve it through
                   (slackit-runtime-start-account account-id resolved))))
     (slackit-root-open app t)
     (unless existing
-      (slackit-bootstrap-account app #'slackit-realtime-start))
+      (slackit-bootstrap-account
+       app #'slackit--start-authenticated-services))
     app))
 
 (defun slackit--login-error (account-id error)

@@ -784,9 +784,9 @@
             '((channel . "C1")
               (ts . "1.000001")
               (user . "U2")
-              (text . "please :pray: :slightly_smiling_face: :unknown:")
+              (text . "please :pray: :laughing: :slightly_smiling_face: :unknown:")
               (reactions
-               . (((name . "pray") (count . 2) (users . ("U1"))))))))
+               . (((name . "laughing") (count . 2) (users . ("U1"))))))))
       (slackit-state-put-team-self
        state '((id . "T1")) '((id . "U1") (name . "self")))
       (slackit-state-put-user state '((id . "U2") (name . "alice")))
@@ -800,14 +800,15 @@
              app state message
              (slackit-room--message-context nil message))
             (should (string-match-p
-                     "🙏.*🙂.*:unknown:" (buffer-string)))
+                     "🙏.*😆.*🙂.*:unknown:" (buffer-string)))
             (let ((button (next-button (point-min))))
               (should button)
               (button-activate button)
-              (should (equal (list app "C1" "1.000001" "pray")
+              (should (equal (list app "C1" "1.000001" "laughing")
                              toggled)))))
-        (should (equal "please :pray: :slightly_smiling_face: :unknown:"
-                       (slackit-normalize-get message 'text)))))))
+        (should (equal
+                 "please :pray: :laughing: :slightly_smiling_face: :unknown:"
+                 (slackit-normalize-get message 'text)))))))
 
 (ert-deftest slackit-contract-avatar-prefers-circular-derived-image ()
   (let ((file (make-temp-file "slackit-round-avatar-" nil ".png")))
@@ -839,14 +840,16 @@
       (clrhash slackit-avatar--image-cache)
       (when (file-exists-p file) (delete-file file)))))
 
-(ert-deftest slackit-contract-media-cards-fetch-only-public-posters ()
+(ert-deftest slackit-contract-file-images-use-origin-bound-private-previews ()
   (slackit-test-with-app (app "media")
     (let* ((root (make-temp-file "slackit-media-test-" t))
            (slackit-media-cache-directory
             (expand-file-name "media/" root))
            (public-url "https://cdn.example.invalid/public-image.png")
            (private-url
-            "https://files.slack.com/files-pri/T1/private-image.png")
+            "https://files.slack.com/files-pri/T1-F1/private-image.png")
+           (thumbnail-url
+            "https://files.slack.com/files-tmb/T1-F1/private-image_1024.png")
            (message
             `((channel . "C1")
               (ts . "1.000001")
@@ -862,13 +865,22 @@
                    (name . "private.png")
                    (mimetype . "image/png")
                    (permalink . "https://workspace.slack.com/files/U1/F1")
-                   (url_private . ,private-url))))))
-           source)
+                   (url_private . ,private-url)
+                   (thumb_1024 . ,thumbnail-url))))))
+           public-source
+           private-source
+           private-headers)
       (unwind-protect
           (progn
             (clrhash slackit-media--fetches)
             (clrhash slackit-media--failures)
             (clrhash slackit-media--image-cache)
+            (setq message (slackit-normalize-message message "C1"))
+            (should
+             (equal thumbnail-url
+                    (slackit-normalize-get
+                     (car (slackit-normalize-get message 'files))
+                     'thumb_1024)))
             (cl-letf
                 (((symbol-function
                    'appkit-media-inline-image-rendering-available-p)
@@ -877,18 +889,53 @@
                    'appkit-media-cache-image-resource-async)
                   (lambda (resource _cache _success _failure &rest arguments)
                     (should-not arguments)
-                    (setq source (alist-get 'url resource))
-                    nil)))
+                    (setq public-source (alist-get 'url resource))
+                    nil))
+                 ((symbol-function 'plz)
+                  (lambda (method url &rest arguments)
+                    (should (eq method 'get))
+                    (should-not (member "--location" plz-curl-default-args))
+                    (setq private-source url
+                          private-headers (plist-get arguments :headers))
+                    (let* ((as (plist-get arguments :as))
+                           (file (cadr as)))
+                      (with-temp-file file
+                        (set-buffer-multibyte nil)
+                        (insert "synthetic image"))
+                      (funcall (plist-get arguments :then) file))
+                    nil))
+                 ((symbol-function 'appkit-media-preview-image-from-file)
+                  (lambda (_file) 'decoded-private-image))
+                 ((symbol-function 'appkit-media-insert-image-slices)
+                  (lambda (image &rest _arguments)
+                    (should (eq image 'decoded-private-image))
+                    (insert "[decoded private preview]"))))
               (slackit-media-ensure-message app message)
+              (should (equal public-url public-source))
+              (should (equal thumbnail-url private-source))
+              (should
+               (equal "Bearer xoxp-CANARY-TOKEN"
+                      (cdr (assoc "Authorization" private-headers))))
+              (should
+               (equal "d=xoxd-CANARY-COOKIE"
+                      (cdr (assoc "Cookie" private-headers))))
+              (should (equal "https://app.slack.com/"
+                             (cdr (assoc "Referer" private-headers))))
+              (should-not (assoc "Origin" private-headers))
               (should-not
                (string-match-p
                 (regexp-quote private-url)
                 (prin1-to-string
                  (slackit-media-message-resource-keys app message))))
+              (should-not
+               (slackit-media--private-source-p
+                "https://files.slack.com.attacker.invalid/files-tmb/T1-F1/x.png"))
               (with-temp-buffer
                 (slackit-media-insert-message-cards app message)
                 (should (string-match-p "Public image" (buffer-string)))
                 (should (string-match-p "private.png" (buffer-string)))
+                (should (string-match-p
+                         "decoded private preview" (buffer-string)))
                 (should-not (string-match-p
                              (regexp-quote private-url)
                              (buffer-string))))))
@@ -896,6 +943,70 @@
         (clrhash slackit-media--failures)
         (clrhash slackit-media--image-cache)
         (when (file-directory-p root) (delete-directory root t))))))
+
+(ert-deftest slackit-contract-custom-emoji-catalog-resolves-aliases-and-images ()
+  (slackit-test-with-app (app "custom-emoji")
+    (let (published ensured-key ensured-url)
+      (cl-letf
+          (((symbol-function 'slackit-api-emoji-list)
+            (lambda (_app &rest arguments)
+              (funcall
+               (plist-get arguments :on-success)
+               '((emoji
+                  . ((happy . "alias:laughing")
+                     (party
+                      . "https://emoji.slack-edge.com/T1/party/hash.gif")))))))
+           ((symbol-function 'slackit-runtime-publish-resource)
+            (lambda (_app resource) (setq published resource)))
+           ((symbol-function 'slackit-media-ensure-public-image)
+            (lambda (_app key url)
+              (setq ensured-key key ensured-url url)))
+           ((symbol-function 'slackit-media-cached-image)
+            (lambda (_key) 'raw-custom-image))
+           ((symbol-function 'appkit-chat-avatar-line-pixel-height)
+            (lambda () 18))
+           ((symbol-function 'appkit-chat-avatar-resize-image)
+            (lambda (image size)
+              (should (eq image 'raw-custom-image))
+              (should (= size 18))
+              'inline-custom-image)))
+        (slackit-emoji-load-catalog app)
+        (should (equal published (slackit-emoji-resource-key app)))
+        (should-not
+         (gethash '(emoji-catalog) (appkit-app-request-table app)))
+        (should (equal "😆"
+                       (slackit-emoji-display-string app "laughing")))
+        (should (equal "😆"
+                       (slackit-emoji-display-string app "happy")))
+        (let ((display (slackit-emoji-display-string app "party")))
+          (should (equal " " (substring-no-properties display)))
+          (should (eq 'inline-custom-image
+                      (get-text-property 0 'display display))))
+        (let* ((candidates (slackit-emoji-completion-candidates app))
+               (laughing
+                (seq-find
+                 (lambda (candidate)
+                   (equal ":laughing:"
+                          (appkit-chat-completion-candidate-label candidate)))
+                 candidates))
+               (party
+                (seq-find
+                 (lambda (candidate)
+                   (equal ":party:"
+                          (appkit-chat-completion-candidate-label candidate)))
+                 candidates)))
+          (should laughing)
+          (should party)
+          (should
+           (equal ":laughing:"
+                  (appkit-chat-completion-candidate-insert laughing))))
+        (let ((message '((text . ":party:"))))
+          (slackit-emoji-ensure-message app message)
+          (should
+           (equal "https://emoji.slack-edge.com/T1/party/hash.gif"
+                  ensured-url))
+          (should (member ensured-key
+                          (slackit-emoji-message-resource-keys app message))))))))
 
 (ert-deftest slackit-contract-entity-decoding-is-one-pass ()
   (should

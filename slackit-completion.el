@@ -17,6 +17,7 @@
 (require 'slackit-render)
 (require 'slackit-runtime)
 (require 'slackit-state)
+(require 'slackit-emoji)
 
 (declare-function slackit-room-current-app "slackit-room" ())
 
@@ -99,6 +100,16 @@
   "Complete a #channel token in the current composer."
   (slackit-completion--capf ?# (slackit-completion--channel-candidates)))
 
+(defun slackit-completion-emoji-capf ()
+  "Complete a Slack :emoji: token for the current account."
+  (when-let* ((bounds (appkit-chat-completion-delimited-token-bounds ?:))
+              (app (slackit-room-current-app))
+              (candidates (slackit-emoji-completion-candidates app)))
+    (appkit-chat-completion-capf
+     (plist-get bounds :start)
+     (plist-get bounds :end)
+     candidates)))
+
 (defun slackit-completion--insert-read-candidate (prompt candidates)
   "Read one CANDIDATES item with PROMPT and insert it at point."
   (unless (appkit-chatbuf-point-in-input-p)
@@ -152,7 +163,8 @@
   "Install structured Slack completion in the current chat buffer."
   (appkit-chat-completion-setup
    :capf-functions '(slackit-completion-user-capf
-                     slackit-completion-channel-capf)))
+                     slackit-completion-channel-capf
+                     slackit-completion-emoji-capf)))
 
 (provide 'slackit-completion)
 

@@ -30,18 +30,13 @@
                (:constructor slackit-realtime-timer-create))
   app generation kind token timer handle)
 
-(defconst slackit-realtime--browser-user-agent
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
-  "Browser protocol User-Agent used only for Slack WebSocket upgrades.")
-
 (defconst slackit-realtime--browser-start-args
   "?agent=client&org_wide_aware=true&agent_version=1785403654&eac_cache_ts=true&cache_ts=0&name_tagging=true&only_self_subteams=true&connect_only=true&ms_latest=true"
   "Captured Slack browser client arguments encoded into the WebSocket URL.")
 
 (defun slackit-realtime--gateway-url (app)
   "Return APP's authenticated Slack Web/Desktop gateway URL, or nil."
-  (let* ((credential
-          (slackit-transport-credential (slackit-runtime-transport app)))
+  (let* ((credential (slackit-runtime-credential app))
          (token (and credential (slackit-credential-token credential)))
          (team-id (and credential (slackit-credential-team-id credential))))
     (when (and (stringp token) (not (string-empty-p token))
@@ -318,16 +313,9 @@
 
 (defun slackit-realtime--websocket-headers (app)
   "Return account-local browser headers for APP's WebSocket upgrade."
-  (let* ((credential (slackit-transport-credential
-                      (slackit-runtime-transport app)))
-         (cookie (and credential (slackit-credential-cookie credential)))
-         (d-cookie
-          (and (stringp cookie)
-               (string-match
-                "\\(?:\\`\\|;[[:space:]]*\\)d=\\([^;]+\\)" cookie)
-               (match-string 1 cookie))))
+  (let ((d-cookie (slackit-runtime-credential-cookie-value app "d")))
     (append
-     `(("User-Agent" . ,slackit-realtime--browser-user-agent)
+     `(("User-Agent" . ,slackit-browser-user-agent)
        ("Accept-Language" . "en-US,en;q=0.9")
        ("Cache-Control" . "no-cache")
        ("Pragma" . "no-cache")

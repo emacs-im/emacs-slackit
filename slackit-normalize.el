@@ -75,14 +75,21 @@
     (format "%s" value)))
 
 (defun slackit-normalize--safe-file (file)
-  "Return non-fetching canonical summary for Slack FILE."
+  "Return canonical presentation and fetch metadata for Slack FILE."
   (let ((normalized (slackit-normalize-object file)))
     (delq nil
           (mapcar (lambda (key)
                     (when-let* ((value (slackit-normalize-get normalized key)))
                       (cons key value)))
                   '(id name title mimetype filetype size permalink
-                       permalink_public mode pretty_type)))))
+                       permalink_public mode pretty_type url_private
+                       url_private_download thumb_64 thumb_80 thumb_160
+                       thumb_360 thumb_360_w thumb_360_h
+                       thumb_480 thumb_480_w thumb_480_h
+                       thumb_720 thumb_720_w thumb_720_h
+                       thumb_960 thumb_960_w thumb_960_h
+                       thumb_1024 thumb_1024_w thumb_1024_h
+                       original_w original_h)))))
 
 (defun slackit-normalize--reaction (reaction)
   "Return canonical Slack REACTION alist."

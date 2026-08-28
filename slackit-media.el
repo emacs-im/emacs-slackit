@@ -1,13 +1,13 @@
-;;; slackit-media.el --- Slack media cards and public posters -*- lexical-binding: t; -*-
+;;; slackit-media.el --- Slack media cards and image previews -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Slackit contributors
 
 ;;; Commentary:
 
 ;; Adapt normalized Slack Block Kit media and file metadata to Appkit cards.
-;; Only credential-free public Block Kit image sources are acquired.  Slack
-;; file URLs and thumbnails remain browser-link metadata and never enter the
-;; media transfer runtime.
+;; Public sources remain credential-free.  Exact files.slack.com image
+;; thumbnails use only their owning account's bearer token and d cookie through
+;; a no-redirect, account-owned transfer.
 
 ;;; Code:
 
@@ -15,6 +15,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'url-parse)
+(require 'plz)
 (require 'appkit-core)
 (require 'appkit-chat-ins)
 (require 'appkit-media)
@@ -25,17 +26,17 @@
 
 (defcustom slackit-media-cache-directory
   (locate-user-emacs-file "slackit/media/")
-  "Directory containing account-isolated public Slack media posters."
+  "Directory containing account-isolated cached Slack media images."
   :type 'directory
   :group 'slackit)
 
 (defcustom slackit-media-retry-delay 60
-  "Seconds before a failed public Slack poster may be requested again."
+  "Seconds before a failed Slack media image may be requested again."
   :type 'number
   :group 'slackit)
 
 (defcustom slackit-media-failure-limit 128
-  "Maximum number of public poster failures retained in memory."
+  "Maximum number of media image failures retained in memory."
   :type 'integer
   :group 'slackit)
 
@@ -45,6 +46,7 @@
   generation
   resource-key
   transfer
+  cache-file
   handle)
 
 (defvar slackit-media--image-cache (make-hash-table :test #'equal)
@@ -108,6 +110,24 @@
         (string-equal host "slack-files.com")
         (string-suffix-p ".slack-files.com" host)
         (string-match-p "/files-\\(?:pri\\|tmb\\)/" path))))
+
+(defun slackit-media--private-source-p (url)
+  "Return non-nil when URL is an exact authenticated Slack file image source."
+  (and (slackit-media--non-empty-string url)
+       (not (string-match-p "[[:space:]\"\\\\]" url))
+       (condition-case nil
+           (let* ((parsed (url-generic-parse-url url))
+                  (host (downcase (or (url-host parsed) "")))
+                  (path (or (url-filename parsed) ""))
+                  (port (url-port parsed)))
+             (and (string-equal (url-type parsed) "https")
+                  (string-equal host "files.slack.com")
+                  (or (null port) (= port 443))
+                  (null (url-user parsed))
+                  (null (url-password parsed))
+                  (string-match-p
+                   "\\`/files-\\(?:tmb\\|pri\\)/[^/]+/.+\\'" path)))
+         (error nil))))
 
 (defun slackit-media--public-source-p (url)
   "Return non-nil when URL is a credential-free public HTTPS image source."
@@ -263,6 +283,23 @@
   (let ((url (slackit-normalize-get file 'permalink)))
     (and (slackit-media--browser-page-url-p url) url)))
 
+(defconst slackit-media--file-preview-fields
+  '(thumb_1024 thumb_960 thumb_720 thumb_480 thumb_360
+    thumb_160 thumb_80 thumb_64)
+  "Slack file image fields in preferred preview order.")
+
+(defun slackit-media--file-preview-source (file kind)
+  "Return FILE preview source for media KIND, or nil."
+  (when (memq kind '(photo video))
+    (or
+     (cl-loop for field in slackit-media--file-preview-fields
+              for value = (slackit-normalize-get file field)
+              when (slackit-media--non-empty-string value)
+              return value)
+     (and (eq kind 'photo)
+          (slackit-media--non-empty-string
+           (slackit-normalize-get file 'url_private))))))
+
 (defun slackit-media--file-meta (file)
   "Return safe compact metadata strings for normalized Slack FILE."
   (let ((type (or (slackit-media--non-empty-string
@@ -285,19 +322,30 @@
    when (listp file)
    collect
    (let* ((id (slackit-normalize-get file 'id))
+          (kind (slackit-media--file-kind file))
+          (source (slackit-media--file-preview-source file kind))
           (identity
            (if (slackit-media--non-empty-string id)
                (list 'id id)
              (list 'index index
                    (slackit-normalize-get file 'name)
                    (slackit-normalize-get file 'mimetype)
-                   (slackit-normalize-get file 'size)))))
+                   (slackit-normalize-get file 'size))))
+          (private-source-p (slackit-media--private-source-p source)))
      (list :class 'file
-           :kind (slackit-media--file-kind file)
+           :kind kind
            :resource-key (slackit-media--resource-key app 'file identity)
+           :source (and (or private-source-p
+                            (slackit-media--public-source-p source))
+                        source)
+           :private-source-p private-source-p
            :title (slackit-media--file-title file)
            :meta (slackit-media--file-meta file)
-           :page-url (slackit-media--file-page-url file)))))
+           :page-url
+           (or (and source
+                    (slackit-media--browser-page-url-p source)
+                    source)
+               (slackit-media--file-page-url file))))))
 
 (defun slackit-media--message-items (app message)
   "Return deterministic media card item plists for APP and MESSAGE."
@@ -323,7 +371,7 @@
            (slackit-media--message-items app message))))
 
 (defun slackit-media--prepare-cache-directory ()
-  "Prepare and return the private public-poster cache directory."
+  "Prepare and return the private media image cache directory."
   (let ((directory (expand-file-name slackit-media-cache-directory)))
     (unless (and (equal directory slackit-media--prepared-cache-directory)
                  (file-directory-p directory))
@@ -338,6 +386,82 @@
   (expand-file-name
    (secure-hash 'sha256 (prin1-to-string resource-key))
    slackit-media-cache-directory))
+
+(defun slackit-media-resource-key (app kind identity)
+  "Return an opaque account-scoped media key for APP, KIND, and IDENTITY."
+  (slackit-media--resource-key app kind identity))
+
+(defun slackit-media-cached-image (resource-key)
+  "Return RESOURCE-KEY's decoded image without starting acquisition."
+  (slackit-media--cached-image resource-key))
+
+(defun slackit-media--source-extension (source)
+  "Return a safe image filename extension inferred from SOURCE."
+  (condition-case nil
+      (let* ((parsed (url-generic-parse-url source))
+             (path (car (split-string (or (url-filename parsed) "") "[?#]")))
+             (extension (downcase (or (file-name-extension path) ""))))
+        (if (string-match-p "\\`[[:alnum:]]\\{1,8\\}\\'" extension)
+            extension
+          "img"))
+    (error "img")))
+
+(defun slackit-media--private-cache-file (resource-key source)
+  "Return non-existing private cache filename for RESOURCE-KEY and SOURCE."
+  (concat (slackit-media--cache-base resource-key)
+          "."
+          (slackit-media--source-extension source)))
+
+(defun slackit-media--private-headers (app)
+  "Return account-local browser image headers for APP."
+  (let* ((credential (slackit-runtime-credential app))
+         (token (and credential (slackit-credential-token credential)))
+         (d-cookie (slackit-runtime-credential-cookie-value app "d")))
+    (unless (and (stringp token) (not (string-empty-p token))
+                 (stringp d-cookie) (not (string-empty-p d-cookie)))
+      (error "slackit: authenticated media credential is unavailable"))
+    `(("User-Agent" . ,slackit-browser-user-agent)
+      ("Accept" . "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+      ("Accept-Language" . "en-US,en;q=0.9")
+      ("Referer" . "https://app.slack.com/")
+      ("Sec-Fetch-Site" . "same-site")
+      ("Sec-Fetch-Mode" . "no-cors")
+      ("Sec-Fetch-Dest" . "image")
+      ("Cache-Control" . "no-cache")
+      ("Pragma" . "no-cache")
+      ("Priority" . "i")
+      ("Authorization" . ,(concat "Bearer " token))
+      ("Cookie" . ,(concat "d=" d-cookie)))))
+
+(defun slackit-media--cancel-transfer (transfer)
+  "Cancel Appkit or plz media TRANSFER."
+  (cond
+   ((appkit-media-transfer-p transfer)
+    (appkit-media-cancel-transfer transfer))
+   ((and (processp transfer) (process-live-p transfer))
+    (delete-process transfer))))
+
+(defun slackit-media--private-transfer (owner item)
+  "Start exact authenticated image transfer for OWNER and ITEM."
+  (let* ((app (slackit-media-fetch-app owner))
+         (source (plist-get item :source))
+         (key (slackit-media-fetch-resource-key owner))
+         (cache-file (slackit-media--private-cache-file key source))
+         (plz-curl-default-args
+          (remove "--location" plz-curl-default-args)))
+    (unless (slackit-media--private-source-p source)
+      (error "slackit: rejected authenticated media URL"))
+    (when (file-exists-p cache-file)
+      (delete-file cache-file))
+    (setf (slackit-media-fetch-cache-file owner) cache-file)
+    (plz 'get source
+      :headers (slackit-media--private-headers app)
+      :as `(file ,cache-file)
+      :decode nil
+      :timeout slackit-http-timeout
+      :connect-timeout slackit-http-timeout
+      :then (apply-partially #'slackit-media--fetch-success owner)
+      :else (apply-partially #'slackit-media--fetch-failure owner))))
 
 (defun slackit-media--cached-image (resource-key)
   "Return RESOURCE-KEY's decoded cached poster without starting acquisition."
@@ -372,14 +496,17 @@
          (eq owner (gethash key slackit-media--fetches)))))
 
 (defun slackit-media--cancel-fetch (owner)
-  "Cancel account-owned poster fetch OWNER without publishing."
+  "Cancel account-owned image fetch OWNER without publishing."
   (let ((key (slackit-media-fetch-resource-key owner)))
     (when (eq owner (gethash key slackit-media--fetches))
       (remhash key slackit-media--fetches))
     (when-let* ((transfer (slackit-media-fetch-transfer owner)))
       (setf (slackit-media-fetch-transfer owner) nil)
-      (when (appkit-media-transfer-p transfer)
-        (appkit-media-cancel-transfer transfer)))))
+      (slackit-media--cancel-transfer transfer))
+    (when-let* ((file (slackit-media-fetch-cache-file owner)))
+      (setf (slackit-media-fetch-cache-file owner) nil)
+      (when (file-exists-p file)
+        (ignore-errors (delete-file file))))))
 
 (defun slackit-media--retire-fetch (owner)
   "Retire completed poster fetch OWNER and its Appkit handle."
@@ -392,7 +519,7 @@
         (appkit-retire-handle handle)))))
 
 (defun slackit-media--trim-failures ()
-  "Keep the in-memory public poster failure table within its configured bound."
+  "Keep the in-memory image failure table within its configured bound."
   (let ((limit (max 1 slackit-media-failure-limit)))
     (while (> (hash-table-count slackit-media--failures) limit)
       (let (oldest-key oldest-time)
@@ -411,7 +538,7 @@
   (slackit-media--trim-failures))
 
 (defun slackit-media--fetch-success (owner file)
-  "Settle poster fetch OWNER from private cache FILE."
+  "Settle image fetch OWNER from private cache FILE."
   (let* ((current-p (slackit-media--owner-current-p owner))
          (app (slackit-media-fetch-app owner))
          (key (slackit-media-fetch-resource-key owner))
@@ -433,15 +560,23 @@
         (when (file-exists-p file)
           (ignore-errors (delete-file file)))
         (slackit-media--record-failure key)))
+    (unless current-p
+      (when (file-exists-p file)
+        (ignore-errors (delete-file file))))
+    (setf (slackit-media-fetch-cache-file owner) nil)
     (slackit-media--retire-fetch owner)
     (when current-p
       (slackit-runtime-publish-resource app key))))
 
 (defun slackit-media--fetch-failure (owner _reason)
-  "Settle failed poster fetch OWNER without exposing remote details."
+  "Settle failed image fetch OWNER without exposing remote details."
   (let ((current-p (slackit-media--owner-current-p owner))
         (app (slackit-media-fetch-app owner))
         (key (slackit-media-fetch-resource-key owner)))
+    (when-let* ((file (slackit-media-fetch-cache-file owner)))
+      (setf (slackit-media-fetch-cache-file owner) nil)
+      (when (file-exists-p file)
+        (ignore-errors (delete-file file))))
     (when current-p
       (slackit-media--record-failure key))
     (slackit-media--retire-fetch owner)
@@ -456,7 +591,7 @@
             (max 0 slackit-media-retry-delay)))))
 
 (defun slackit-media--ensure-item (app item)
-  "Start one deduplicated public poster acquisition for APP and ITEM."
+  "Start one deduplicated image acquisition for APP and ITEM."
   (let ((source (plist-get item :source))
         (key (plist-get item :resource-key)))
     (when (and source key
@@ -481,30 +616,37 @@
         (slackit-runtime-publish-resource app key)
         (condition-case nil
             (let ((transfer
-                   (appkit-media-cache-image-resource-async
-                    (appkit-media-resource-create
-                     :url source :name "slack-poster.img"
-                     :mime-type "image/*")
-                    (slackit-media--cache-base key)
-                    (apply-partially #'slackit-media--fetch-success owner)
-                    (apply-partially #'slackit-media--fetch-failure owner))))
+                   (if (plist-get item :private-source-p)
+                       (slackit-media--private-transfer owner item)
+                     (appkit-media-cache-image-resource-async
+                      (appkit-media-resource-create
+                       :url source :name "slack-image.img"
+                       :mime-type "image/*")
+                      (slackit-media--cache-base key)
+                      (apply-partially #'slackit-media--fetch-success owner)
+                      (apply-partially #'slackit-media--fetch-failure owner)))))
               (if (slackit-media--owner-current-p owner)
                   (setf (slackit-media-fetch-transfer owner) transfer)
-                (when (appkit-media-transfer-p transfer)
-                  (appkit-media-cancel-transfer transfer))))
+                (slackit-media--cancel-transfer transfer)))
           (error (slackit-media--fetch-failure owner nil)))
         owner))))
 
 (defun slackit-media-ensure-message (app message)
-  "Start deduplicated public poster acquisition for APP's normalized MESSAGE.
+  "Start deduplicated image acquisition for APP's normalized MESSAGE.
 
 This function only acquires resources.  Rendering remains a separate,
 deterministic operation in `slackit-media-insert-message-cards'."
   (when (and (appkit-app-live-p app)
              (appkit-media-inline-image-rendering-available-p))
-    (dolist (item (slackit-media--block-items app message))
+    (dolist (item (slackit-media--message-items app message))
       (slackit-media--ensure-item app item)))
   nil)
+
+(defun slackit-media-ensure-public-image (app resource-key source)
+  "Ensure credential-free public image SOURCE for APP and RESOURCE-KEY."
+  (when (slackit-media--public-source-p source)
+    (slackit-media--ensure-item
+     app (list :source source :resource-key resource-key))))
 
 (defun slackit-media--browser-action (url)
   "Return a zero-argument exact browser action for URL, or nil."
@@ -558,7 +700,8 @@ deterministic operation in `slackit-media-insert-message-cards'."
 (defun slackit-media--insert-item-card (item prefix properties)
   "Insert one deterministic media ITEM card using PREFIX and PROPERTIES."
   (let* ((context (slackit-media--item-context item))
-         (block-p (eq (plist-get item :class) 'block))
+         (preview-p (and (plist-get item :source)
+                         (memq (plist-get item :kind) '(photo video))))
          (meta (plist-get item :meta)))
     (appkit-chat-ins-insert-media-card
      :kind (plist-get item :kind)
@@ -573,7 +716,7 @@ deterministic operation in `slackit-media-insert-message-cards'."
                          "Open exact Slack media page in browser"
                        "Media page unavailable")
      :body-inserter
-     (and block-p
+     (and preview-p
           (lambda (prefix-state)
             (slackit-media--insert-poster item context prefix-state))))))
 
@@ -586,7 +729,7 @@ function only observes memory and disk cache state; it never starts transfer."
     (slackit-media--insert-item-card item prefix properties)))
 
 (defun slackit-media-clear-memory-cache ()
-  "Clear decoded public poster images and bounded failure state."
+  "Clear decoded media images and bounded failure state."
   (clrhash slackit-media--image-cache)
   (clrhash slackit-media--failures)
   (appkit-media-clear-video-decoration-cache 'slackit))

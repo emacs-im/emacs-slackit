@@ -86,6 +86,28 @@
     (error "slackit: invalid account transport"))
   (appkit-app-transport app))
 
+(defun slackit-runtime-credential (app)
+  "Return the credential owned by Slackit APP, or nil."
+  (slackit-transport-credential (slackit-runtime-transport app)))
+
+(defun slackit-runtime-credential-cookie-value (app name)
+  "Return APP credential cookie NAME without exposing sibling cookies."
+  (unless (and (stringp name)
+               (string-match-p "\\`[[:alnum:]-]+\\'" name))
+    (error "slackit: invalid credential cookie name"))
+  (let ((cookie
+         (when-let* ((credential (slackit-runtime-credential app)))
+           (slackit-credential-cookie credential))))
+    (when (stringp cookie)
+      (if (and (equal name "d")
+               (not (string-match-p "=" cookie)))
+          cookie
+        (when (string-match
+               (format "\\(?:\\`\\|;[[:space:]]*\\)%s=\\([^;]+\\)"
+                       (regexp-quote name))
+               cookie)
+          (match-string 1 cookie))))))
+
 (defun slackit-runtime-bind-credential-identity (app team-id user-id)
   "Bind authenticated TEAM-ID and USER-ID to APP's credential.
 

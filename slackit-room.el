@@ -25,6 +25,7 @@
 (require 'slackit-state)
 (require 'slackit-avatar)
 (require 'slackit-media)
+(require 'slackit-emoji)
 
 (declare-function slackit-compose-submit "slackit-compose" ())
 (declare-function slackit-compose-apply-settlement "slackit-compose" (event))
@@ -206,7 +207,8 @@
                         (slackit-avatar-resource-key app subject)))
                   (slackit-render-reference-dependencies
                    (slackit-normalize-get message 'text))
-                  (slackit-media-message-resource-keys app message))))))
+                  (slackit-media-message-resource-keys app message)
+                  (slackit-emoji-message-resource-keys app message))))))
     (when user-id
       (slackit-runtime-ensure-user app user-id))
     (when (and slackit-show-avatars
@@ -214,6 +216,7 @@
                subject)
       (slackit-avatar-ensure app subject))
     (slackit-media-ensure-message app message)
+    (slackit-emoji-ensure-message app message)
     resources))
 
 (defun slackit-room--message-epoch (message)

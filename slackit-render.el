@@ -96,8 +96,8 @@
     (`(link ,label ,url) (slackit-render--insert-link label url))
     (`(text ,label) (insert label))))
 
-(defun slackit-render-insert-text (state text)
-  "Insert Slack TEXT safely, expanding references through STATE."
+(defun slackit-render-insert-text (app state text)
+  "Insert Slack TEXT safely for APP, expanding references through STATE."
   (let ((position 0)
         (length (length (or text "")))
         (source (or text "")))
@@ -142,6 +142,7 @@
                (end (min next-angle next-code)))
           (insert
            (slackit-emoji-substitute
+            app
             (slackit-render-decode-entities
              (substring source position end))))
           (setq position end)))))))
@@ -270,10 +271,10 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
   (appkit-chat-ins-insert-divider-row
    text face (slackit-render--line-fill-column)))
 
-(defun slackit-render--reaction-label (reaction)
-  "Return one display label for normalized REACTION."
+(defun slackit-render--reaction-label (app reaction)
+  "Return one display label for APP normalized REACTION."
   (let* ((name (or (slackit-normalize-get reaction 'name) "?"))
-         (emoji (slackit-emoji-display-string name))
+         (emoji (slackit-emoji-display-string app name))
          (count (or (slackit-normalize-get reaction 'count) 0)))
     (format "%s %s" (or emoji (format ":%s:" name)) count)))
 
@@ -308,7 +309,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
      :prefix "  "
      :selected-face '(slackit-reaction bold)
      :unselected-face 'slackit-reaction
-     :label-function #'slackit-render--reaction-label
+     :label-function (apply-partially #'slackit-render--reaction-label app)
      :selected-p-function
      (apply-partially #'slackit-render--reaction-selected-p self-id)
      :action-function
@@ -318,8 +319,8 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
      :help-echo-function
      (apply-partially #'slackit-render--reaction-help self-id))))
 
-(defun slackit-render--insert-primary-content (state message)
-  "Insert MESSAGE subtype marker and primary content from STATE."
+(defun slackit-render--insert-primary-content (app state message)
+  "Insert MESSAGE subtype marker and primary content for APP from STATE."
   (let ((text (or (slackit-normalize-get message 'text) ""))
         (subtype (slackit-normalize-get message 'subtype)))
     (when (and subtype
@@ -331,7 +332,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
           (insert (propertize "[Unsupported Block Kit content]"
                               'face 'slackit-status)))
       (when (equal subtype "me_message") (insert "* "))
-      (slackit-render-insert-text state text))))
+      (slackit-render-insert-text app state text))))
 
 (defun slackit-render--insert-heading
     (state message sender timestamp header-prefix body-rest-prefix)
@@ -385,7 +386,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
       (slackit-render--insert-heading
        state message sender timestamp header-prefix rest-body-prefix))
     (let ((body-start (point)))
-      (slackit-render--insert-primary-content state message)
+      (slackit-render--insert-primary-content app state message)
       (when compact
         (let ((time-span
                (slackit-render--insert-right-aligned-time

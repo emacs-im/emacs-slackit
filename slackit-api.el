@@ -80,6 +80,15 @@
                        :on-success on-success
                        :on-error on-error))
 
+(cl-defun slackit-api-emoji-list (app &key on-success on-error)
+  "Fetch APP's custom emoji catalog."
+  (slackit-api-request
+   app "emoji.list"
+   :method 'get
+   :idempotent-p t
+   :on-success on-success
+   :on-error on-error))
+
 
 (cl-defun slackit-api-user-info
     (app user-id &key on-success on-error)

@@ -19,6 +19,7 @@
   team
   self
   users
+  emojis
   conversations
   conversation-order
   messages
@@ -38,6 +39,7 @@
   "Return a new empty canonical Slackit account state."
   (slackit-state--create
    :users (make-hash-table :test #'equal)
+   :emojis (make-hash-table :test #'equal)
    :conversations (make-hash-table :test #'equal)
    :conversation-order nil
    :messages (make-hash-table :test #'equal)
@@ -123,6 +125,28 @@
 (defun slackit-state-user (state user-id)
   "Return canonical user USER-ID from STATE."
   (and user-id (gethash user-id (slackit-account-state-users state))))
+
+(defun slackit-state-set-emojis (state emojis)
+  "Replace STATE's account custom EMOJIS and return their count."
+  (let ((table (slackit-account-state-emojis state)))
+    (clrhash table)
+    (dolist (entry emojis)
+      (let ((name (cond
+                   ((symbolp (car-safe entry)) (symbol-name (car entry)))
+                   ((stringp (car-safe entry)) (car entry))))
+            (value (cdr-safe entry)))
+        (when (and name
+                   (string-match-p "\\`[+[:alnum:]_-]+\\'" name)
+                   (stringp value)
+                   (not (string-empty-p value)))
+          (puthash name value table))))
+    (slackit-state--touch state)
+    (hash-table-count table)))
+
+(defun slackit-state-emoji (state name)
+  "Return custom emoji value for exact NAME in STATE, or nil."
+  (and (stringp name)
+       (gethash name (slackit-account-state-emojis state))))
 
 (defun slackit-state-user-name (state user-id)
   "Return a stable display name for USER-ID in STATE."

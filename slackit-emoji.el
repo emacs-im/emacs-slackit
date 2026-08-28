@@ -1,85 +1,236 @@
-;;; slackit-emoji.el --- Slack emoji display resolution -*- lexical-binding: t; -*-
+;;; slackit-emoji.el --- Slack emoji catalog and display -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Slackit contributors
 
 ;;; Commentary:
 
-;; Display-only resolution of Slack emoji shortnames through Appkit's
-;; Emacs-native Unicode emoji candidates.  This module never rewrites the
-;; canonical message or reaction name held by Slackit.
+;; Render every standard Slack shortname from the bundled iamcal-derived table.
+;; Account custom emoji aliases resolve through canonical state; image-backed
+;; custom emoji use credential-free media resources.  Canonical message and
+;; reaction names are never rewritten.
 
 ;;; Code:
 
-(require 'appkit-chat-emoji)
-(require 'appkit-chat-completion)
+(require 'cl-lib)
 (require 'subr-x)
-
-(defconst slackit-emoji--aliases
-  '(("pray" . "folded_hands")
-    ("+1" . "thumbs_up")
-    ("-1" . "thumbs_down")
-    ("thumbsup" . "thumbs_up")
-    ("thumbsdown" . "thumbs_down"))
-  "Slack shortnames whose Unicode names differ from Appkit's names.")
+(require 'seq)
+(require 'appkit-chat-avatar)
+(require 'appkit-chat-completion)
+(require 'slackit-api)
+(require 'slackit-emoji-data)
+(require 'slackit-media)
+(require 'slackit-normalize)
+(require 'slackit-runtime)
+(require 'slackit-state)
 
 (defconst slackit-emoji--token-regexp
   ":[+[:alnum:]_-]+:"
   "Regexp matching one complete Slack emoji token.")
 
-(defvar slackit-emoji--glyph-table nil
-  "Private immutable cache of Slack shortnames to Unicode glyphs.")
+(defconst slackit-emoji--max-alias-hops 10
+  "Maximum custom emoji alias links followed during display.")
 
-(defun slackit-emoji--build-glyph-table ()
-  "Build a Slack shortname to Unicode glyph table from Appkit candidates."
-  (let ((table (make-hash-table :test #'equal)))
-    (dolist (candidate (appkit-chat-emoji-candidates))
-      (when (appkit-chat-completion-candidate-p candidate)
-        (let ((label (appkit-chat-completion-candidate-label candidate))
-              (glyph (appkit-chat-completion-candidate-insert candidate)))
-          (when (and (stringp label)
-                     (string-match-p
-                      (concat "\\`" slackit-emoji--token-regexp "\\'")
-                      label)
-                     (stringp glyph)
-                     (not (string-empty-p glyph)))
-            (puthash (substring label 1 -1)
-                     (substring-no-properties glyph)
-                     table)))))
-    (dolist (alias slackit-emoji--aliases)
-      (when-let* ((glyph (gethash (cdr alias) table)))
-        (puthash (car alias) glyph table)))
-    table))
+(defvar slackit-emoji--glyph-table nil
+  "Private immutable cache of Slack standard shortnames to Unicode glyphs.")
+
+(defvar slackit-emoji--standard-candidates nil
+  "Cached completion candidates for every standard Slack shortname.")
 
 (defun slackit-emoji--glyph-table ()
-  "Return the lazily initialized private Unicode glyph table."
+  "Return the lazily initialized standard Slack glyph table."
   (or slackit-emoji--glyph-table
-      (setq slackit-emoji--glyph-table
-            (slackit-emoji--build-glyph-table))))
+      (let ((table (make-hash-table :test #'equal)))
+        (mapc (lambda (entry)
+                (puthash (car entry) (cdr entry) table))
+              slackit-emoji-standard-data)
+        (setq slackit-emoji--glyph-table table))))
 
-(defun slackit-emoji--lookup (name)
-  "Return cached Unicode glyph for exact Slack shortname NAME, or nil."
-  (and (stringp name)
-       (gethash name (slackit-emoji--glyph-table))))
+(defun slackit-emoji--completion-candidate (name display group)
+  "Return a Slack emoji completion candidate for NAME, DISPLAY, and GROUP."
+  (let ((token (format ":%s:" name)))
+    (appkit-chat-completion-candidate-create
+     :label token
+     :insert token
+     :prefix (concat (or display "□") " ")
+     :search-terms (list name token)
+     :group group
+     :value (list :kind 'slack-emoji :name name))))
 
-(defun slackit-emoji-display-string (name)
-  "Return a Unicode display string for Slack shortname NAME, or nil.
+(defun slackit-emoji--standard-candidates ()
+  "Return cached completion candidates for the complete Slack standard table."
+  (or slackit-emoji--standard-candidates
+      (setq slackit-emoji--standard-candidates
+            (mapcar
+             (lambda (entry)
+               (slackit-emoji--completion-candidate
+                (car entry) (cdr entry) "Slack standard"))
+             (append slackit-emoji-standard-data nil)))))
 
-NAME has no surrounding colons.  The returned string is detached from the
-immutable internal cache, so callers may safely add text properties to it."
-  (when-let* ((glyph (slackit-emoji--lookup name)))
+(defun slackit-emoji-completion-candidates (app)
+  "Return complete standard and account custom emoji candidates for APP."
+  (let* ((customs
+          (and (appkit-app-live-p app)
+               (slackit-account-state-emojis
+                (slackit-runtime-state app))))
+         custom-candidates)
+    (when (hash-table-p customs)
+      (maphash
+       (lambda (name _value)
+         (push
+          (slackit-emoji--completion-candidate
+           name (slackit-emoji--resolve app name) "Workspace custom")
+          custom-candidates))
+       customs))
+    (append
+     (sort custom-candidates
+           (lambda (left right)
+             (string-lessp
+              (appkit-chat-completion-candidate-label left)
+              (appkit-chat-completion-candidate-label right))))
+     (if (or (not (hash-table-p customs)) (= 0 (hash-table-count customs)))
+         (slackit-emoji--standard-candidates)
+       (seq-filter
+        (lambda (candidate)
+          (not
+           (gethash
+            (plist-get
+             (appkit-chat-completion-candidate-value candidate) :name)
+            customs)))
+        (slackit-emoji--standard-candidates))))))
+
+(defun slackit-emoji-resource-key (app)
+  "Return APP's opaque custom emoji catalog resource key."
+  (list :slackit-emoji-catalog
+        (secure-hash 'sha256 (prin1-to-string (appkit-app-id app)))))
+
+(defun slackit-emoji--custom-value (app name)
+  "Return APP custom emoji value for NAME, or nil."
+  (and (appkit-app-live-p app)
+       (slackit-state-emoji (slackit-runtime-state app) name)))
+
+(defun slackit-emoji--custom-url (app name &optional seen hops)
+  "Resolve APP custom emoji NAME to an image URL, or nil.
+
+SEEN and HOPS guard malformed alias cycles."
+  (when (< (or hops 0) slackit-emoji--max-alias-hops)
+    (let ((value (slackit-emoji--custom-value app name)))
+      (cond
+       ((not (stringp value)) nil)
+       ((string-prefix-p "alias:" value)
+        (let ((target (substring value (length "alias:"))))
+          (unless (member target seen)
+            (slackit-emoji--custom-url
+             app target (cons name seen) (1+ (or hops 0))))))
+       (t value)))))
+
+(defun slackit-emoji--image-resource-key (app name url)
+  "Return opaque APP custom emoji resource key for NAME and URL."
+  (slackit-media-resource-key app 'emoji (list name url)))
+
+(defun slackit-emoji--inline-image (app name url)
+  "Return one line-sized image display string for APP NAME at URL, or nil."
+  (let* ((key (slackit-emoji--image-resource-key app name url))
+         (image (slackit-media-cached-image key))
+         (size (and image (appkit-chat-avatar-line-pixel-height)))
+         (resized
+          (and image size
+               (appkit-chat-avatar-resize-image image size))))
+    (when resized
+      (propertize
+       " "
+       'display resized
+       'help-echo (format ":%s:" name)
+       'rear-nonsticky '(display help-echo)))))
+
+(defun slackit-emoji--resolve (app name &optional seen hops)
+  "Resolve APP Slack shortname NAME to a Unicode or image display string."
+  (let ((custom (slackit-emoji--custom-value app name)))
+    (cond
+     ((and (stringp custom) (string-prefix-p "alias:" custom))
+      (let ((target (substring custom (length "alias:"))))
+        (unless (or (member target seen)
+                    (>= (or hops 0) slackit-emoji--max-alias-hops))
+          (slackit-emoji--resolve
+           app target (cons name seen) (1+ (or hops 0))))))
+     ((stringp custom)
+      (slackit-emoji--inline-image app name custom))
+     (t (gethash name (slackit-emoji--glyph-table))))))
+
+(defun slackit-emoji-display-string (app name)
+  "Return a detached display string for APP Slack shortname NAME, or nil."
+  (when-let* ((glyph (and (stringp name)
+                          (slackit-emoji--resolve app name))))
     (copy-sequence glyph)))
 
-(defun slackit-emoji-substitute (text)
-  "Return display TEXT with recognized Slack emoji tokens replaced once.
+(defun slackit-emoji-substitute (app text)
+  "Return display TEXT with recognized APP Slack emoji tokens replaced once.
 
-Only complete `:[+[:alnum:]_-]+:' tokens are considered.  Unknown tokens are
-preserved byte-for-byte, and TEXT itself is never modified."
+Unknown tokens are preserved byte-for-byte, and TEXT itself is never modified."
   (replace-regexp-in-string
    slackit-emoji--token-regexp
    (lambda (token)
-     (or (slackit-emoji--lookup (substring token 1 -1))
+     (or (slackit-emoji--resolve app (substring token 1 -1))
          token))
    text t t))
+
+(defun slackit-emoji--message-names (message)
+  "Return deduplicated Slack emoji names referenced by MESSAGE."
+  (let ((text (or (slackit-normalize-get message 'text) ""))
+        names
+        (position 0))
+    (while (string-match slackit-emoji--token-regexp text position)
+      (push (substring (match-string 0 text) 1 -1) names)
+      (setq position (match-end 0)))
+    (dolist (reaction (slackit-normalize-get message 'reactions))
+      (when-let* ((name (slackit-normalize-get reaction 'name)))
+        (push name names)))
+    (delete-dups names)))
+
+(defun slackit-emoji-message-resource-keys (app message)
+  "Return catalog and custom image resources used by APP MESSAGE."
+  (let ((keys (list (slackit-emoji-resource-key app))))
+    (dolist (name (slackit-emoji--message-names message))
+      (when-let* ((url (slackit-emoji--custom-url app name)))
+        (push (slackit-emoji--image-resource-key app name url) keys)))
+    (delete-dups keys)))
+
+(defun slackit-emoji-ensure-message (app message)
+  "Start deduplicated custom emoji image acquisition for APP MESSAGE."
+  (when (appkit-app-live-p app)
+    (dolist (name (slackit-emoji--message-names message))
+      (when-let* ((url (slackit-emoji--custom-url app name)))
+        (slackit-media-ensure-public-image
+         app (slackit-emoji--image-resource-key app name url) url))))
+  nil)
+
+(defun slackit-emoji--catalog-success (app operation body)
+  "Settle APP custom emoji OPERATION from emoji.list BODY."
+  (when (slackit-runtime-operation-current-p app operation)
+    (slackit-state-set-emojis
+     (slackit-runtime-state app)
+     (or (slackit-normalize-get body 'emoji) nil))
+    (slackit-runtime-operation-end app operation)
+    (slackit-runtime-publish-resource
+     app (slackit-emoji-resource-key app))))
+
+(defun slackit-emoji--catalog-failure (app operation _error)
+  "Settle failed APP custom emoji OPERATION without blocking startup."
+  (slackit-runtime-operation-end app operation))
+
+(defun slackit-emoji-load-catalog (app)
+  "Load APP's custom Slack emoji catalog once per pending operation."
+  (let* ((key '(emoji-catalog))
+         (pending (gethash key (appkit-app-request-table app))))
+    (if (slackit-runtime-operation-current-p app pending)
+        pending
+      (let ((operation (slackit-runtime-operation-begin app key)))
+        (slackit-api-emoji-list
+         app
+         :on-success
+         (apply-partially #'slackit-emoji--catalog-success app operation)
+         :on-error
+         (apply-partially #'slackit-emoji--catalog-failure app operation))
+        operation))))
 
 (provide 'slackit-emoji)
 
