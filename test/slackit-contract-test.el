@@ -946,19 +946,34 @@
                      (context (slackit-media--item-context private-item))
                      (action (plist-get context :open-action))
                      (context-text (prin1-to-string context))
-                     (key (plist-get private-item :resource-key))
-                     (cached-file (slackit-media--cached-file key)))
+                     (preview-key (plist-get private-item :resource-key))
+                     (content-key
+                      (plist-get private-item :content-resource-key))
+                     (preview-file
+                      (slackit-media--cached-file preview-key)))
                 (should (functionp action))
-                (should (file-regular-p cached-file))
+                (should (functionp (plist-get context :download-action)))
+                (should (functionp (plist-get context :save-as-action)))
+                (should (file-regular-p preview-file))
+                (should-not (equal preview-key content-key))
                 (unless (memq system-type '(ms-dos windows-nt cygwin))
                   (should (= #o600
-                             (logand #o777 (file-modes cached-file)))))
+                             (logand #o777 (file-modes preview-file)))))
                 (should-not
                  (string-match-p (regexp-quote private-url) context-text))
                 (should-not
                  (string-match-p (regexp-quote thumbnail-url) context-text))
                 (funcall action)
-                (should (equal cached-file opened-file)))
+                (let ((content-file
+                       (slackit-media--cached-file content-key)))
+                  (should (equal private-url private-source))
+                  (should (file-regular-p content-file))
+                  (should-not (equal preview-file content-file))
+                  (should (equal content-file opened-file))
+                  (unless (memq system-type '(ms-dos windows-nt cygwin))
+                    (should (= #o600
+                               (logand #o777
+                                       (file-modes content-file)))))))
               (should-not
                (slackit-media--private-source-p
                 "https://files.slack.com.attacker.invalid/files-tmb/T1-F1/x.png"))
@@ -974,6 +989,184 @@
         (clrhash slackit-media--fetches)
         (clrhash slackit-media--failures)
         (clrhash slackit-media--image-cache)
+        (clrhash slackit-media--open-specs)
+        (clrhash slackit-media--audio-states)
+        (when (file-directory-p root) (delete-directory root t))))))
+
+(ert-deftest slackit-contract-media-kinds-download-before-local-dispatch ()
+  (slackit-test-with-app (app "media-kinds")
+    (let* ((root (make-temp-file "slackit-media-kinds-" t))
+           (slackit-media-cache-directory
+            (expand-file-name "media/" root))
+           (video-url
+            "https://files.slack.com/files-pri/T1-F2/movie.mp4")
+           (audio-url
+            "https://files.slack.com/files-pri/T1-F3/voice.mp3")
+           (document-url
+            "https://files.slack.com/files-pri/T1-F4/notes.pdf")
+           (bad-url
+            "https://files.slack.com/files-pri/T1-F5/login.pdf")
+           (message
+            `((channel . "C1")
+              (ts . "2.000001")
+              (files
+               . (((id . "F2") (name . "movie.mp4")
+                   (mimetype . "video/mp4")
+                   (url_private_download . ,video-url))
+                  ((id . "F3") (name . "voice.mp3")
+                   (mimetype . "audio/mpeg")
+                   (duration_ms . 42000)
+                   (url_private_download . ,audio-url))
+                  ((id . "F4") (name . "notes.pdf")
+                   (mimetype . "application/pdf")
+                   (url_private_download . ,document-url))
+                  ((id . "F5") (name . "login.pdf")
+                   (mimetype . "application/pdf")
+                   (url_private_download . ,bad-url))))))
+           fetched
+           header-snapshots
+           played-video
+           played-audio
+           opened-document)
+      (unwind-protect
+          (progn
+            (clrhash slackit-media--fetches)
+            (clrhash slackit-media--failures)
+            (clrhash slackit-media--image-cache)
+            (clrhash slackit-media--open-specs)
+            (setq message (slackit-normalize-message message "C1"))
+            (cl-letf
+                (((symbol-function 'plz)
+                  (lambda (method url &rest arguments)
+                    (should (eq method 'get))
+                    (should-not (member "--location" plz-curl-default-args))
+                    (push url fetched)
+                    (push (plist-get arguments :headers) header-snapshots)
+                    (let ((file (cadr (plist-get arguments :as))))
+                      (with-temp-file file
+                        (set-buffer-multibyte nil)
+                        (insert
+                         (if (equal url bad-url)
+                             "<!doctype html><html><body>login</body></html>"
+                           "synthetic local media")))
+                      (funcall (plist-get arguments :then) file))
+                    nil))
+                 ((symbol-function 'appkit-media-play-video-file)
+                  (lambda (file label &rest arguments)
+                    (should (equal label "slackit"))
+                    (should (eq app (plist-get arguments :owner)))
+                    (setq played-video file)))
+                 ((symbol-function 'slackit-media--start-audio-file)
+                  (lambda (_key file) (setq played-audio file)))
+                 ((symbol-function 'appkit-media-open-file)
+                  (lambda (file) (setq opened-document file))))
+              (let ((items (slackit-media--file-items app message)))
+                (should (= 4 (length items)))
+                (dolist (item items)
+                  (let* ((context (slackit-media--item-context item))
+                         (context-text (prin1-to-string context)))
+                    (should
+                     (functionp (plist-get context :open-action)))
+                    (dolist (url (list video-url audio-url
+                                       document-url bad-url))
+                      (should-not
+                       (string-match-p
+                        (regexp-quote url) context-text)))
+                    (funcall (plist-get context :open-action))))
+                (should (equal (sort (list video-url audio-url
+                                           document-url bad-url)
+                                     #'string<)
+                               (sort fetched #'string<)))
+                (should (equal "mp4" (file-name-extension played-video)))
+                (should (equal "mp3" (file-name-extension played-audio)))
+                (should
+                 (equal "pdf" (file-name-extension opened-document)))
+                (should (file-regular-p played-video))
+                (should (file-regular-p played-audio))
+                (should (file-regular-p opened-document))
+                (let* ((bad-item (nth 3 items))
+                       (bad-key
+                        (plist-get bad-item :content-resource-key))
+                       (bad-state
+                        (slackit-media--content-state bad-key)))
+                  (should (eq 'error (plist-get bad-state :status)))
+                  (should-not (slackit-media--cached-file bad-key)))
+                (dolist (headers header-snapshots)
+                  (should
+                   (equal "Bearer xoxp-CANARY-TOKEN"
+                          (cdr (assoc "Authorization" headers))))
+                  (should
+                   (equal "d=xoxd-CANARY-COOKIE"
+                          (cdr (assoc "Cookie" headers))))
+                  (should (equal "empty"
+                                 (cdr (assoc "Sec-Fetch-Dest" headers))))
+                  (should-not (assoc "Origin" headers)))
+                (with-temp-buffer
+                  (slackit-media-insert-message-cards app message)
+                  (should (string-match-p "\\[video\\]" (buffer-string)))
+                  (should (string-match-p "\\[audio\\]" (buffer-string)))
+                  (should (string-match-p "\\[file\\]" (buffer-string)))
+                  (dolist (url (list video-url audio-url
+                                     document-url bad-url))
+                    (should-not
+                     (string-match-p
+                      (regexp-quote url) (buffer-string)))))))))
+        (clrhash slackit-media--fetches)
+        (clrhash slackit-media--failures)
+        (clrhash slackit-media--image-cache)
+        (clrhash slackit-media--open-specs)
+        (clrhash slackit-media--audio-states)
+        (when (file-directory-p root) (delete-directory root t)))))
+
+(ert-deftest slackit-contract-media-download-cancel-removes-partial-file ()
+  (slackit-test-with-app (app "media-cancel")
+    (let* ((root (make-temp-file "slackit-media-cancel-" t))
+           (slackit-media-cache-directory
+            (expand-file-name "media/" root))
+           (url "https://files.slack.com/files-pri/T1-F6/archive.zip")
+           (message
+            (slackit-normalize-message
+             `((channel . "C1") (ts . "3.000001")
+               (files
+                . (((id . "F6") (name . "archive.zip")
+                    (mimetype . "application/zip")
+                    (url_private_download . ,url)))))
+             "C1"))
+           partial-file)
+      (unwind-protect
+          (progn
+            (clrhash slackit-media--fetches)
+            (clrhash slackit-media--failures)
+            (clrhash slackit-media--open-specs)
+            (cl-letf
+                (((symbol-function 'plz)
+                  (lambda (_method _url &rest arguments)
+                    (setq partial-file
+                          (cadr (plist-get arguments :as)))
+                    (with-temp-file partial-file
+                      (insert "partial"))
+                    nil)))
+              (let* ((item (car (slackit-media--file-items app message)))
+                     (content-key
+                      (plist-get item :content-resource-key))
+                     (context (slackit-media--item-context item)))
+                (funcall (plist-get context :download-action))
+                (should (file-exists-p partial-file))
+                (should (gethash content-key slackit-media--fetches))
+                (setq context (slackit-media--item-context item))
+                (should (functionp (plist-get context :cancel-action)))
+                (funcall (plist-get context :cancel-action))
+                (should-not (file-exists-p partial-file))
+                (should-not
+                 (gethash content-key slackit-media--fetches))
+                (should
+                 (eq 'not-downloaded
+                     (plist-get
+                      (slackit-media--content-state content-key)
+                      :status))))))
+        (clrhash slackit-media--fetches)
+        (clrhash slackit-media--failures)
+        (clrhash slackit-media--open-specs)
         (when (file-directory-p root) (delete-directory root t))))))
 
 (ert-deftest slackit-contract-custom-emoji-catalog-resolves-aliases-and-images ()
@@ -1200,7 +1393,8 @@
 (ert-deftest slackit-contract-transients-retain-exact-message-scope ()
   (slackit-test-with-app (app "transient")
     (let ((state (slackit-runtime-state app))
-          (kill-ring nil))
+          (kill-ring nil)
+          media-called)
       (slackit-state-put-team-self
        state '((id . "T1")) '((id . "U1") (name . "self")))
       (slackit-state-put-conversation
@@ -1213,8 +1407,16 @@
                (plist-get arguments :on-success)
                '((messages
                   . (((channel . "C1") (ts . "1.000001")
-                      (user . "U1") (text . "scoped text"))))
-                 (response_metadata . ((next_cursor . ""))))))))
+                      (user . "U1") (text . "scoped text")
+                      (files
+                       . (((id . "F1") (name . "notes.txt")
+                           (mimetype . "text/plain")
+                           (url_private_download
+                            . "https://files.slack.com/files-pri/T1-F1/notes.txt")))))))
+                 (response_metadata . ((next_cursor . "")))))))
+           ((symbol-function 'appkit-media-card-call-action)
+            (lambda (action context)
+              (setq media-called (list action context)))))
         (let* ((view (slackit-room-open app "C1" nil))
                scope)
           (with-current-buffer (appkit-view-buffer view)
@@ -1223,11 +1425,17 @@
                    (text-property-search-forward
                     slackit-message-key-property "1.000001" #'equal)))
               (should match)
-              (goto-char (prop-match-beginning match)))
+              (goto-char (prop-match-beginning match))
+              (should (search-forward "notes.txt" nil t)))
             (setq scope (slackit-transient--capture-room-scope t)))
           (with-temp-buffer
             (slackit-transient-actions-copy-text scope))
           (should (equal "scoped text" (current-kill 0 t)))
+          (slackit-transient-actions-media-download scope)
+          (should (eq 'download (car media-called)))
+          (should
+           (eq (slackit-transient-scope-media-context scope)
+               (cadr media-called)))
           (slackit-runtime-stop-account app)
           (should-error
            (slackit-transient-actions-copy-text scope)

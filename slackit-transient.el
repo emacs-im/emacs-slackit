@@ -17,6 +17,7 @@
 (require 'appkit-chatbuf)
 (require 'appkit-core)
 (require 'appkit-directory)
+(require 'appkit-media-card)
 (require 'slackit-actions)
 (require 'slackit-compose)
 (require 'slackit-read)
@@ -29,7 +30,8 @@
   view-id
   conversation-id
   message-ts
-  entry-payload)
+  entry-payload
+  media-context)
 
 (defun slackit-transient--view-valid-p (scope)
   "Return non-nil when SCOPE still owns its exact registered Appkit view."
@@ -133,7 +135,10 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
            :view view
            :view-id (copy-tree view-id)
            :conversation-id (copy-tree conversation-id)
-           :message-ts (and ts (copy-sequence ts)))))
+           :message-ts (and ts (copy-sequence ts))
+           :media-context
+           (when-let* ((context (appkit-media-card-context-at-point)))
+             (copy-sequence context)))))
     (unless (and (equal slackit-room--conversation-id conversation-id)
                  (slackit-state-conversation
                   (slackit-runtime-state app) conversation-id))
@@ -253,6 +258,31 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
         (with-current-buffer
             (appkit-view-buffer (slackit-transient-scope-view scope))
           (not (appkit-chatbuf-composer-idle-p))))))
+
+(defun slackit-transient--actions-media-inapt-p (action)
+  "Return non-nil when captured media ACTION is unavailable."
+  (let* ((scope
+          (slackit-transient--prefix-scope 'slackit-actions-transient))
+         (context
+          (and scope (slackit-transient-scope-media-context scope))))
+    (or (not (slackit-transient--room-view-valid-p scope))
+        (appkit-media-card-action-inapt-reason action context))))
+
+(defun slackit-transient--actions-media-open-inapt-p ()
+  "Return non-nil when captured media cannot be opened."
+  (slackit-transient--actions-media-inapt-p 'open))
+
+(defun slackit-transient--actions-media-download-inapt-p ()
+  "Return non-nil when captured media cannot be downloaded."
+  (slackit-transient--actions-media-inapt-p 'download))
+
+(defun slackit-transient--actions-media-cancel-inapt-p ()
+  "Return non-nil when captured media download cannot be canceled."
+  (slackit-transient--actions-media-inapt-p 'cancel))
+
+(defun slackit-transient--actions-media-save-inapt-p ()
+  "Return non-nil when captured media cannot be saved."
+  (slackit-transient--actions-media-inapt-p 'save-as))
 
 (defun slackit-transient--actions-read-inapt-p ()
   "Return non-nil when captured message cannot advance room read state."
@@ -539,6 +569,38 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     (kill-new text)
     (message "slackit: message text copied")))
 
+(defun slackit-transient--call-media-action (scope action)
+  "Call captured media ACTION from exact room SCOPE."
+  (slackit-transient--require-room scope)
+  (let ((context (slackit-transient-scope-media-context scope)))
+    (unless context
+      (user-error "slackit: no media at captured point"))
+    (appkit-media-card-call-action action context)))
+
+(transient-define-suffix slackit-transient-actions-media-open (scope)
+  "Open or play captured media."
+  :inapt-if #'slackit-transient--actions-media-open-inapt-p
+  (interactive (list (slackit-transient--actions-scope)))
+  (slackit-transient--call-media-action scope 'open))
+
+(transient-define-suffix slackit-transient-actions-media-download (scope)
+  "Download captured media."
+  :inapt-if #'slackit-transient--actions-media-download-inapt-p
+  (interactive (list (slackit-transient--actions-scope)))
+  (slackit-transient--call-media-action scope 'download))
+
+(transient-define-suffix slackit-transient-actions-media-cancel (scope)
+  "Cancel captured media download."
+  :inapt-if #'slackit-transient--actions-media-cancel-inapt-p
+  (interactive (list (slackit-transient--actions-scope)))
+  (slackit-transient--call-media-action scope 'cancel))
+
+(transient-define-suffix slackit-transient-actions-media-save (scope)
+  "Save captured media locally."
+  :inapt-if #'slackit-transient--actions-media-save-inapt-p
+  (interactive (list (slackit-transient--actions-scope)))
+  (slackit-transient--call-media-action scope 'save-as))
+
 ;;;###autoload(autoload 'slackit-root-transient "slackit-transient" nil t)
 (transient-define-prefix slackit-root-transient (scope)
   "Open commands scoped to one exact Slackit account root."
@@ -590,7 +652,12 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     ("d" "Delete…" slackit-transient-actions-delete)
     ("r" "Toggle reaction…" slackit-transient-actions-react)
     ("m" "Mark read through here" slackit-transient-actions-mark-read)
-    ("w" "Copy text" slackit-transient-actions-copy-text)]]
+    ("w" "Copy text" slackit-transient-actions-copy-text)]
+   ["Media"
+    ("o" "Open / play" slackit-transient-actions-media-open)
+    ("D" "Download" slackit-transient-actions-media-download)
+    ("x" "Cancel download" slackit-transient-actions-media-cancel)
+    ("s" "Save as…" slackit-transient-actions-media-save)]]
   (interactive (list (slackit-transient--capture-room-scope t)))
   (unless (slackit-transient-scope-p scope)
     (user-error "slackit: invalid message menu scope"))

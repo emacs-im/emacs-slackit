@@ -289,8 +289,8 @@ chat timeline.  It uses:
 - =appkit-chat-completion= for account-local =@user= and =#channel=
   candidates;
 - resource dependencies for senders, user/channel references, account-local
-  avatars, and public media posters, with exact row invalidation after lazy
-  resource arrival.
+  avatars, media previews/content, and custom emoji, with exact row invalidation
+  after lazy resource or transfer-state arrival.
 
 Slackit owns the row payload, Slack mrkdwn/reference interpretation, subtype
 handling, clock text, sender selection, and actions.  It decodes entities once
@@ -315,11 +315,21 @@ hidden buffer may use =fill-column= temporarily, but displaying or resizing it
 must replace that fallback without application-owned window hooks.
 
 Unsupported blocks and subtypes remain visible as explicit safe rows.  Slack
-file objects render typed metadata/permalink cards.  Supported public Block Kit
-image and video posters use account-owned, generation-fenced Appkit media
-resources and exact row invalidation; renderers only observe ready/loading/
-failure state.  Private =url_private=/=thumb_*= bytes remain metadata/browser
-actions because Slackit does not forward its API token or Cookie to media URLs.
+file objects project typed photo, video, audio, or document cards.  Preview
+resources remain separate from original content resources: images and video
+posters render from bounded caches, while open/play/download/save actions use
+validated local content files.  Public Block Kit media is credential-free.
+Private Slack content is accepted only from exact HTTPS =files.slack.com=
+=files-pri=/=files-tmb= paths and uses only its owning account's =xoxc= bearer
+plus =d= cookie, with redirects disabled.  Login HTML, empty content, stale
+generation callbacks, and partial files are rejected; Unix cache directories
+and completed files use modes =0700= and =0600=.  Media card contexts and
+resource keys contain only opaque account-qualified hashes, never URLs or
+credentials.  Photos/GIFs open through Appkit's local image runtime, videos
+play from local files through Appkit's lifecycle-owned player, audio downloads
+before local playback, and documents download before the configured local file
+opener.  Appkit card actions expose open/play, download, cancel, and save-as;
+media actions never fall back to a browser.
 
 Initial room history uses =conversations.history=.  The room owns its returned
 older cursor because Appkit deliberately does not interpret protocol cursors.
@@ -407,8 +417,8 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-compose.el= | Draft/aux capture, structured serialization, send/edit settlement |
 | =slackit-completion.el= | Account-local user/channel candidates and structured insertion |
 | =slackit-avatar.el= | Credential-free profile image acquisition, private disk cache, resource invalidation |
-| =slackit-emoji.el= | Display-only Slack shortname to Emacs Unicode resolution |
-| =slackit-media.el= | Credential-free public poster acquisition and Appkit media-card projection |
+| =slackit-emoji.el= | Standard/workspace shortnames, aliases, completion, custom-image resources |
+| =slackit-media.el= | Typed preview/content projection, private/public acquisition, local open/play, transfer state |
 | =slackit-render.el= | Safe message-row rendering, Slack reference expansion, fallback rows |
 | =slackit-thread.el= | Thread view, reply history, parent/reply projection, reply send |
 | =slackit-reaction.el= | Latest-intent reaction operation ownership and REST settlement |
@@ -417,10 +427,11 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-evil.el= | Optional late-safe Evil state/key projection |
 | =slackit-transient.el= | Exact-view/account/message scoped command menus |
 
-Media support remains deliberately split by capability: implemented public
-poster cards are owned by =slackit-media.el=; authenticated private downloads,
-uploads, and the remaining Block Kit surface are not represented by empty
-scaffolds.
+Media support is capability-separated inside =slackit-media.el=: public preview
+fetches carry no credentials; exact private Slack file transfers are
+account-owned and no-redirect; external page links remain distinct from media
+actions.  Uploads and unsupported Block Kit elements are not represented by
+empty scaffolds.
 
 * First daily-use vertical slice
 
@@ -441,10 +452,10 @@ is complete only when one or more registered accounts can:
 5. open an Appkit directory root and the exact account-owned conversation room;
 6. load the latest exact message window, page older with the returned cursor,
    and merge pages safely against later realtime edits/deletes;
-7. render Slack references, safe links/code, standard emoji, reaction chips,
-   circular avatars, typed file cards, supported public image/video posters,
-   and explicit unsupported content;
-8. complete =@user= and =#channel= as structured exact-ID composer objects;
+7. render Slack references, safe links/code, standard/workspace emoji,
+   reaction chips, circular avatars, typed media previews, local
+   photo/video/audio/document actions, and explicit unsupported content;
+8. complete =@user=, =#channel=, and Slack =:emoji:= names from exact account-local identities;
 9. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
    marked, user, and joined-conversation lifecycle events;
 10. send room text and reconcile HTTP/realtime arrival in either order without
@@ -460,13 +471,12 @@ is complete only when one or more registered accounts can:
 16. coexist with =slack= and expose optional Evil plus exact-scope Transient menus.
 
 Deferred after this slice: remaining rich Block Kit/attachments and WYSIWYG,
-authenticated private file/media download/preview/upload, workspace custom
-emoji images/catalogs, global search, notifications, unread/modeline count
-summaries, typing, presence, DND, thread subscription/activity endpoints,
-pins/saved items, scheduled messages, workspace administration, OAuth/token
-refresh/Socket Mode, enterprise-token selection, and optimistic local timeline
-rows.  Unsupported content remains visible without silently expanding a
-deferred transport surface.
+media upload, global search, notifications, unread/modeline count summaries,
+typing, presence, DND, thread subscription/activity endpoints, pins/saved
+items, scheduled messages, workspace administration, OAuth/token refresh/
+Socket Mode, enterprise-token selection, and optimistic local timeline rows.
+Unsupported content remains visible without silently expanding a deferred
+transport surface.
 
 * Contract checks
 
@@ -481,6 +491,12 @@ Implementation should defend these observable contracts:
 - avatar resources reject non-HTTPS/non-Slack hosts, never receive Web API
   credentials, deduplicate account-owned transfers, persist only private image
   bytes, derive circular size/mtime-specific images, and redraw exact rows;
+- media resources separate preview and content identities; exact private Slack
+  hosts receive only the owning account's bearer/=d= credentials with no
+  redirect; HTML login responses and partial files never become cache entries;
+  photo/video/audio/document actions download before local open/play, expose
+  cancel/save state through Appkit, and keep URLs out of row contexts, resource
+  keys, rendered output, and diagnostics;
 - capture callbacks and diagnostics contain no secret values; imported auth and
   temporary capture files are private; capture files are deleted on success,
   failure, cancellation, and synchronous startup errors;
