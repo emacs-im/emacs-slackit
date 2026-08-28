@@ -32,8 +32,7 @@
   connection-generation
   websocket
   connection
-  capability-url
-  reconnect-url
+  websocket-url
   hello-timer
   heartbeat-timer
   pong-timer
@@ -87,30 +86,35 @@
     (error "slackit: invalid account transport"))
   (appkit-app-transport app))
 
-(defun slackit-runtime-credential-identity-matches-p
-    (app team-id user-id)
-  "Return non-nil when TEAM-ID and USER-ID match APP's pinned identity.
+(defun slackit-runtime-bind-credential-identity (app team-id user-id)
+  "Bind authenticated TEAM-ID and USER-ID to APP's credential.
 
-Session-only credentials without pinned identity accept any nonempty identity."
+Return non-nil after binding missing identity fields.  Return nil without
+mutation when either value is empty or conflicts with an already pinned
+browser-session identity."
   (let* ((transport (slackit-runtime-transport app))
          (credential (slackit-transport-credential transport))
          (expected-team-id
           (and credential (slackit-credential-team-id credential)))
          (expected-user-id
           (and credential (slackit-credential-user-id credential))))
-    (and (stringp team-id)
-         (not (string-empty-p team-id))
-         (stringp user-id)
-         (not (string-empty-p user-id))
-         (or (null expected-team-id) (equal expected-team-id team-id))
-         (or (null expected-user-id) (equal expected-user-id user-id)))))
+    (when (and credential
+               (stringp team-id)
+               (not (string-empty-p team-id))
+               (stringp user-id)
+               (not (string-empty-p user-id))
+               (or (null expected-team-id) (equal expected-team-id team-id))
+               (or (null expected-user-id) (equal expected-user-id user-id)))
+      (setf (slackit-credential-team-id credential) team-id
+            (slackit-credential-user-id credential) user-id)
+      t)))
 
 (defun slackit-runtime-generation (app)
   "Return APP's account-lifecycle callback generation."
   (slackit-transport-generation (slackit-runtime-transport app)))
 
 (defun slackit-runtime-connection-generation (app)
-  "Return APP's RTM connection-attempt generation."
+  "Return APP's realtime connection-attempt generation."
   (slackit-transport-connection-generation
    (slackit-runtime-transport app)))
 
@@ -130,8 +134,7 @@ Session-only credentials without pinned identity accept any nonempty identity."
           (slackit-credential-team-id credential) nil
           (slackit-credential-user-id credential) nil))
   (setf (slackit-transport-credential transport) nil
-        (slackit-transport-capability-url transport) nil
-        (slackit-transport-reconnect-url transport) nil))
+        (slackit-transport-websocket-url transport) nil))
 
 (defun slackit-runtime--app-shutdown (app)
   "Complete cleanup for stopped Slackit APP."
@@ -187,7 +190,7 @@ Session-only credentials without pinned identity accept any nonempty identity."
           app))))
 
 (defun slackit-runtime-revoke-generation (app)
-  "Revoke account callbacks and RTM connection ownership for APP."
+  "Revoke account callbacks and realtime connection ownership for APP."
   (let ((transport (slackit-runtime-transport app)))
     (setf (slackit-transport-stopping-p transport) t
           (slackit-transport-ready-p transport) nil
@@ -200,7 +203,7 @@ Session-only credentials without pinned identity accept any nonempty identity."
     (slackit-transport-generation transport)))
 
 (defun slackit-runtime-begin-generation (app)
-  "Begin a fresh account lifecycle and RTM generation for live APP."
+  "Begin a fresh account lifecycle and realtime generation for live APP."
   (let ((transport (slackit-runtime-transport app)))
     (setf (slackit-transport-generation transport)
           (1+ (slackit-transport-generation transport))
@@ -237,7 +240,7 @@ Session-only credentials without pinned identity accept any nonempty identity."
     (delq nil
           (list (and credential (slackit-credential-token credential))
                 (and credential (slackit-credential-cookie credential))
-                (and transport (slackit-transport-capability-url transport))))))
+                (and transport (slackit-transport-websocket-url transport))))))
 
 (defun slackit-runtime-redact (app value)
   "Return printable VALUE with APP secrets and credential syntax redacted."

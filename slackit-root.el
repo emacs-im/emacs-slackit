@@ -43,13 +43,13 @@
      (error-code (format "Bootstrap error: %s — press g to retry" error-code))
      ((not (slackit-state-bootstrap-ready-p state))
       (format
-       "Loading directory (identity: %s, users: on-demand, conversations: %s); RTM: %s"
+       "Loading directory (identity: %s, users: on-demand, conversations: %s); Realtime: %s"
        (if (slackit-account-state-bootstrap-identity-complete-p state)
            "complete" "loading")
        (if (slackit-account-state-bootstrap-conversations-complete-p state)
            "complete" "loading")
        connection))
-     (t (format "Directory complete; RTM: %s" connection)))))
+     (t (format "Directory complete; Realtime: %s" connection)))))
 
 (defun slackit-root--section-kind (conversation)
   "Return directory section kind for CONVERSATION."

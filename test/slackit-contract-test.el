@@ -219,14 +219,14 @@
                       'text)))
       (should-not (eq (appkit-app-state left) (appkit-app-state right))))))
 
-(ert-deftest slackit-contract-rtm-reconnect-preserves-account-work ()
+(ert-deftest slackit-contract-realtime-reconnect-preserves-account-work ()
   (slackit-test-with-app (app "generation")
     (let* ((account-generation (slackit-runtime-generation app))
            (connection-generation
             (slackit-runtime-connection-generation app))
            (operation
             (slackit-runtime-operation-begin app '(bootstrap))))
-      (slackit-rtm--begin-attempt app)
+      (slackit-realtime--begin-attempt app)
       (should (= account-generation (slackit-runtime-generation app)))
       (should (slackit-runtime-current-p app account-generation))
       (should (slackit-runtime-operation-current-p app operation))
@@ -234,13 +234,13 @@
                  (slackit-runtime-connection-generation app)))
       (let ((first-connection-generation
              (slackit-runtime-connection-generation app)))
-        (slackit-rtm--begin-attempt app)
+        (slackit-realtime--begin-attempt app)
         (should (= account-generation (slackit-runtime-generation app)))
         (should-not
-         (slackit-rtm--generation-current-p
+         (slackit-realtime--generation-current-p
           app first-connection-generation))
         (should
-         (slackit-rtm--generation-current-p
+         (slackit-realtime--generation-current-p
           app (slackit-runtime-connection-generation app)))))))
 
 (ert-deftest slackit-contract-stale-http-response-retires-handle ()
@@ -292,12 +292,14 @@
             "Bearer xoxp-CANARY-TOKEN d=xoxd-CANARY-COOKIE ?token=secret")))
       (should-not (string-match-p "CANARY" redacted))
       (should-not (string-match-p "token=secret" redacted)))
-    (should (slackit-rtm-valid-url-p
+    (should (slackit-realtime-valid-url-p
              "wss://wss-primary.slack.com/?token=capability"))
-    (should-not (slackit-rtm-valid-url-p
+    (should-not (slackit-realtime-valid-url-p
                  "wss://slack.com.evil.invalid/?token=capability"))
-    (should-not (slackit-rtm-valid-url-p
-                 "https://wss-primary.slack.com/"))))
+    (should-not (slackit-realtime-valid-url-p
+                 "https://wss-primary.slack.com/"))
+    (should-not (slackit-realtime-valid-url-p
+                 "wss://wss-backup.slack.com/?token=capability"))))
 
 (ert-deftest slackit-contract-pagination-consumes-every-cursor ()
   (let ((calls nil)
@@ -337,9 +339,10 @@
       (slackit-state-set-bootstrap-complete state 'conversations)
       (should (slackit-state-bootstrap-ready-p state)))))
 
-(ert-deftest slackit-contract-bootstrap-skips-workspace-user-scan ()
+(ert-deftest slackit-contract-bootstrap-binds-identity-before-realtime ()
   (slackit-test-with-app (app "lazy-bootstrap")
-    (let (users-list-called)
+    (let (users-list-called
+          (realtime-starts 0))
       (cl-letf
           (((symbol-function 'slackit-api-auth-test)
             (lambda (_app &rest arguments)
@@ -354,9 +357,19 @@
            ((symbol-function 'slackit-api-users-list-all)
             (lambda (&rest _arguments)
               (setq users-list-called t))))
-        (slackit-bootstrap-account app))
-      (let ((state (slackit-runtime-state app)))
+        (slackit-bootstrap-account
+         app
+         (lambda (ready-app)
+           (should (eq app ready-app))
+           (cl-incf realtime-starts))))
+      (let* ((state (slackit-runtime-state app))
+             (credential
+              (slackit-transport-credential
+               (slackit-runtime-transport app))))
         (should-not users-list-called)
+        (should (= 1 realtime-starts))
+        (should (equal "T1" (slackit-credential-team-id credential)))
+        (should (equal "U0" (slackit-credential-user-id credential)))
         (should (slackit-state-bootstrap-ready-p state))
         (should (slackit-state-user state "U0"))
         (should-not
@@ -897,20 +910,20 @@
          (input (concat mention mention)))
     (should (equal "<@U1> <@U1> "
                    (slackit-compose-serialize input)))))
-(ert-deftest slackit-contract-http-write-snapshot-cannot-regress-rtm ()
+(ert-deftest slackit-contract-http-write-snapshot-cannot-regress-realtime ()
   (let ((state (slackit-state-create)))
     (slackit-state-upsert-message
      state "C1" '((ts . "1.000001") (text . "old")))
     (let ((captured
            (slackit-state-message-revision state "C1" "1.000001")))
       (slackit-state-upsert-message
-       state "C1" '((ts . "1.000001") (text . "newer RTM edit")))
+       state "C1" '((ts . "1.000001") (text . "newer realtime edit")))
       (should-not
        (slackit-state-merge-write-snapshot
         state "C1" '((ts . "1.000001") (text . "stale HTTP edit"))
         captured))
       (should
-       (equal "newer RTM edit"
+       (equal "newer realtime edit"
               (slackit-normalize-get
                (slackit-state-message state "C1" "1.000001") 'text))))
     (slackit-state-delete-message state "C1" "1.000001")
@@ -1012,7 +1025,9 @@
           (slackit--bootstrap-identity-success
            app operation
            '((team_id . "T2") (user_id . "U2")
-             (team . "wrong") (user . "wrong")))
+             (team . "wrong") (user . "wrong"))
+           (lambda (_app)
+             (ert-fail "identity mismatch must not start realtime")))
           (should
            (equal "identity_mismatch"
                   (slackit-account-state-bootstrap-error
@@ -1085,22 +1100,35 @@
              (channel . "G1")
              (ts . "2.000001"))))))
 
-(ert-deftest slackit-contract-browser-session-rtm-reaches-hello ()
-  (slackit-test-with-app (app "browser-rtm")
+(ert-deftest slackit-contract-realtime-requires-authenticated-identity ()
+  (slackit-test-with-app (app "realtime-unbound")
+    (let (websocket-opened)
+      (cl-letf (((symbol-function 'websocket-open)
+                 (lambda (&rest _arguments)
+                   (setq websocket-opened t))))
+        (slackit-realtime-start app))
+      (should-not websocket-opened)
+      (should
+       (eq 'protocol-error
+           (slackit-account-state-connection-status
+            (slackit-runtime-state app))))
+      (should-not
+       (slackit-transport-reconnect-timer
+        (slackit-runtime-transport app))))))
+
+(ert-deftest slackit-contract-browser-session-realtime-reaches-hello ()
+  (slackit-test-with-app (app "browser-realtime")
     (let* ((transport (slackit-runtime-transport app))
            (credential (slackit-transport-credential transport))
            opened-url
            opened-headers)
-      (setf (slackit-credential-token credential) "xoxc-RTM-CANARY"
+      (setf (slackit-credential-token credential) "xoxc-REALTIME-CANARY"
             (slackit-credential-cookie credential)
-            "d=xoxd-RTM-CANARY; d-s=DS; lc=LC"
+            "d=xoxd-REALTIME-CANARY; d-s=DS; lc=LC"
             (slackit-credential-team-id credential) "T1"
             (slackit-credential-user-id credential) "U1")
       (cl-letf
-          (((symbol-function 'slackit-api-rtm-connect)
-            (lambda (&rest _arguments)
-              (ert-fail "browser-session RTM must not use rtm.connect")))
-           ((symbol-function 'websocket-open)
+          (((symbol-function 'websocket-open)
             (lambda (url &rest arguments)
               (setq opened-url url
                     opened-headers
@@ -1118,14 +1146,14 @@
               'synthetic-websocket))
            ((symbol-function 'websocket-close)
             (lambda (&rest _arguments) nil)))
-        (slackit-rtm-start app)
+        (slackit-realtime-start app)
         (should (string-prefix-p
                  "wss://wss-primary.slack.com/?" opened-url))
         (should (string-match-p
-                 "token=xoxc-RTM-CANARY" opened-url))
+                 "token=xoxc-REALTIME-CANARY" opened-url))
         (should (string-match-p
                  "agent_version%3D1785403654" opened-url))
-        (should (equal "d=xoxd-RTM-CANARY"
+        (should (equal "d=xoxd-REALTIME-CANARY"
                        (cdr (assoc "Cookie" opened-headers))))
         (should (equal "https://app.slack.com"
                        (cdr (assoc "Origin" opened-headers))))
@@ -1136,7 +1164,7 @@
               (slackit-runtime-state app))))
         (should-not
          (string-match-p
-          "RTM-CANARY"
+          "REALTIME-CANARY"
           (slackit-runtime-redact app opened-url)))))))
 
 (provide 'slackit-contract-test)

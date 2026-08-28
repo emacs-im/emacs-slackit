@@ -4,8 +4,8 @@
 
 ;;; Commentary:
 
-;; Convert Slack Web API and RTM payloads into stable plain alists and
-;; classify nested message envelopes before state reduction.
+;; Convert Slack Web API and Web/Desktop realtime payloads into stable plain
+;; alists and classify nested message envelopes before state reduction.
 
 ;;; Code:
 
@@ -157,7 +157,7 @@
             :message (slackit-normalize-message payload channel))))))
 
 (defun slackit-normalize-event (event)
-  "Classify Slack RTM EVENT into a reducer descriptor plist."
+  "Classify Slack realtime EVENT into a reducer descriptor plist."
   (let* ((payload (slackit-normalize-object event))
          (type (slackit-normalize-get payload 'type)))
     (cond
@@ -165,7 +165,7 @@
      ((equal type "pong")
       (list :kind 'pong :reply-to (slackit-normalize-get payload 'reply_to)))
      ((equal type "reconnect_url")
-      (list :kind 'reconnect-url :url (slackit-normalize-get payload 'url)))
+      (list :kind 'ignored :type type))
      ((equal type "message") (slackit-normalize--message-event payload))
      ((member type '("reaction_added" "reaction_removed"))
       (let ((item (slackit-normalize-get payload 'item)))

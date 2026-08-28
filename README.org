@@ -3,7 +3,7 @@
 
 Slackit is an independent Appkit-based Slack client for Emacs.  Its
 =slackit-= namespace coexists with =emacs-slack=.  The current daily-use slice
-includes multi-account roots, room/thread history, RTM updates, structured
+includes multi-account roots, room/thread history, realtime updates, structured
 mentions, circular avatars, native Slack emoji and reaction chips, public
 image/video poster cards, send/edit/delete, explicit read marking, optional
 Evil integration, and context-safe Transient action menus.

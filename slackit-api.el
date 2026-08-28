@@ -80,14 +80,6 @@
                        :on-success on-success
                        :on-error on-error))
 
-(cl-defun slackit-api-rtm-connect (app &key on-success on-error)
-  "Fetch an RTM capability URL and connection metadata for APP."
-  (slackit-api-request
-   app "rtm.connect"
-   :method 'post
-   :parameters '((batch_presence_aware . t))
-   :on-success on-success
-   :on-error on-error))
 
 (cl-defun slackit-api-user-info
     (app user-id &key on-success on-error)

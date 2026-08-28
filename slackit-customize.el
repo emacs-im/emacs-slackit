@@ -120,36 +120,31 @@ must not be logged."
   :type 'regexp
   :group 'slackit)
 
-(defcustom slackit-rtm-hello-timeout 15
-  "Seconds an open Slack RTM socket may wait for `hello'."
+(defcustom slackit-realtime-hello-timeout 15
+  "Seconds an open Slack realtime socket may wait for `hello'."
   :type 'number
   :group 'slackit)
 
-(defcustom slackit-rtm-ping-interval 20
-  "Seconds between Slack RTM ping messages."
+(defcustom slackit-realtime-ping-interval 20
+  "Seconds between Slack realtime ping messages."
   :type 'number
   :group 'slackit)
 
-(defcustom slackit-rtm-pong-timeout 10
-  "Seconds to wait for the matching Slack RTM pong."
+(defcustom slackit-realtime-pong-timeout 10
+  "Seconds to wait for the matching Slack realtime pong."
   :type 'number
   :group 'slackit)
 
 (defcustom slackit-reconnect-min-delay 1
-  "Minimum seconds before reconnecting Slack RTM."
+  "Minimum seconds before reconnecting Slack realtime."
   :type 'number
   :group 'slackit)
 
 (defcustom slackit-reconnect-max-delay 60
-  "Maximum seconds before reconnecting Slack RTM."
+  "Maximum seconds before reconnecting Slack realtime."
   :type 'number
   :group 'slackit)
 
-(defcustom slackit-websocket-host-regexp
-  "\\(?:\\`\\|\\.\\)slack\\.com\\'"
-  "Regexp accepted for hosts in RTM capability URLs."
-  :type 'regexp
-  :group 'slackit)
 
 (defface slackit-account-name
   '((t :inherit font-lock-keyword-face :weight bold))

@@ -21,10 +21,10 @@ presentation.
 
 The existing workspace projects have distinct roles:
 
-- =emacs-slack= is the behavioral and Slack Web API/RTM reference.  Slackit may
-  port endpoint semantics and payload knowledge, but never loads its =slack-=
-  modules or shares their global state, EIEIO models, LUI buffers, request
-  worker, or symbols.
+- =emacs-slack= is the behavioral and Slack Web API/Web/Desktop realtime
+  reference.  Slackit may port endpoint semantics and payload knowledge, but
+  never loads its =slack-= modules or shares their global state, EIEIO models,
+  LUI buffers, request worker, or symbols.
 - =disco.el= is the closest room/gateway/Appkit reference: canonical state is
   changed before views are invalidated, and room timelines use stable server
   keys.
@@ -49,9 +49,9 @@ EIEIO dependency is required.
 One registered Slack account owns one =slackit-account= Appkit application.
 =ACCOUNT-ID= is required, local, stable, and chosen by the user.  It identifies
 the Appkit application and appears in buffer names.  Slack team/self IDs are
-protocol facts, not Appkit lifecycle IDs, but browser-imported credentials pin
-them: later =auth.test= and =rtm.connect= identities must agree before they can
-publish canonical state.
+protocol facts, not Appkit lifecycle IDs.  Browser-imported credentials pin
+them; =auth.test= must agree with that identity, or bind a missing session-only
+identity, before canonical state or realtime startup can proceed.
 
 The default interactive entry point is:
 
@@ -90,14 +90,14 @@ automation integrations.  Manual token/cookie input is not the recommended
 desktop workflow.
 
 Credentials are an account-local bundle, never global URL-library state.
-Tokens, cookies, RTM capability URLs, capture contents, and response bodies are
-never used in Appkit IDs, view IDs, state keys, buffer names, errors, or logs.
+Tokens, cookies, realtime WebSocket URLs, capture contents, and response bodies
+are never used in Appkit IDs, view IDs, state keys, buffer names, errors, or logs.
 Diagnostics redact headers, URL queries/fragments, request/response bodies, and
 WebSocket URLs before formatting them.
 
 The credential router is origin- and endpoint-class-aware.  Fixed Web API
 requests to =https://slack.com/api/= receive the account bearer token and
-=xoxc= cookie bundle.  The browser-session RTM adapter is a separate exact
+=xoxc= cookie bundle.  The browser-session realtime gateway is a separate exact
 endpoint class: only =wss://wss-primary.slack.com/= receives the percent-encoded
 =xoxc= query token, one =d= cookie, the captured browser =start_args=/
 =agent_version= fingerprint, and the small WebSocket header set.  URL-library
@@ -105,20 +105,22 @@ global cookies are dynamically suppressed during its handshake so accounts
 cannot contribute duplicate/cross-account Cookie headers.  Redirects, media
 URLs, and presigned upload URLs never inherit Slack credentials.
 
-Pinned browser credentials build that browser WebSocket URL directly, matching
-the measured =slk= client; the =rtm.connect= capability flow remains only for
-deliberate session-only credentials without captured team identity.  Both paths
-validate exact Slack WSS hosts and treat RTM =hello= as readiness.  Capability
-URLs are secret and never logged.  Hello/heartbeat/pong timeout, bounded
-reconnect backoff, and one pending reconnect attempt per live generation remain
-generation-owned.  Browser reconnects rebuild the browser URL; capability
-fallbacks may adopt a validated =reconnect_url=.
+Authenticated credentials build the Slack Web/Desktop gateway URL directly,
+matching the measured =slk= client.  There is no legacy =rtm.connect= capability
+fallback: session-only credentials first bind their workspace/user identity
+through =auth.test=.  Only the exact gateway host is accepted, and receipt of
+=hello= establishes readiness.  The secret gateway URL is never logged.
+Hello/heartbeat/pong timeout, bounded reconnect backoff, and one pending
+reconnect attempt per live generation remain generation-owned.  Reconnects
+rebuild the authenticated gateway URL rather than adopting an event-provided
+capability URL.
 
 Only idempotent reads may honor server =Retry-After= automatically, with a
 bounded account/view-owned delay.  =chat.postMessage= and every other write are
 sent once; timeout or an unknown outcome is surfaced without automatic retry.
 OAuth, token refresh, Socket Mode, and enterprise-token selection remain
-outside the first slice; browser-session imports an existing browser login.
+outside the first slice.  Socket Mode transports scoped Slack App events and
+cannot replace a logged-in user's Web/Desktop realtime stream.
 
 * Ownership model
 
@@ -127,21 +129,21 @@ outside the first slice; browser-session imports an existing browser login.
 The Appkit application owns:
 
 - one canonical =slackit-account-state=;
-- one =slackit-transport= with distinct account-lifecycle and RTM-connection
-  generations, WebSocket, capability URL, heartbeat/reconnect timers, and
-  connection status;
+- one =slackit-transport= with distinct account-lifecycle and realtime
+  connection generations, secret WebSocket URL, heartbeat/reconnect timers,
+  and connection status;
 - cursor-complete identity and joined-conversation bootstrap plus an on-demand
   user cache;
 - account-wide writes, including send, edit, delete, reaction, and mark-read
-  operations, which must settle even if their originating room closes or RTM
-  reconnects;
+  operations, which must settle even if their originating room closes or
+  realtime reconnects;
 - the root, room, and thread views for that account.
 
 HTTP requests and account operations capture the account-lifecycle generation.
-RTM capability callbacks, WebSockets, and liveness/reconnect timers capture the
-independent RTM-connection generation.  Beginning a socket attempt increments
-only the latter; otherwise RTM startup/reconnect would silently retire
-in-flight bootstrap, history, and write callbacks.
+WebSockets and liveness/reconnect timers capture the independent realtime
+connection generation.  Beginning a socket attempt increments only the latter;
+otherwise realtime startup/reconnect would silently retire in-flight bootstrap,
+history, and write callbacks.
 
 Stopping an account increments both generations before calling
 =appkit-stop-app=.  Appkit then cancels its WebSocket, timers, HTTP processes,
@@ -207,7 +209,7 @@ History responses capture the account mutation revision at dispatch.  When a
 page settles, its messages are merged only if a newer realtime mutation has
 not changed or deleted the same key.  A delayed room or reply page therefore
 cannot resurrect a deleted message or overwrite a newer edit.  HTTP responses,
-RTM events, and action refreshes all use the same idempotent reducers.
+realtime events, and action refreshes all use the same idempotent reducers.
 
 Reaction and read facts are event/snapshot-authoritative.  A successful write
 receipt settles its operation but does not invent a reaction count, membership,
@@ -219,7 +221,7 @@ the exact account, conversation, message, and reaction/read identity.
 Every external result follows one path:
 
 #+begin_example
-HTTP / RTM payload
+HTTP response / realtime event
   -> normalize and validate
   -> reduce canonical account state
   -> produce Slackit change descriptors
@@ -256,9 +258,9 @@ account directory ready.  It never scans the workspace-wide =users.list=
 collection: visible direct messages, message senders, and =<@USER>= references
 request exact =users.info= records through account-owned, deduplicated
 operations.  Until a lookup settles, renderers expose the opaque user ID rather
-than blocking startup.  RTM =user_change=/=team_join= and joined-conversation
-join/leave/rename/archive events keep existing rows and sender dependencies
-current.
+than blocking startup.  Realtime =user_change=/=team_join= and joined-
+conversation join/leave/rename/archive events keep existing rows and sender
+dependencies current.
 
 Canonical user records are an in-memory account cache, matching
 =emacs-slack='s team-local user table; Slackit does not persist a second stale
@@ -362,8 +364,8 @@ the account-owned request is in flight.  Success clears or exits the operation
 only if that same revision is still current; failure leaves the draft editable
 and displays the real Slack error.
 
-The HTTP response and matching RTM event may arrive in either order.  Send and
-edit converge through the server =(conversation-id . ts)= reducer; delete
+The HTTP response and matching realtime event may arrive in either order.  Send
+and edit converge through the server =(conversation-id . ts)= reducer; delete
 converges through the same tombstone.  The first slice does not create an
 optimistic timeline row or automatically retry a write with an unknown outcome.
 
@@ -371,8 +373,8 @@ optimistic timeline row or automatically retry a write with an unknown outcome.
 
 History/reply snapshots render reaction name, count, and current-user
 membership as text.  =reactions.add= and =reactions.remove= are account-owned;
-RTM =reaction_added=/=reaction_removed= events are authoritative and invalidate
-only the affected row in every projection.  One latest operation per
+Realtime =reaction_added=/=reaction_removed= events are authoritative and
+invalidate only the affected row in every projection.  One latest operation per
 =(account, conversation, ts, reaction)= prevents a stale REST completion from
 overwriting a later opposite action.
 
@@ -398,7 +400,7 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-normalize.el= | JSON normalization, safe file/reaction summaries, message/event classification |
 | =slackit-http.el= | Origin-bound =plz= requests, credential routing, redaction, cancellation, read retry |
 | =slackit-api.el= | Slack endpoint parameters, cursor adaptation, typed results |
-| =slackit-rtm.el= | WebSocket generation, hello/readiness, heartbeat/reconnect, event dispatch |
+| =slackit-realtime.el= | Web/Desktop gateway ownership, hello/readiness, heartbeat/reconnect, event dispatch |
 | =slackit-root.el= | Appkit directory projection and account root commands |
 | =slackit-room.el= | Room view assembly, invalidation sync, timeline projection |
 | =slackit-history.el= | Initial/older paging and exact Appkit history-window transitions |
@@ -433,24 +435,24 @@ is complete only when one or more registered accounts can:
 3. consume every conversation cursor, seed self identity, resolve visible users
    once on demand, project readiness honestly, and honor bounded =Retry-After=
    only for idempotent reads;
-4. reach RTM =hello= through the browser-shaped or capability fallback path,
-   maintain ping/pong, reconnect with a generation fence, and keep
+4. reach realtime =hello= through the authenticated Web/Desktop gateway,
+   maintain ping/pong, rebuild reconnects with a generation fence, and keep
    user/conversation metadata current;
 5. open an Appkit directory root and the exact account-owned conversation room;
 6. load the latest exact message window, page older with the returned cursor,
-   and merge pages safely against later RTM edits/deletes;
+   and merge pages safely against later realtime edits/deletes;
 7. render Slack references, safe links/code, standard emoji, reaction chips,
    circular avatars, typed file cards, supported public image/video posters,
    and explicit unsupported content;
 8. complete =@user= and =#channel= as structured exact-ID composer objects;
 9. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
    marked, user, and joined-conversation lifecycle events;
-10. send room text and reconcile HTTP/RTM arrival in either order without an
-    optimistic row or automatic write retry;
+10. send room text and reconcile HTTP/realtime arrival in either order without
+    an optimistic row or automatic write retry;
 11. open a stable thread view, load/page replies, receive reply mutations, and
     send a reply;
 12. edit and delete an owned message with revision/tombstone-safe settlement;
-13. render, add, and remove emoji reaction chips with REST/RTM race safety;
+13. render, add, and remove emoji reaction chips with REST/realtime race safety;
 14. advance and explicitly mark read only through an authoritative reached row,
     without =client.counts= or fabricated unread badges;
 15. stop with no live Slackit WebSocket, timer, request, operation, login
@@ -489,14 +491,14 @@ Implementation should defend these observable contracts:
   rejected without persisting credentials;
 - login capture requires the canonical HTTPS Slack customize origin, complete
   team/user identity, private storage, and one global browser-session owner;
-  captured identity remains pinned through =auth.test= and =rtm.connect=;
+  captured identity remains pinned through =auth.test=;
 - two-page conversation fixtures do not become ready after page one; startup
   never calls =users.list=, and repeated visible references share one pending
   =users.info= operation;
-- RTM readiness requires =hello=; only one reconnect attempt exists per live
-  generation; stop/restart makes every prior callback inert;
+- realtime readiness requires =hello=; only one reconnect attempt exists per
+  live generation; stop/restart makes every prior callback inert;
 - timestamp ordering remains correct for fixed-width decimal strings;
-- a delayed room/reply history page cannot overwrite a later RTM edit or
+- a delayed room/reply history page cannot overwrite a later realtime edit or
   resurrect a delete;
 - empty history followed by a live message becomes one attached-latest row;
 - initial and older pages preserve exact Appkit edges and do not project cached
@@ -510,14 +512,14 @@ Implementation should defend these observable contracts:
 - standard colon emoji resolve only at presentation, unknown names remain
   literal, reaction chips preserve exact Slack names, and adjacent identical
   structured mentions serialize as separate occurrences;
-- public media resources contain no raw capability URL or credential, start
-  outside rendering, and settle loading to preview/failure by exact row;
+- public media resources contain no raw source URL or credential, start outside
+  rendering, and settle loading to preview/failure by exact row;
 - Evil remains optional and preserves native motions/operators plus the
   timeline/composer boundary; Transient suffixes retain their original live
   Appkit view/account/message generation;
-- send/edit HTTP snapshots cannot overwrite a later RTM edit or clear a
-  tombstone; response-before-RTM and RTM-before-response orders converge to one
-  server row;
+- send/edit HTTP snapshots cannot overwrite a later realtime edit or clear a
+  tombstone; response-before-event and event-before-response orders converge to
+  one server row;
 - editing text or structured objects during an in-flight write prevents stale
   success/failure from overwriting the newer composer;
 - reaction event-before-REST and REST-before-event update once; reversed

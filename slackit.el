@@ -26,7 +26,7 @@
 (require 'slackit-runtime)
 (require 'slackit-http)
 (require 'slackit-api)
-(require 'slackit-rtm)
+(require 'slackit-realtime)
 (require 'slackit-history)
 (require 'slackit-emoji)
 (require 'slackit-media)
@@ -61,12 +61,16 @@
     (slackit-runtime-operation-end app operation))
   (slackit-runtime-publish-bootstrap app))
 
-(defun slackit--bootstrap-identity-success (app operation body)
-  "Reduce auth.test BODY for current APP bootstrap OPERATION."
+(defun slackit--bootstrap-identity-success
+    (app operation body &optional identity-ready-function)
+  "Reduce auth.test BODY for current APP bootstrap OPERATION.
+
+After binding the authenticated identity, call IDENTITY-READY-FUNCTION with
+APP when it is non-nil."
   (when (slackit-runtime-operation-current-p app operation)
     (let ((team-id (slackit-normalize-get body 'team_id))
           (user-id (slackit-normalize-get body 'user_id)))
-      (if (not (slackit-runtime-credential-identity-matches-p
+      (if (not (slackit-runtime-bind-credential-identity
                 app team-id user-id))
           (slackit--bootstrap-failure
            app operation '(:code "identity_mismatch"))
@@ -78,7 +82,9 @@
           (slackit-state-put-team-self state team self)
           (slackit-state-put-user state self)
           (slackit-state-set-bootstrap-complete state 'identity)
-          (slackit--bootstrap-maybe-complete app operation))))))
+          (slackit--bootstrap-maybe-complete app operation)
+          (when identity-ready-function
+            (funcall identity-ready-function app)))))))
 
 
 (defun slackit--bootstrap-conversations-page (app operation conversations)
@@ -98,12 +104,13 @@
      (slackit-runtime-state app) kind)
     (slackit--bootstrap-maybe-complete app operation)))
 
-(defun slackit-bootstrap-account (app)
+(defun slackit-bootstrap-account (app &optional identity-ready-function)
   "Start identity and conversation bootstrap for APP.
 
-The user cache is ready immediately and grows through exact `users.info'
-lookups requested by visible conversations and messages.  Startup never scans
-the workspace-wide `users.list' collection."
+Call IDENTITY-READY-FUNCTION with APP after `auth.test' binds the credential's
+workspace identity.  The user cache is ready immediately and grows through
+exact `users.info' lookups requested by visible conversations and messages.
+Startup never scans the workspace-wide `users.list' collection."
   (let* ((key '(bootstrap))
          (operation (slackit-runtime-operation-begin app key))
          (state (slackit-runtime-state app))
@@ -114,8 +121,10 @@ the workspace-wide `users.list' collection."
     (slackit-runtime-publish-bootstrap app)
     (slackit-api-auth-test
      app
-     :on-success (apply-partially
-                  #'slackit--bootstrap-identity-success app operation)
+     :on-success
+     (lambda (body)
+       (slackit--bootstrap-identity-success
+        app operation body identity-ready-function))
      :on-error failure)
     (slackit-api-conversations-list-all
      app
@@ -128,7 +137,7 @@ the workspace-wide `users.list' collection."
     operation))
 
 (defun slackit-start-account (account-id &optional credential)
-  "Start ACCOUNT-ID, bootstrap it, start RTM, and open its root.
+  "Start ACCOUNT-ID, authenticate it, start realtime, and open its root.
 
 When CREDENTIAL is nil, resolve it through
 `slackit-credential-function'."
@@ -144,8 +153,7 @@ When CREDENTIAL is nil, resolve it through
                   (slackit-runtime-start-account account-id resolved))))
     (slackit-root-open app t)
     (unless existing
-      (slackit-bootstrap-account app)
-      (slackit-rtm-start app))
+      (slackit-bootstrap-account app #'slackit-realtime-start))
     app))
 
 (defun slackit--login-error (account-id error)
