@@ -77,11 +77,31 @@
             user-id
             (secure-hash 'sha256 url)))))
 
+(defun slackit-avatar--cache-scope (resource-key)
+  "Return account/user cache scope hash for RESOURCE-KEY."
+  (secure-hash 'sha256
+               (prin1-to-string (seq-take resource-key 3))))
+
 (defun slackit-avatar--cache-base (resource-key)
-  "Return private cache base path for opaque RESOURCE-KEY."
+  "Return versioned private cache base path for opaque RESOURCE-KEY."
   (expand-file-name
-   (secure-hash 'sha256 (prin1-to-string resource-key))
+   (format "%s-%s"
+           (slackit-avatar--cache-scope resource-key)
+           (or (nth 3 resource-key) "unknown"))
    slackit-avatar-cache-directory))
+
+(defun slackit-avatar--delete-stale-cache-files (resource-key keep-file)
+  "Delete old profile image versions for RESOURCE-KEY except KEEP-FILE."
+  (when (file-directory-p slackit-avatar-cache-directory)
+    (let ((regexp
+           (concat "\\`"
+                   (regexp-quote
+                    (concat (slackit-avatar--cache-scope resource-key) "-")))))
+      (dolist (file
+               (directory-files slackit-avatar-cache-directory t regexp))
+        (when (and (file-regular-p file)
+                   (not (file-equal-p file keep-file)))
+          (ignore-errors (delete-file file)))))))
 
 (defun slackit-avatar--prepare-cache-directory ()
   "Prepare and return the private avatar cache directory."
@@ -126,14 +146,17 @@
 
 (defun slackit-avatar--fetch-success (owner file)
   "Settle avatar fetch OWNER with private cache FILE."
-  (when (slackit-avatar--owner-current-p owner)
-    (unless (memq system-type '(ms-dos windows-nt cygwin))
+  (let* ((current-p (slackit-avatar--owner-current-p owner))
+         (app (slackit-avatar-fetch-app owner))
+         (resource-key (slackit-avatar-fetch-resource-key owner)))
+    (when (and (file-regular-p file)
+               (not (memq system-type '(ms-dos windows-nt cygwin))))
       (set-file-modes file #o600))
-    (remhash (slackit-avatar-fetch-resource-key owner)
-             slackit-avatar--failures)
-    (let ((app (slackit-avatar-fetch-app owner))
-          (resource-key (slackit-avatar-fetch-resource-key owner)))
-      (slackit-avatar--retire-fetch owner)
+    (when current-p
+      (slackit-avatar--delete-stale-cache-files resource-key file)
+      (remhash resource-key slackit-avatar--failures))
+    (slackit-avatar--retire-fetch owner)
+    (when current-p
       (slackit-runtime-publish-resource app resource-key))))
 
 (defun slackit-avatar--fetch-failure (owner _error)

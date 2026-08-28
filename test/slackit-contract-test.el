@@ -430,9 +430,16 @@
                  (string-match-p
                   "CANARY-TOKEN\\|CANARY-COOKIE\\|Authorization\\|Cookie"
                   (prin1-to-string calls)))
-                (let ((file (concat (cadar calls) ".png")))
+                (let* ((file (concat (cadar calls) ".png"))
+                       (stale
+                        (expand-file-name
+                         (format "%s-stale.png"
+                                 (slackit-avatar--cache-scope resource-key))
+                         slackit-avatar-cache-directory)))
+                  (with-temp-file stale (insert "old-image"))
                   (with-temp-file file (insert "synthetic-image"))
                   (funcall success file)
+                  (should-not (file-exists-p stale))
                   (unless (memq system-type '(ms-dos windows-nt cygwin))
                     (should (= #o700
                                (logand #o777
@@ -496,6 +503,94 @@
                    (if (listp value)
                        (memq expected value)
                      (eq value expected)))))))))
+
+(ert-deftest slackit-contract-chat-views-enable-responsive-geometry ()
+  (slackit-test-with-app (app "responsive-view")
+    (slackit-state-put-conversation
+     (slackit-runtime-state app)
+     '((id . "C1") (name . "general") (is_member . t)))
+    (cl-letf (((symbol-function 'slackit-history-load-latest)
+               (lambda (&rest _arguments) nil)))
+      (let ((view (slackit-room-open app "C1" nil)))
+        (should (memq 'geometry (appkit-view-parts view)))
+        (with-current-buffer (appkit-view-buffer view)
+          (should appkit-view--responsive-geometry-p))))))
+
+(ert-deftest slackit-contract-geometry-redraws-timestamps-at-new-width ()
+  (with-temp-buffer
+    (let ((invalidations (appkit-invalidations-create))
+          rendered-keys)
+      (setf (appkit-invalidations-parts invalidations) '(geometry)
+            (appkit-invalidations-entry-keys invalidations) '("changed"))
+      (cl-letf (((symbol-function 'appkit-view-responsive-width)
+                 (lambda (&rest _arguments) 44))
+                ((symbol-function 'appkit-chat-timeline-live-p)
+                 (lambda () t))
+                ((symbol-function 'appkit-chat-timeline-keys)
+                 (lambda () '("one" "two")))
+                ((symbol-function 'appkit-view-pending-events-snapshot)
+                 (lambda (_view) nil))
+                ((symbol-function 'appkit-view-acknowledge-events)
+                 (lambda (&rest _arguments) nil))
+                ((symbol-function 'slackit-room--render)
+                 (lambda (keys _resources)
+                   (setq rendered-keys keys))))
+        (slackit-room--sync 'fake-view invalidations))
+      (should (= 44 fill-column))
+      (should (equal '("changed" "one" "two") rendered-keys))))
+  (slackit-test-with-app (app "responsive-time")
+    (let ((state (slackit-runtime-state app))
+          (message
+           '((ts . "1710000000.000001")
+             (user . "U1")
+             (text . "message"))))
+      (slackit-state-put-user
+       state '((id . "U1") (profile . ((display_name . "Alice")))))
+      (with-temp-buffer
+        (let ((slackit-show-avatars nil)
+              (slackit-right-align-timestamps t)
+              (inhibit-read-only t))
+          (cl-labels
+              ((render-target
+                (width)
+                (erase-buffer)
+                (cl-letf (((symbol-function 'appkit-view-responsive-width)
+                           (lambda (&rest _arguments) width))
+                          ((symbol-function
+                            'appkit-chat-avatar-two-line-pixel-size)
+                           (lambda () 32)))
+                  (slackit-render-message-row
+                   app state message
+                   (slackit-room--message-context nil message)))
+                (let* ((positions
+                        (number-sequence
+                         (point-min) (max (point-min) (1- (point-max)))))
+                       (timestamp-position
+                        (seq-find
+                         (lambda (position)
+                           (eq (get-text-property position 'face)
+                               'slackit-timestamp))
+                         positions))
+                       (timestamp-line-start
+                        (and timestamp-position
+                             (save-excursion
+                               (goto-char timestamp-position)
+                               (line-beginning-position))))
+                       (spacer-position
+                        (and timestamp-position
+                             (seq-find
+                              (lambda (position)
+                                (let ((display
+                                       (get-text-property position 'display)))
+                                  (and (listp display)
+                                       (eq (car display) 'space)
+                                       (eq (cadr display) :align-to))))
+                              (number-sequence
+                               timestamp-line-start timestamp-position)))))
+                  (nth 2
+                       (get-text-property spacer-position 'display)))))
+            (should (= 35 (render-target 40)))
+            (should (= 55 (render-target 60)))))))))
 
 (ert-deftest slackit-contract-delayed-history-cannot-overwrite-or-resurrect ()
   (let* ((state (slackit-state-create))

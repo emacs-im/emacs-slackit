@@ -287,6 +287,13 @@ right-aligned timestamps, full-width date/unread separators, wrapped body
 prefixes, and bounded same-sender compaction.  These are display properties;
 copied message text remains free of alignment padding and avatar placeholders.
 
+Both chat view kinds declare the Appkit =geometry= part and enable
+=appkit-view-enable-responsive-geometry=.  A coalesced geometry invalidation
+remeasures the canonical display window and force-redraws every visible
+timeline key, preserving position while recalculating alignment.  Rendering a
+hidden buffer may use =fill-column= temporarily, but displaying or resizing it
+must replace that fallback without application-owned window hooks.
+
 Unsupported blocks, files, and subtypes remain visible as explicit safe rows.
 A file-only message shows available filename/type/permalink metadata without
 starting a download, preview, upload, or media process.

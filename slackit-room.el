@@ -319,28 +319,36 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
       ((or 'compose-success 'compose-failure)
        (slackit-compose-apply-settlement change)))))
 
+(defun slackit-room--configure-responsive-view (view sync-function)
+  "Configure live chat VIEW for responsive rendering through SYNC-FUNCTION."
+  (setf (appkit-view-sync-function view) sync-function
+        (appkit-view-parts view) '(frame timeline composer geometry))
+  (appkit-view-enable-responsive-geometry view)
+  view)
+
+(defun slackit-room--invalidation-force-keys (invalidations)
+  "Return row keys requiring redraw for coalesced INVALIDATIONS."
+  (let ((entries (appkit-invalidations-entry-keys invalidations)))
+    (if (memq 'geometry (appkit-invalidations-parts invalidations))
+        (progn
+          (when-let* ((width
+                       (appkit-view-responsive-width
+                        slackit-room-auto-fill-margin-columns)))
+            (setq-local fill-column width))
+          (delete-dups
+           (append entries
+                   (and (appkit-chat-timeline-live-p)
+                        (appkit-chat-timeline-keys)))))
+      entries)))
+
 (defun slackit-room--sync (view invalidations)
   "Synchronize room VIEW from coalesced INVALIDATIONS."
-  (let* ((events (appkit-view-pending-events-snapshot view))
-         (parts (appkit-invalidations-parts invalidations))
-         (geometry-p (memq 'geometry parts))
-         (entries (appkit-invalidations-entry-keys invalidations))
-         (resources (appkit-invalidations-resource-keys invalidations)))
-    (when geometry-p
-      (when-let* ((width
-                   (appkit-view-responsive-width
-                    slackit-room-auto-fill-margin-columns)))
-        (setq-local fill-column width)))
+  (let ((events (appkit-view-pending-events-snapshot view)))
     (dolist (event events) (slackit-room--apply-event view event))
     (appkit-view-acknowledge-events view (length events))
     (slackit-room--render
-     (if geometry-p
-         (delete-dups
-          (append entries
-                  (and (appkit-chat-timeline-live-p)
-                       (appkit-chat-timeline-keys))))
-       entries)
-     resources)))
+     (slackit-room--invalidation-force-keys invalidations)
+     (appkit-invalidations-resource-keys invalidations))))
 
 (defun slackit-room--setup (conversation-id app _view)
   "Initialize a newly attached room for CONVERSATION-ID and APP."
@@ -366,9 +374,8 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
                 :setup (apply-partially
                         #'slackit-room--setup conversation-id app)
                 :select select)))
-    (setf (appkit-view-sync-function view) #'slackit-room--sync
-          (appkit-view-parts view) '(frame timeline composer geometry))
-    (appkit-view-enable-responsive-geometry view)
+    (slackit-room--configure-responsive-view
+     view #'slackit-room--sync)
     (with-current-buffer (appkit-view-buffer view)
       (setq-local slackit-room--conversation-id conversation-id
                   slackit-room--app app)

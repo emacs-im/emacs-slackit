@@ -26,6 +26,10 @@
                   "slackit-room" (app resources))
 (declare-function slackit-room--message-context
                   "slackit-room" (previous message &optional unread-divider))
+(declare-function slackit-room--configure-responsive-view
+                  "slackit-room" (view sync-function))
+(declare-function slackit-room--invalidation-force-keys
+                  "slackit-room" (invalidations))
 (declare-function slackit-avatar-resource-key
                   "slackit-avatar" (app user))
 
@@ -164,26 +168,12 @@
 
 (defun slackit-thread--sync (view invalidations)
   "Synchronize thread VIEW from coalesced INVALIDATIONS."
-  (let* ((events (appkit-view-pending-events-snapshot view))
-         (parts (appkit-invalidations-parts invalidations))
-         (geometry-p (memq 'geometry parts))
-         (entries (appkit-invalidations-entry-keys invalidations))
-         (resources (appkit-invalidations-resource-keys invalidations)))
-    (when geometry-p
-      (when-let* ((width
-                   (appkit-view-responsive-width
-                    slackit-room-auto-fill-margin-columns)))
-        (setq-local fill-column width)))
+  (let ((events (appkit-view-pending-events-snapshot view)))
     (dolist (event events) (slackit-thread--apply-event view event))
     (appkit-view-acknowledge-events view (length events))
     (slackit-thread--render
-     (if geometry-p
-         (delete-dups
-          (append entries
-                  (and (appkit-chat-timeline-live-p)
-                       (appkit-chat-timeline-keys))))
-       entries)
-     resources)))
+     (slackit-room--invalidation-force-keys invalidations)
+     (appkit-invalidations-resource-keys invalidations))))
 
 (defun slackit-thread--setup (app conversation-id root-ts _view)
   "Initialize one newly attached APP thread view."
@@ -214,9 +204,8 @@
                         #'slackit-thread--setup
                         app conversation-id root-ts)
                 :select select)))
-    (setf (appkit-view-sync-function view) #'slackit-thread--sync
-          (appkit-view-parts view) '(frame timeline composer geometry))
-    (appkit-view-enable-responsive-geometry view)
+    (slackit-room--configure-responsive-view
+     view #'slackit-thread--sync)
     (with-current-buffer (appkit-view-buffer view)
       (setq-local slackit-room--app app
                   slackit-room--conversation-id conversation-id
