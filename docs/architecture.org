@@ -1,0 +1,415 @@
+#+title: Slackit
+#+options: toc:2 num:nil
+
+Slackit is an Appkit-based Slack client for Emacs.  It is a new implementation,
+not a fork or compatibility layer for =emacs-slack=.  The package, feature,
+files, commands, variables, and faces use the =slackit-= namespace so both
+clients can be installed and loaded in one Emacs session.
+
+Status: the first daily-use vertical slice is implemented and covered by
+deterministic contract tests.  Live-workspace transport validation still
+requires account credentials and remains an explicit release check.
+
+* Product boundary
+
+Slackit owns Slack account configuration, protocol state, transport, error
+semantics, event reduction, message rendering, and Slack-specific actions.
+Appkit owns application/view lifecycle, generated-content transactions,
+coalesced invalidation, stable-key reconciliation, semantic position, chat
+composer geometry, continuous history-window mechanics, directories, and media
+presentation.
+
+The existing workspace projects have distinct roles:
+
+- =emacs-slack= is the behavioral and Slack Web API/RTM reference.  Slackit may
+  port endpoint semantics and payload knowledge, but never loads its =slack-=
+  modules or shares their global state, EIEIO models, LUI buffers, request
+  worker, or symbols.
+- =disco.el= is the closest room/gateway/Appkit reference: canonical state is
+  changed before views are invalidated, and room timelines use stable server
+  keys.
+- =emacs-qq= is the account-lifecycle reference: each stable account owns a
+  separate Appkit application and state partition.
+- =appkit.el/docs/integrator.org= is authoritative for reusable UI and update
+  mechanics.  Slackit does not add a second projection, composer, history, or
+  lifecycle framework beside it.
+
+The initial compatibility floor is Emacs 29.1 with =appkit=, =plz=, and
+=websocket=.  No =request=, =circe=/LUI, =dash=, =s=, or EIEIO dependency is
+needed for the first slice.
+
+* Account identity and credentials
+
+One registered Slack account owns one =slackit-account= Appkit application.
+The public registration shape is:
+
+#+begin_src emacs-lisp
+(slackit-register-account
+ :id "work"
+ :token (auth-source-pick-first-password
+         :host "work.slack.com"
+         :user "me@example.com")
+ :cookie (auth-source-pick-first-password
+          :host "work.slack.com"
+          :user "me@example.com^cookie"))
+#+end_src
+
+=:id= is required, local, stable, and chosen by the user.  It identifies the
+Appkit application and appears in buffer names.  A Slack team ID and self user
+ID learned during connection are protocol facts, not lifecycle identities:
+they may be unavailable before bootstrap and one workspace can contain more
+than one configured user account.
+
+Credentials are an account-local bundle, never global URL-library state.
+Tokens, cookies, RTM capability URLs, and response bodies are never used in
+Appkit IDs, view IDs, state keys, buffer names, errors, or logs.  Diagnostics
+redact headers, URL queries/fragments, request/response bodies, and WebSocket
+URLs before formatting them.
+
+The credential router is origin- and endpoint-class-aware.  Only fixed Web API
+requests to =https://slack.com/api/= receive the account bearer token and
+optional =xoxc= cookie.  Redirects, media URLs, and presigned upload URLs never
+inherit those credentials.  Cookies are account-local, so two =xoxc= accounts
+cannot share a cookie jar.
+
+The first realtime transport calls =rtm.connect=, validates the returned URL as
+an allowed =wss= Slack capability URL, opens that exact URL, and treats receipt
+of RTM =hello= as connection readiness.  The capability URL is secret and is
+never logged.  Heartbeat/pong timeout, =reconnect_url= adoption, bounded
+reconnect backoff, and one pending reconnect attempt per live generation are
+part of the first delivery, not later reliability work.
+
+Only idempotent reads may honor server =Retry-After= automatically, with a
+bounded account/view-owned delay.  =chat.postMessage= and every other write are
+sent once; timeout or an unknown outcome is surfaced without automatic retry.
+Interactive OAuth, token refresh, Socket Mode, and enterprise-token selection
+are outside the first slice.
+
+* Ownership model
+
+** Account application
+
+The Appkit application owns:
+
+- one canonical =slackit-account-state=;
+- one =slackit-transport= with connection generation, WebSocket, capability
+  URL, heartbeat/reconnect timers, and connection status;
+- cursor-complete account bootstrap for users and joined conversations;
+- account-wide writes, including send, edit, delete, reaction, and mark-read
+  operations, which must settle even if their originating room closes;
+- the root, room, and thread views for that account.
+
+Stopping an account increments its transport generation before calling
+=appkit-stop-app=.  Appkit then cancels its WebSocket, timers, HTTP processes,
+and views.  The generation bump cannot live only in the app-kind shutdown
+callback because Appkit invokes that callback after normal owner cleanup.  A
+callback captures the exact application object and generation; matching only a
+reused local account ID is insufficient.
+
+There is no dynamically global “current Slack team” for callbacks.  Interactive
+commands may remember a default account ID for selection, but every operation
+and buffer resolves its exact owning Appkit application.
+
+** Views
+
+Stable view IDs are secret-free protocol identities:
+
+- root: =(root)=
+- conversation: =(room CONVERSATION-ID)=
+- thread: =(thread CONVERSATION-ID ROOT-TS)=
+
+Suggested buffer names are =*Slackit:work*=,
+=*Slackit:work:#general*=, and =*Slackit:work:#general:thread ROOT-TS*=.
+Names are presentation only; Appkit fingerprints remain authoritative if users
+rename buffers.
+
+Room and thread history requests are view-owned because cursors, exact windows,
+and loading state are view-local.  Their Appkit history owner and cancellable
+transport handle are retired together.  Every write is account-owned.  UI
+settlement is applied only when the originating view is still live and the
+captured message/composer revision is still current.
+
+* Canonical state
+
+=slackit-account-state= contains protocol facts, not rendered strings:
+
+- connection/team/self metadata with explicit unknown/loading/error states;
+- users keyed by exact Slack user ID;
+- conversations keyed by exact conversation ID plus a stable visible order;
+- explicit-knownness read facts such as =last_read=, never fabricated zeroes;
+- messages partitioned by conversation ID and keyed by exact =ts=;
+- separate top-level and =(conversation-id . root-ts)= reply indexes;
+- normalized text references, thread metadata, reactions, and safe file
+  summaries retained on canonical messages;
+- sorted message-key sequences for projection;
+- a monotonic mutation revision and per-message revisions/tombstones;
+- the latest raw protocol facts required to normalize later events.
+
+JSON payloads are normalized into plain alists at the API/event boundary.
+Unknown fields may be preserved there; views never depend directly on raw HTTP
+or WebSocket envelopes.  Nested =message_changed=, =message_deleted=,
+=message_replied=, ordinary reply, and =thread_broadcast= envelopes are
+classified before reduction.  An ordinary reply never becomes an accidental
+top-level row; a broadcast reply appears once in the room and once in its
+thread projection.
+
+Slack IDs and timestamps are opaque strings.  Message identity is
+=(CONVERSATION-ID . TS)=.  Within one room or thread the Appkit timeline row key
+is =TS=.  Timestamp order uses =string<=; identity and ordering never convert
+=ts= to an Emacs number.  Rendering may parse the integer seconds component
+only to show a clock time.
+
+History responses capture the account mutation revision at dispatch.  When a
+page settles, its messages are merged only if a newer realtime mutation has
+not changed or deleted the same key.  A delayed room or reply page therefore
+cannot resurrect a deleted message or overwrite a newer edit.  HTTP responses,
+RTM events, and action refreshes all use the same idempotent reducers.
+
+Reaction and read facts are event/snapshot-authoritative.  A successful write
+receipt settles its operation but does not invent a reaction count, membership,
+or read frontier that Slack has not supplied.  Pending operation keys include
+the exact account, conversation, message, and reaction/read identity.
+
+* Update path
+
+Every external result follows one path:
+
+#+begin_example
+HTTP / RTM payload
+  -> normalize and validate
+  -> reduce canonical account state
+  -> produce Slackit change descriptors
+  -> enqueue descriptors on affected Appkit views
+  -> appkit-request-sync
+  -> the view sync callback adjusts view-local controllers
+  -> Appkit reconciles stable rows inside its transaction
+#+end_example
+
+Transport callbacks never edit generated buffer content, call row printers, or
+force redisplay.  Change descriptors carry only what projection needs, such as
+conversation ID, message =ts=, root =ts=, structural change kind, and resource
+keys.
+
+A room or thread sync drains its queued descriptors before projection.  A live
+create can seed an authoritative-empty Appkit history window; an edit
+invalidates one entry; a delete repairs an exact window edge before structural
+reconciliation.  User, conversation join/leave/rename/archive, reply metadata,
+reaction, and marked events update canonical state first and then request
+targeted root/room/thread invalidation.
+
+* Appkit surfaces
+
+** Root
+
+=slackit-root-mode= derives from =appkit-directory-mode=.  It projects joined
+conversations into three sections: direct messages, group direct messages, and
+channels.  Entry keys are conversation IDs; activation opens the exact account
+room.  User and conversation changes invalidate dependent entries without
+rebuilding unrelated rows.
+
+Bootstrap consumes every =users.list= and =conversations.list= cursor before
+declaring the account directory ready.  The root remains usable while showing
+real connection/loading/retryable-error state, but never presents a partial
+collection as complete.  RTM =user_change=/=team_join= and joined-conversation
+join/leave/rename/archive events keep existing rows and sender dependencies
+current.
+
+The root does not call =client.userBoot= or =client.counts= and does not invent
+unread or mention badges.  It may mark a row unread only after the selected
+transport supplies an authoritative read projection.
+
+** Room
+
+=slackit-room-mode= derives from =appkit-chatbuf-mode= and installs an Appkit
+chat timeline.  It uses:
+
+- =appkit-chat-timeline-project= and =appkit-chat-timeline-sync= for =ts=-keyed
+  rows;
+- =appkit-chat-history= for exact visible edges, loading ownership, older
+  exhaustion, and passive delimiters;
+- the Appkit chatbuf composer for the writable tail, draft history, reply/edit
+  auxiliary state, and structured mention/channel objects;
+- =appkit-chat-completion= for account-local =@user= and =#channel=
+  candidates;
+- resource dependencies for sender, user/channel references, thread parent,
+  and later avatar/emoji/media invalidation.
+
+Slackit owns the row payload, Slack mrkdwn/reference interpretation, subtype
+handling, clock text, sender selection, and actions.  The first slice decodes
+entities and renders user, channel, special mention, date, safe link, and code
+references from stable protocol IDs.  Missing resources retain explicit ID
+fallbacks and later resource arrival invalidates dependent rows.
+
+Unsupported blocks, files, and subtypes remain visible as explicit safe rows.
+A file-only message shows available filename/type/permalink metadata without
+starting a download, preview, upload, or media process.
+
+Initial history uses =conversations.history=.  The room owns the returned older
+cursor because Appkit deliberately does not interpret protocol cursors.
+
+- An empty first response calls
+  =appkit-chat-history-window-establish-empty=.
+- A non-empty latest response sets the exact first key and a nil last key,
+  meaning attached to the live frontier.
+- The response cursor is used for the next older page.
+- An absent next cursor marks the older edge authoritative.
+- Realtime creates extend an attached-latest window without guessing across a
+  partial window.
+- Exact slicing happens before subtype visibility filtering, so a hidden reply
+  cannot manufacture a false history gap.
+
+** Thread
+
+=slackit-thread-mode= is a separate Appkit chatbuf/timeline view keyed by
+=(thread CONVERSATION-ID ROOT-TS)=.  It loads the root and replies through
+=conversations.replies=, pages with its own view-owned cursor, and sends replies
+through =chat.postMessage= with =thread_ts=.  It does not use
+=subscriptions.thread.*= or =client.counts=.
+
+The canonical message exists once per conversation; room and thread projections
+select different indexes.  Reply create/change/delete events update the open
+thread and its parent row metadata.  =thread_broadcast= reconciles into both
+views without duplicating either row.  Closing the thread does not cancel an
+already dispatched reply.
+
+** Composer and completion
+
+The composer serializes ordinary text plus structured =@user= and =#channel=
+objects to exact Slack ID forms.  Candidate labels are account-local and
+collision-safe; display text is never the wire identity.  The same composer
+auxiliary state supports a plain room send, a thread reply, and editing one
+owned message.  It does not implement rich WYSIWYG or Block Kit authoring.
+
+Each operation freezes its semantic input and Appkit composer revision while
+the account-owned request is in flight.  Success clears or exits the operation
+only if that same revision is still current; failure leaves the draft editable
+and displays the real Slack error.
+
+The HTTP response and matching RTM event may arrive in either order.  Send and
+edit converge through the server =(conversation-id . ts)= reducer; delete
+converges through the same tombstone.  The first slice does not create an
+optimistic timeline row or automatically retry a write with an unknown outcome.
+
+** Reactions and read state
+
+History/reply snapshots render reaction name, count, and current-user
+membership as text.  =reactions.add= and =reactions.remove= are account-owned;
+RTM =reaction_added=/=reaction_removed= events are authoritative and invalidate
+only the affected row in every projection.  One latest operation per
+=(account, conversation, ts, reaction)= prevents a stale REST completion from
+overwriting a later opposite action.
+
+Room read advancement uses only the newest canonical row actually reached in
+an exact visible window.  It never crosses an unknown history gap.  Mark writes
+through =conversations.mark= are monotonic and coalesced per account and
+conversation; =*_marked= events update canonical =last_read=.  A write receipt
+settles pending work but does not fabricate unread counts or locally clear an
+unknown server badge.
+
+* Modules
+
+Keep cohesive modules near 500 lines and split protocol mechanics before room
+controllers become a =disco-room.el=-sized unit.
+
+| Module | Ownership |
+|--------+-----------|
+| =slackit.el= | Package entry point, registration/start/stop commands, cursor-complete bootstrap |
+| =slackit-customize.el= | User options, faces, and redacted diagnostic policy |
+| =slackit-runtime.el= | Account registry, Appkit apps, operation ownership, view invalidation dispatch |
+| =slackit-state.el= | Canonical account store, revisions, tombstones, idempotent reducers, queries |
+| =slackit-normalize.el= | JSON normalization, safe file/reaction summaries, message/event classification |
+| =slackit-http.el= | Origin-bound =plz= requests, credential routing, redaction, cancellation, read retry |
+| =slackit-api.el= | Slack endpoint parameters, cursor adaptation, typed results |
+| =slackit-rtm.el= | WebSocket generation, hello/readiness, heartbeat/reconnect, event dispatch |
+| =slackit-root.el= | Appkit directory projection and account root commands |
+| =slackit-room.el= | Room view assembly, invalidation sync, timeline projection |
+| =slackit-history.el= | Initial/older paging and exact Appkit history-window transitions |
+| =slackit-compose.el= | Draft/aux capture, structured serialization, send/edit settlement |
+| =slackit-completion.el= | Account-local user/channel candidates and structured insertion |
+| =slackit-render.el= | Safe message-row rendering, Slack reference expansion, fallback rows |
+| =slackit-thread.el= | Thread view, reply history, parent/reply projection, reply send |
+| =slackit-reaction.el= | Latest-intent reaction operation ownership and REST settlement |
+| =slackit-read.el= | Known read frontier, viewed-row advancement, coalesced mark operations |
+| =slackit-actions.el= | Stable row action dispatch, edit/delete/reply/reaction entry points |
+
+Media transfer, search, notification, and full Block Kit modules are added only
+when their observable feature is implemented; the first slice does not create
+empty extension scaffolds.
+
+* First daily-use vertical slice
+
+The first delivery is intentionally larger than a transport demonstration.  It
+is complete only when one or more registered accounts can:
+
+1. start independently from stable local account IDs with account-local,
+   origin-bound credentials and secret-free diagnostics;
+2. consume all users/conversations cursors, project loading/error/readiness
+   honestly, and honor bounded =Retry-After= only for idempotent reads;
+3. reach RTM =hello=, maintain ping/pong, adopt =reconnect_url=, reconnect with a
+   generation fence, and keep user/conversation metadata current;
+4. open an Appkit directory root and the exact account-owned conversation room;
+5. load the latest exact message window, page older with the returned cursor,
+   and merge pages safely against later RTM edits/deletes;
+6. render Slack text references, safe links/code, explicit unsupported content,
+   and non-fetching file summaries;
+7. complete =@user= and =#channel= as structured exact-ID composer objects;
+8. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
+   marked, user, and joined-conversation lifecycle events;
+9. send room text and reconcile HTTP/RTM arrival in either order without an
+   optimistic row or automatic write retry;
+10. open a stable thread view, load/page replies, receive reply mutations, and
+    send a reply;
+11. edit and delete an owned message with revision/tombstone-safe settlement;
+12. render, add, and remove text reactions with REST/RTM race safety;
+13. advance and explicitly mark read only through an authoritative reached row,
+    without =client.counts= or fabricated unread badges;
+14. stop with no live Slackit WebSocket, timer, request, operation, or view left
+    behind; and
+15. coexist in one Emacs process with the existing =slack= package.
+
+Deferred after this slice: rich Block Kit/attachments, rich WYSIWYG, file/media
+download/preview/upload, avatars, custom emoji images/catalogs, global search,
+notifications, unread/modeline count summaries, typing, presence, DND,
+thread subscription/activity endpoints, pins/saved items, scheduled messages,
+workspace administration, interactive OAuth/token refresh/Socket Mode, and
+optimistic local timeline rows.  Unsupported content remains visible without
+silently expanding any deferred transport surface.
+
+* Contract checks
+
+Implementation should defend these observable contracts:
+
+- loading =slack= and =slackit= together produces no feature, file, symbol,
+  Custom group, face, mode, or buffer ownership collision;
+- two accounts with equal conversation/message/root =ts= values never share
+  state, requests, operations, completions, marks, or views;
+- canary credentials never appear in identities, rendered buffers, errors, or
+  diagnostics, and cross-origin/redirect/media URLs receive no Slack secrets;
+- two-page users and conversations fixtures do not become ready after page one;
+- RTM readiness requires =hello=; only one reconnect attempt exists per live
+  generation; stop/restart makes every prior callback inert;
+- timestamp ordering remains correct for fixed-width decimal strings;
+- a delayed room/reply history page cannot overwrite a later RTM edit or
+  resurrect a delete;
+- empty history followed by a live message becomes one attached-latest row;
+- initial and older pages preserve exact Appkit edges and do not project cached
+  islands across an unknown gap;
+- user/conversation metadata events retain and narrowly invalidate unaffected
+  root/timeline rows;
+- ordinary replies stay out of the top-level sequence, while broadcasts appear
+  once in both the room and thread;
+- completion serializes the selected account's exact user/conversation ID even
+  when labels collide or later change;
+- send and edit response-before-RTM and RTM-before-response orders converge to
+  one server row; delete converges to one tombstone;
+- editing text or structured objects during an in-flight write prevents stale
+  success/failure from overwriting the newer composer;
+- reaction event-before-REST and REST-before-event update once; reversed
+  add/remove completions leave the later action authoritative;
+- read marks advance monotonically only to a reached row and never cross an
+  unknown gap; receipts do not fabricate read/count state;
+- no write is automatically retried after timeout, rate limit, or unknown
+  outcome; and
+- every external callback reduces canonical/controller state and requests
+  Appkit sync; only sync callbacks mutate generated content while preserving
+  point, window start, draft text, and undo history.
