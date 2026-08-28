@@ -1085,6 +1085,60 @@
              (channel . "G1")
              (ts . "2.000001"))))))
 
+(ert-deftest slackit-contract-browser-session-rtm-reaches-hello ()
+  (slackit-test-with-app (app "browser-rtm")
+    (let* ((transport (slackit-runtime-transport app))
+           (credential (slackit-transport-credential transport))
+           opened-url
+           opened-headers)
+      (setf (slackit-credential-token credential) "xoxc-RTM-CANARY"
+            (slackit-credential-cookie credential)
+            "d=xoxd-RTM-CANARY; d-s=DS; lc=LC"
+            (slackit-credential-team-id credential) "T1"
+            (slackit-credential-user-id credential) "U1")
+      (cl-letf
+          (((symbol-function 'slackit-api-rtm-connect)
+            (lambda (&rest _arguments)
+              (ert-fail "browser-session RTM must not use rtm.connect")))
+           ((symbol-function 'websocket-open)
+            (lambda (url &rest arguments)
+              (setq opened-url url
+                    opened-headers
+                    (plist-get arguments :custom-header-alist))
+              (should-not url-cookie-storage)
+              (should-not url-cookie-secure-storage)
+              (funcall (plist-get arguments :on-open) 'synthetic-websocket)
+              (funcall
+               (plist-get arguments :on-message)
+               'synthetic-websocket
+               (make-websocket-frame
+                :opcode 'text
+                :payload "{\"type\":\"hello\"}"
+                :completep t))
+              'synthetic-websocket))
+           ((symbol-function 'websocket-close)
+            (lambda (&rest _arguments) nil)))
+        (slackit-rtm-start app)
+        (should (string-prefix-p
+                 "wss://wss-primary.slack.com/?" opened-url))
+        (should (string-match-p
+                 "token=xoxc-RTM-CANARY" opened-url))
+        (should (string-match-p
+                 "agent_version%3D1785403654" opened-url))
+        (should (equal "d=xoxd-RTM-CANARY"
+                       (cdr (assoc "Cookie" opened-headers))))
+        (should (equal "https://app.slack.com"
+                       (cdr (assoc "Origin" opened-headers))))
+        (should (slackit-transport-ready-p transport))
+        (should
+         (eq 'ready
+             (slackit-account-state-connection-status
+              (slackit-runtime-state app))))
+        (should-not
+         (string-match-p
+          "RTM-CANARY"
+          (slackit-runtime-redact app opened-url)))))))
+
 (provide 'slackit-contract-test)
 
 ;;; slackit-contract-test.el ends here

@@ -14,6 +14,8 @@
 (require 'json)
 (require 'subr-x)
 (require 'url-parse)
+(require 'url-cookie)
+(require 'url-util)
 (require 'websocket)
 (require 'appkit-core)
 (require 'slackit-api)
@@ -29,6 +31,32 @@
 (cl-defstruct (slackit-rtm-timer
                (:constructor slackit-rtm-timer-create))
   app generation kind token timer handle)
+
+(defconst slackit-rtm--browser-user-agent
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+  "Browser protocol User-Agent used only for Slack WebSocket upgrades.")
+
+(defconst slackit-rtm--browser-start-args
+  "?agent=client&org_wide_aware=true&agent_version=1785403654&eac_cache_ts=true&cache_ts=0&name_tagging=true&only_self_subteams=true&connect_only=true&ms_latest=true"
+  "Captured Slack browser client arguments encoded into the WebSocket URL.")
+
+(defun slackit-rtm--browser-url (app)
+  "Return APP's browser-session WebSocket URL, or nil without pinned identity."
+  (let* ((credential
+          (slackit-transport-credential (slackit-runtime-transport app)))
+         (token (and credential (slackit-credential-token credential)))
+         (team-id (and credential (slackit-credential-team-id credential))))
+    (when (and (stringp token) (not (string-empty-p token))
+               (stringp team-id) (not (string-empty-p team-id)))
+      (format
+       (concat
+        "wss://wss-primary.slack.com/?token=%s"
+        "&sync_desync=1&slack_client=desktop&start_args=%s"
+        "&no_query_on_subscribe=1&flannel=3&lazy_channels=1"
+        "&gateway_server=%s-1&batch_presence_aware=1")
+       (url-hexify-string token)
+       (url-hexify-string slackit-rtm--browser-start-args)
+       (url-hexify-string team-id)))))
 
 (defun slackit-rtm-valid-url-p (url)
   "Return non-nil when URL is an allowed Slack WSS capability URL."
@@ -295,15 +323,22 @@
       (slackit-rtm--schedule-reconnect app))))
 
 (defun slackit-rtm--websocket-headers (app)
-  "Return account-local WebSocket cookie headers for APP."
+  "Return account-local browser headers for APP's WebSocket upgrade."
   (let* ((credential (slackit-transport-credential
                       (slackit-runtime-transport app)))
-         (cookie (and credential (slackit-credential-cookie credential))))
-    (when (and (stringp cookie) (not (string-empty-p cookie)))
-      (list (cons "Cookie"
-                  (if (string-prefix-p "d=" cookie)
-                      cookie
-                    (concat "d=" cookie)))))))
+         (cookie (and credential (slackit-credential-cookie credential)))
+         (d-cookie
+          (and (stringp cookie)
+               (string-match
+                "\\(?:\\`\\|;[[:space:]]*\\)d=\\([^;]+\\)" cookie)
+               (match-string 1 cookie))))
+    (append
+     `(("User-Agent" . ,slackit-rtm--browser-user-agent)
+       ("Accept-Language" . "en-US,en;q=0.9")
+       ("Cache-Control" . "no-cache")
+       ("Pragma" . "no-cache")
+       ("Origin" . "https://app.slack.com"))
+     (and d-cookie (list (cons "Cookie" (concat "d=" d-cookie)))))))
 
 (defun slackit-rtm--open (app url)
   "Open APP WebSocket using exact validated capability URL."
@@ -322,36 +357,38 @@
     (condition-case nil
         (progn
           (setq websocket
-                (websocket-open
-                 url
-                 :custom-header-alist (slackit-rtm--websocket-headers app)
-                 :on-open
-                 (lambda (opened)
-                   (when (slackit-rtm--connection-current-p connection opened)
-                     (slackit-rtm--publish-connection app 'handshaking)
-                     (slackit-rtm--start-hello-timeout app)))
-                 :on-message
-                 (lambda (message-websocket frame)
-                   (when (slackit-rtm--connection-current-p
-                          connection message-websocket)
-                     (condition-case nil
-                         (when-let* ((text (slackit-rtm--frame-text frame)))
-                           (slackit-rtm--handle-event
-                            app (slackit-normalize-json text)))
-                       (error
-                        (slackit-rtm--disconnect-current app)
-                        (slackit-rtm--publish-connection app 'protocol-error)
-                        (slackit-rtm--schedule-reconnect app)))))
-                 :on-close
-                 (lambda (closed)
-                   (slackit-rtm--connection-closed connection closed))
-                 :on-error
-                 (lambda (error-websocket _type _error)
-                   (when (slackit-rtm--connection-current-p
-                          connection error-websocket)
-                     (slackit-rtm--disconnect-current app)
-                     (slackit-rtm--publish-connection app 'disconnected)
-                     (slackit-rtm--schedule-reconnect app)))))
+                (let ((url-cookie-storage nil)
+                      (url-cookie-secure-storage nil))
+                  (websocket-open
+                   url
+                   :custom-header-alist (slackit-rtm--websocket-headers app)
+                   :on-open
+                   (lambda (opened)
+                     (when (slackit-rtm--connection-current-p connection opened)
+                       (slackit-rtm--publish-connection app 'handshaking)
+                       (slackit-rtm--start-hello-timeout app)))
+                   :on-message
+                   (lambda (message-websocket frame)
+                     (when (slackit-rtm--connection-current-p
+                            connection message-websocket)
+                       (condition-case nil
+                           (when-let* ((text (slackit-rtm--frame-text frame)))
+                             (slackit-rtm--handle-event
+                              app (slackit-normalize-json text)))
+                         (error
+                          (slackit-rtm--disconnect-current app)
+                          (slackit-rtm--publish-connection app 'protocol-error)
+                          (slackit-rtm--schedule-reconnect app)))))
+                   :on-close
+                   (lambda (closed)
+                     (slackit-rtm--connection-closed connection closed))
+                   :on-error
+                   (lambda (error-websocket _type _error)
+                     (when (slackit-rtm--connection-current-p
+                            connection error-websocket)
+                       (slackit-rtm--disconnect-current app)
+                       (slackit-rtm--publish-connection app 'disconnected)
+                       (slackit-rtm--schedule-reconnect app))))))
           (if (slackit-rtm--connection-current-p connection)
               (setf (slackit-rtm-connection-websocket connection) websocket
                     (slackit-transport-websocket transport) websocket)
@@ -383,16 +420,19 @@
         (slackit-rtm--schedule-reconnect app))))))
 
 (defun slackit-rtm--request-capability (app)
-  "Request and open a fresh RTM capability for APP."
-  (let ((generation (slackit-runtime-connection-generation app)))
-    (slackit-api-rtm-connect
-     app
-     :on-success (lambda (body)
-                   (slackit-rtm--capability-success app generation body))
-     :on-error (lambda (_error)
-                 (when (slackit-rtm--generation-current-p app generation)
-                   (slackit-rtm--publish-connection app 'disconnected)
-                   (slackit-rtm--schedule-reconnect app))))))
+  "Open APP's browser-session socket or request an RTM capability fallback."
+  (if-let* ((url (slackit-rtm--browser-url app)))
+      (slackit-rtm--open app url)
+    (let ((generation (slackit-runtime-connection-generation app)))
+      (slackit-api-rtm-connect
+       app
+       :on-success (lambda (body)
+                     (slackit-rtm--capability-success app generation body))
+       :on-error
+       (lambda (_error)
+         (when (slackit-rtm--generation-current-p app generation)
+           (slackit-rtm--publish-connection app 'disconnected)
+           (slackit-rtm--schedule-reconnect app)))))))
 
 (defun slackit-rtm--reconnect-delay (attempt)
   "Return bounded exponential reconnect delay for ATTEMPT."
@@ -410,9 +450,13 @@
               (slackit-transport-reconnect-url transport) nil)
         (slackit-rtm--retire-timer owner)
         (slackit-rtm--begin-attempt app)
-        (if (slackit-rtm-valid-url-p reconnect-url)
-            (slackit-rtm--open app reconnect-url)
-          (slackit-rtm--request-capability app))))))
+        (cond
+         ((slackit-rtm--browser-url app)
+          (slackit-rtm--request-capability app))
+         ((slackit-rtm-valid-url-p reconnect-url)
+          (slackit-rtm--open app reconnect-url))
+         (t
+          (slackit-rtm--request-capability app)))))))
 
 (defun slackit-rtm--schedule-reconnect (app)
   "Schedule at most one bounded reconnect attempt for APP."

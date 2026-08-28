@@ -95,17 +95,24 @@ never used in Appkit IDs, view IDs, state keys, buffer names, errors, or logs.
 Diagnostics redact headers, URL queries/fragments, request/response bodies, and
 WebSocket URLs before formatting them.
 
-The credential router is origin- and endpoint-class-aware.  Only fixed Web API
+The credential router is origin- and endpoint-class-aware.  Fixed Web API
 requests to =https://slack.com/api/= receive the account bearer token and
-=xoxc= cookie bundle.  Redirects, media URLs, and presigned upload URLs never
-inherit those credentials.  Cookies and login profiles are account-local.
+=xoxc= cookie bundle.  The browser-session RTM adapter is a separate exact
+endpoint class: only =wss://wss-primary.slack.com/= receives the percent-encoded
+=xoxc= query token, one =d= cookie, the captured browser =start_args=/
+=agent_version= fingerprint, and the small WebSocket header set.  URL-library
+global cookies are dynamically suppressed during its handshake so accounts
+cannot contribute duplicate/cross-account Cookie headers.  Redirects, media
+URLs, and presigned upload URLs never inherit Slack credentials.
 
-The first realtime transport calls =rtm.connect=, validates the returned URL as
-an allowed =wss= Slack capability URL, opens that exact URL, and treats receipt
-of RTM =hello= as connection readiness.  The capability URL is secret and is
-never logged.  Hello/heartbeat/pong timeout, =reconnect_url= adoption, bounded
-reconnect backoff, and one pending reconnect attempt per live generation are
-part of the first delivery.
+Pinned browser credentials build that browser WebSocket URL directly, matching
+the measured =slk= client; the =rtm.connect= capability flow remains only for
+deliberate session-only credentials without captured team identity.  Both paths
+validate exact Slack WSS hosts and treat RTM =hello= as readiness.  Capability
+URLs are secret and never logged.  Hello/heartbeat/pong timeout, bounded
+reconnect backoff, and one pending reconnect attempt per live generation remain
+generation-owned.  Browser reconnects rebuild the browser URL; capability
+fallbacks may adopt a validated =reconnect_url=.
 
 Only idempotent reads may honor server =Retry-After= automatically, with a
 bounded account/view-owned delay.  =chat.postMessage= and every other write are
@@ -426,8 +433,9 @@ is complete only when one or more registered accounts can:
 3. consume every conversation cursor, seed self identity, resolve visible users
    once on demand, project readiness honestly, and honor bounded =Retry-After=
    only for idempotent reads;
-4. reach RTM =hello=, maintain ping/pong, adopt =reconnect_url=, reconnect with a
-   generation fence, and keep user/conversation metadata current;
+4. reach RTM =hello= through the browser-shaped or capability fallback path,
+   maintain ping/pong, reconnect with a generation fence, and keep
+   user/conversation metadata current;
 5. open an Appkit directory root and the exact account-owned conversation room;
 6. load the latest exact message window, page older with the returned cursor,
    and merge pages safely against later RTM edits/deletes;
