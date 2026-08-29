@@ -5,7 +5,7 @@
 ;; Author: Slackit contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (appkit "0.2.18") (browser-session "0.1.0") (plz "0.8") (transient "0.7") (websocket "1.16"))
+;; Package-Requires: ((emacs "29.1") (appkit "0.2.19") (browser-session "0.1.0") (plz "0.8") (transient "0.7") (websocket "1.16"))
 ;; URL: https://github.com/emacs-slack/emacs-slackit
 
 ;;; Commentary:

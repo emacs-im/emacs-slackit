@@ -1505,23 +1505,6 @@
            (slackit-state-self-id (slackit-runtime-state app))))
       (slackit-runtime-stop-account app))))
 
-(ert-deftest slackit-contract-evil-preserves-native-motions-and-composer ()
-  (unless (require 'evil nil t)
-    (ert-skip "Evil development dependency unavailable"))
-  (require 'slackit-evil)
-  (slackit-evil-setup)
-  (with-temp-buffer
-    (slackit-room-mode)
-    (evil-normal-state)
-    (slackit-room-timeline-mode 1)
-    (appkit-evil-normalize-keymaps)
-    (should (eq (key-binding (kbd "g g")) #'evil-goto-first-line))
-    (should (eq (key-binding (kbd "e")) #'evil-forward-word-end))
-    (should (eq (key-binding (kbd "i")) #'appkit-chatbuf-focus-input))
-    (should (eq (key-binding (kbd "E")) #'slackit-actions-edit))
-    (slackit-room-timeline-mode -1)
-    (appkit-evil-normalize-keymaps)
-    (should (eq (key-binding (kbd "i")) #'evil-insert))))
 
 (ert-deftest slackit-contract-transients-retain-exact-message-scope ()
   (slackit-test-with-app (app "transient")

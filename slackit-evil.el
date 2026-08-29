@@ -14,10 +14,6 @@
 (require 'appkit-evil)
 (require 'slackit-customize)
 
-(declare-function appkit-evil-normalize-keymaps "appkit-evil" ())
-(declare-function evil-set-initial-state "evil-core" (mode state))
-(declare-function appkit-chatbuf-focus-input "appkit-chatbuf" ())
-
 (defgroup slackit-evil nil
   "Optional native Evil integration for Slackit."
   :group 'slackit
@@ -42,68 +38,61 @@ When nil, leave Evil's initial-state selection untouched."
   '(slackit-root-mode slackit-room-mode slackit-thread-mode slackit-user-mode)
   "Major modes participating in Slackit's Evil integration.")
 
-(defconst slackit-evil--application-states '(normal motion)
-  "Evil states used by Slackit application bindings.")
-
 (defun slackit-evil--set-initial-states ()
   "Register `slackit-evil-initial-state' for Slackit modes."
-  (when slackit-evil-initial-state
-    (dolist (mode slackit-evil--application-modes)
-      (evil-set-initial-state mode slackit-evil-initial-state))))
+  (appkit-evil-set-initial-states
+   slackit-evil--application-modes slackit-evil-initial-state))
 
 (defun slackit-evil--define-root-keys ()
   "Install root-directory modal bindings."
   (appkit-evil-define-readonly-keys 'slackit-root-mode-map)
-  (appkit-evil-define-keys slackit-evil--application-states
-      'slackit-root-mode-map
-    (kbd "RET") #'appkit-directory-activate
-    (kbd "<return>") #'appkit-directory-activate
-    (kbd "g r") #'slackit-root-refresh
-    (kbd "TAB") #'appkit-directory-tab-dwim
-    (kbd "<backtab>") #'appkit-directory-previous-item
-    (kbd "?") #'slackit-root-transient))
+  (appkit-evil-map
+    (:map slackit-root-mode-map
+     :nm
+     "RET" #'appkit-directory-activate
+     "<return>" #'appkit-directory-activate
+     "g r" #'slackit-root-refresh
+     "TAB" #'appkit-directory-tab-dwim
+     "<backtab>" #'appkit-directory-previous-item
+     "?" #'slackit-root-transient)))
 
 (defun slackit-evil--define-room-keys ()
   "Install room-wide and timeline-only modal bindings."
-  (appkit-evil-define-keys slackit-evil--application-states
-      'slackit-room-mode-map
-    (kbd "g r") #'slackit-room-refresh
-    (kbd "g +") #'slackit-room-load-older
-    (kbd "?") #'slackit-room-transient)
+  ;; Appkit disables the timeline map in the writable composer.  Keep
+  ;; operators and word motions native outside deliberate application keys.
+  (appkit-evil-map
+    (:map slackit-room-mode-map
+     :nm
+     "g r" #'slackit-room-refresh
+     "g +" #'slackit-room-load-older
+     "?" #'slackit-room-transient)
+    (:map slackit-room-timeline-mode-map
+     :nm
+     "q" #'quit-window
+     "RET" #'slackit-actions-activate
+     "<return>" #'slackit-actions-activate
+     "T" #'slackit-actions-open-thread
+     "i" #'appkit-evil-chatbuf-enter-input
+     "E" #'slackit-actions-edit
+     "R" #'slackit-actions-react
+     "Y" #'slackit-actions-copy-text
+     "?" #'slackit-actions-transient
+     :n
+     "D" #'slackit-actions-delete)))
 
-  ;; Appkit disables this mode in the writable composer.  Keep operator and
-  ;; word-motion prefixes untouched; the uppercase aliases are deliberate
-  ;; message actions only while point is on generated timeline content.
-  (appkit-evil-define-keys slackit-evil--application-states
-      'slackit-room-timeline-mode-map
-    (kbd "q") #'quit-window
-    (kbd "RET") #'slackit-actions-activate
-    (kbd "<return>") #'slackit-actions-activate
-    (kbd "T") #'slackit-actions-open-thread
-    (kbd "i") #'appkit-chatbuf-focus-input
-    (kbd "E") #'slackit-actions-edit
-    (kbd "R") #'slackit-actions-react
-    (kbd "Y") #'slackit-actions-copy-text
-    (kbd "?") #'slackit-actions-transient)
-  (appkit-evil-define-keys 'normal 'slackit-room-timeline-mode-map
-    (kbd "D") #'slackit-actions-delete))
 (defun slackit-evil--define-user-keys ()
   "Install user-profile modal bindings without shadowing local actions."
   (appkit-evil-define-readonly-keys 'slackit-user-mode-map)
-  (appkit-evil-define-keys slackit-evil--application-states
-      'slackit-user-mode-map
-    (kbd "g r") #'slackit-user-refresh
-    (kbd "?") #'slackit-user-transient
-    (kbd "q") #'quit-window))
-
+  (appkit-evil-map
+    (:map slackit-user-mode-map
+     :nm
+     "g r" #'slackit-user-refresh
+     "?" #'slackit-user-transient
+     "q" #'quit-window)))
 
 (defun slackit-evil--refresh-live-buffers ()
   "Refresh Evil projections in existing Slackit application buffers."
-  (dolist (buffer (buffer-list))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (memq major-mode slackit-evil--application-modes)
-          (appkit-evil-normalize-keymaps))))))
+  (appkit-evil-normalize-buffers slackit-evil--application-modes))
 
 ;;;###autoload
 (defun slackit-evil-setup ()
