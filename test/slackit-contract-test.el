@@ -990,7 +990,7 @@
         (clrhash slackit-media--failures)
         (clrhash slackit-media--image-cache)
         (clrhash slackit-media--open-specs)
-        (clrhash slackit-media--audio-states)
+        (clrhash slackit-media--audio-sessions)
         (when (file-directory-p root) (delete-directory root t))))))
 
 (ert-deftest slackit-contract-video-poster-keeps-preview-file-extension ()
@@ -1045,21 +1045,74 @@
         (clrhash slackit-media--open-specs)
         (when (file-directory-p root) (delete-directory root t))))))
 
-(ert-deftest slackit-contract-audio-mpv-cannot-inherit-keep-open ()
-  (let* ((slackit-media-audio-player-command
-          '("mpv" "--no-video" "--keep-open=yes"))
-         (arguments (slackit-media--audio-command-arguments)))
-    (should (equal '("--keep-open=no" "--idle=no")
-                   (last arguments 2)))
-    (should (= 1 (seq-count
-                  (lambda (argument)
-                    (equal argument "--keep-open=no"))
-                  arguments))))
-  (let ((slackit-media-audio-player-command
-         '("ffplay" "-nodisp" "-autoexit")))
-    (should
-     (equal slackit-media-audio-player-command
-            (slackit-media--audio-command-arguments)))))
+(ert-deftest slackit-contract-media-specs-survive-equal-keys-until-account-stop ()
+  (let ((app
+         (slackit-runtime-start-account
+          "media-spec-owner"
+          (list :token "xoxp-CANARY-TOKEN"
+                :cookie "xoxd-CANARY-COOKIE")))
+        lookup-key)
+    (unwind-protect
+        (let ((key
+               (slackit-media--register-content-spec
+                app '(file (id "F-SPEC")) 'audio
+                "https://files.slack.com/files-pri/T1-F-SPEC/voice.mp3"
+                "voice.mp3" "audio/mpeg" 128 1000)))
+          (setq lookup-key (copy-tree key)
+                key nil)
+          (garbage-collect)
+          (should (slackit-media--content-spec-current lookup-key))
+          (should
+           (appkit-handle-alive-p
+            (gethash app slackit-media--spec-handles)))
+          (slackit-runtime-stop-account app)
+          (should-not (gethash lookup-key slackit-media--open-specs))
+          (should-not (gethash app slackit-media--spec-handles)))
+      (when (appkit-app-live-p app)
+        (slackit-runtime-stop-account app)))))
+
+(ert-deftest slackit-contract-audio-playback-is-appkit-owned ()
+  (slackit-test-with-app (app "audio-player")
+    (let* ((file (make-temp-file "slackit-audio-" nil ".mp3"))
+           (content-key
+            (slackit-media--register-content-spec
+             app '(file (id "F-AUDIO")) 'audio
+             "https://files.slack.com/files-pri/T1-F-AUDIO/voice.mp3"
+             "voice.mp3" "audio/mpeg" 128 42000))
+           start-arguments
+           toggled
+           session)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'appkit-media-player-available-p)
+                (lambda (&rest _arguments) t))
+               ((symbol-function 'appkit-media-player-start-file)
+                (lambda (path &rest arguments)
+                  (should (equal file path))
+                  (setq start-arguments arguments
+                        session
+                        (appkit-media-player-session--create
+                         :status 'playing))
+                  session))
+               ((symbol-function 'appkit-media-player-toggle)
+                (lambda (current)
+                  (setq toggled current)
+                  current)))
+            (let ((result
+                   (slackit-media--start-audio-file content-key file)))
+              (should (eq session result)))
+            (should (eq app (plist-get start-arguments :owner)))
+            (should (= 42.0
+                       (plist-get start-arguments :duration-seconds)))
+            (should (functionp
+                     (plist-get start-arguments :on-change)))
+            (should (eq session
+                        (gethash content-key
+                                 slackit-media--audio-sessions)))
+            (slackit-media--start-audio-file content-key file)
+            (should (eq session toggled)))
+        (remhash content-key slackit-media--audio-sessions)
+        (when (file-exists-p file) (delete-file file))))))
 
 (ert-deftest slackit-contract-media-kinds-download-before-local-dispatch ()
   (slackit-test-with-app (app "media-kinds")
@@ -1195,7 +1248,7 @@
         (clrhash slackit-media--failures)
         (clrhash slackit-media--image-cache)
         (clrhash slackit-media--open-specs)
-        (clrhash slackit-media--audio-states)
+        (clrhash slackit-media--audio-sessions)
         (when (file-directory-p root) (delete-directory root t)))))
 
 (ert-deftest slackit-contract-media-download-cancel-removes-partial-file ()

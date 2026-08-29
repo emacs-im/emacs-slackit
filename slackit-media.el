@@ -39,29 +39,6 @@
   :type 'integer
   :group 'slackit)
 
-(defcustom slackit-media-audio-player-command
-  (cond
-   ((executable-find "mpv")
-    '("mpv" "--no-video" "--force-window=no"
-      "--keep-open=no" "--idle=no"))
-   ((executable-find "ffplay") '("ffplay" "-nodisp" "-autoexit"))
-   ((executable-find "vlc") '("vlc" "--play-and-exit"))
-   (t nil))
-  "Command used to play downloaded Slack audio files."
-  :type '(choice
-          (const :tag "No audio player" nil)
-          string
-          (repeat string))
-  :group 'slackit)
-
-(cl-defstruct (slackit-media-audio
-               (:constructor slackit-media-audio-create))
-  app
-  generation
-  resource-key
-  process
-  handle
-  status)
 
 (cl-defstruct (slackit-media-fetch
                (:constructor slackit-media-fetch-create))
@@ -84,6 +61,7 @@
   name
   mime-type
   size
+  duration-ms
   private-source-p)
 
 (defvar slackit-media--image-cache (make-hash-table :test #'equal)
@@ -95,12 +73,14 @@
 (defvar slackit-media--failures (make-hash-table :test #'equal)
   "Bounded media failure timestamps keyed by opaque resource identity.")
 
-(defvar slackit-media--open-specs
-  (make-hash-table :test #'equal :weakness 'key)
+(defvar slackit-media--open-specs (make-hash-table :test #'equal)
   "Opaque content keys to account-owned media specifications.")
 
-(defvar slackit-media--audio-states (make-hash-table :test #'equal)
-  "Account-owned audio playback states keyed by content resource identity.")
+(defvar slackit-media--spec-handles (make-hash-table :test #'eq)
+  "Live Slackit apps to their content-registry lifecycle handles.")
+
+(defvar slackit-media--audio-sessions (make-hash-table :test #'equal)
+  "Appkit audio sessions keyed by content resource identity.")
 
 (defvar slackit-media--prepared-cache-directory nil
   "Expanded private media cache directory prepared in this Emacs session.")
@@ -111,14 +91,38 @@
        (let ((trimmed (string-trim value)))
          (and (not (string-empty-p trimmed)) trimmed))))
 
+(defun slackit-media--clear-app-specs (app)
+  "Remove every private media specification and session owned by APP."
+  (let (keys)
+    (maphash
+     (lambda (key spec)
+       (when (eq app (slackit-media-open-spec-app spec))
+         (push key keys)))
+     slackit-media--open-specs)
+    (dolist (key keys)
+      (remhash key slackit-media--open-specs)
+      (remhash key slackit-media--audio-sessions)))
+  (remhash app slackit-media--spec-handles))
+
+(defun slackit-media--ensure-spec-handle (app)
+  "Ensure APP owns exact cleanup for its private media registry."
+  (or (gethash app slackit-media--spec-handles)
+      (let ((handle
+             (appkit-register-handle
+              app 'slackit-media-specs app
+              #'slackit-media--clear-app-specs)))
+        (puthash app handle slackit-media--spec-handles)
+        handle)))
+
 (defun slackit-media--register-content-spec
-    (app identity kind source name mime-type size)
+    (app identity kind source name mime-type size &optional duration-ms)
   "Register APP media content and return its opaque key.
 
 IDENTITY is secret-free.  SOURCE must be an accepted private Slack or public
 media source."
   (let ((private-source-p (slackit-media--private-source-p source)))
     (when (or private-source-p (slackit-media--public-source-p source))
+      (slackit-media--ensure-spec-handle app)
       (let ((key (slackit-media--resource-key app 'content identity)))
         (puthash
          key
@@ -130,6 +134,7 @@ media source."
           :name name
           :mime-type mime-type
           :size size
+          :duration-ms duration-ms
           :private-source-p private-source-p)
          slackit-media--open-specs)
         key))))
@@ -411,7 +416,8 @@ media source."
           (content-key
            (slackit-media--register-content-spec
             app (list 'file identity) kind content-source
-            name mime-type size)))
+            name mime-type size
+            (slackit-normalize-get file 'duration_ms))))
      (list :class 'file
            :kind kind
            :resource-key (slackit-media--resource-key app 'preview identity)
@@ -944,111 +950,49 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
      (slackit-media--content-cached-file content-key spec)
      (user-error "slackit: media content is temporarily unavailable"))))
 
-(defun slackit-media--audio-finished (state process _event)
-  "Settle audio playback STATE when PROCESS exits."
-  (when (and (eq state
-                 (gethash
-                  (slackit-media-audio-resource-key state)
-                  slackit-media--audio-states))
-             (eq process (slackit-media-audio-process state))
-             (not (process-live-p process)))
-    (setf (slackit-media-audio-process state) nil
-          (slackit-media-audio-status state) 'finished)
-    (when-let* ((handle (slackit-media-audio-handle state)))
-      (when (appkit-handle-alive-p handle)
-        (appkit-retire-handle handle))
-      (setf (slackit-media-audio-handle state) nil))
-    (when (slackit-runtime-current-p
-           (slackit-media-audio-app state)
-           (slackit-media-audio-generation state))
-      (slackit-runtime-publish-resource
-       (slackit-media-audio-app state)
-       (slackit-media-audio-resource-key state)))))
-
-(defun slackit-media--cancel-audio (state)
-  "Cancel account-owned audio playback STATE."
-  (when-let* ((process (slackit-media-audio-process state)))
-    (set-process-sentinel process nil)
-    (when (process-live-p process)
-      (delete-process process)))
-  (setf (slackit-media-audio-process state) nil
-        (slackit-media-audio-handle state) nil
-        (slackit-media-audio-status state) 'idle)
-  (when (eq state
-            (gethash
-             (slackit-media-audio-resource-key state)
-             slackit-media--audio-states))
-    (remhash
-     (slackit-media-audio-resource-key state)
-     slackit-media--audio-states)))
-
-(defun slackit-media--audio-command-arguments ()
-  "Return audio player arguments with bounded MPV lifecycle options."
-  (let ((arguments
-         (appkit-media-command-arguments
-          slackit-media-audio-player-command)))
-    (when (and arguments
-               (equal "mpv"
-                      (file-name-nondirectory (car arguments))))
-      (dolist (option '("--keep-open=no" "--idle=no"))
-        (unless (member option arguments)
-          (setq arguments (append arguments (list option))))))
-    arguments))
-
+(defun slackit-media--audio-session-update (content-key session)
+  "Publish exact CONTENT-KEY state changes from Appkit SESSION."
+  (when (eq session (gethash content-key slackit-media--audio-sessions))
+    (if-let* ((spec (slackit-media--content-spec-current content-key)))
+        (slackit-runtime-publish-resource
+         (slackit-media-open-spec-app spec) content-key)
+      (remhash content-key slackit-media--audio-sessions))))
 
 (defun slackit-media--start-audio-file (content-key file)
-  "Start or stop local audio FILE playback for CONTENT-KEY."
+  "Start, pause, or resume local audio FILE for CONTENT-KEY."
   (let* ((spec (slackit-media--content-spec-current content-key))
          (app (and spec (slackit-media-open-spec-app spec)))
-         (arguments (slackit-media--audio-command-arguments))
-         (existing (gethash content-key slackit-media--audio-states)))
-    (unless (and spec
-                 arguments
-                 (appkit-media-command-runnable-p
-                  slackit-media-audio-player-command))
-      (user-error
-       "slackit: audio player is unavailable; customize `slackit-media-audio-player-command'"))
-    (if (and existing
-             (process-live-p (slackit-media-audio-process existing)))
-        (progn
-          (appkit-cancel-handle (slackit-media-audio-handle existing))
-          (slackit-runtime-publish-resource app content-key)
-          nil)
-      (let ((state
-             (slackit-media-audio-create
-              :app app
-              :generation (slackit-runtime-generation app)
-              :resource-key content-key
-              :status 'playing))
-            handle
-            process
-            constructor-returned-p)
-        (puthash content-key state slackit-media--audio-states)
-        (unwind-protect
-            (progn
-              (setq handle
-                    (appkit-register-handle
-                     app 'process state #'slackit-media--cancel-audio))
-              (setf (slackit-media-audio-handle state) handle)
-              (setq process
-                    (make-process
-                     :name "slackit-media-audio-player"
-                     :buffer nil
-                     :command (append arguments (list file))
-                     :noquery t
-                     :sentinel
-                     (apply-partially
-                      #'slackit-media--audio-finished state)))
-              (setf (slackit-media-audio-process state) process)
-              (setq constructor-returned-p t))
-          (unless constructor-returned-p
-            (if handle
-                (appkit-cancel-handle handle)
-              (remhash content-key slackit-media--audio-states))))
-        (when (and process (not (process-live-p process)))
-          (slackit-media--audio-finished state process "finished"))
-        (slackit-runtime-publish-resource app content-key)
-        process))))
+         (existing (gethash content-key slackit-media--audio-sessions)))
+    (unless spec
+      (user-error "slackit: media content is unavailable"))
+    (pcase (and existing
+                (appkit-media-player-status existing))
+      ((or 'playing 'paused)
+       (appkit-media-player-toggle existing))
+      ('starting
+       (user-error "slackit: audio playback is preparing"))
+      (_
+       (when (and existing
+                  (not (appkit-media-player-session-finalized-p existing)))
+         (appkit-media-player-stop existing))
+       (unless (appkit-media-player-available-p nil 'audio)
+         (user-error
+          "slackit: audio player is unavailable; customize `appkit-media-audio-player-command'"))
+       (let* ((duration-ms (slackit-media-open-spec-duration-ms spec))
+              (session
+               (appkit-media-player-start-file
+                file
+                :kind 'audio
+                :owner app
+                :duration-seconds
+                (and (numberp duration-ms)
+                     (/ (max 0 duration-ms) 1000.0))
+                :on-change
+                (apply-partially
+                 #'slackit-media--audio-session-update content-key))))
+         (puthash content-key session slackit-media--audio-sessions)
+         (slackit-runtime-publish-resource app content-key)
+         session)))))
 
 (defun slackit-media--open-content-file (content-key file)
   "Open or play local FILE according to CONTENT-KEY's media kind."
@@ -1201,21 +1145,29 @@ deterministic operation in `slackit-media-insert-message-cards'."
 
 (defun slackit-media--audio-control-state (content-key)
   "Return Appkit voice-note state for audio CONTENT-KEY."
-  (let ((audio (and content-key
-                    (gethash content-key slackit-media--audio-states))))
+  (let* ((session
+          (and content-key
+               (gethash content-key slackit-media--audio-sessions)))
+         (session-status
+          (and (appkit-media-player-session-p session)
+               (appkit-media-player-status session)))
+         (transfer-status
+          (plist-get (slackit-media--content-state content-key) :status)))
     (cond
-     ((and audio
-           (process-live-p (slackit-media-audio-process audio)))
-      'playing)
-     ((eq (plist-get (slackit-media--content-state content-key) :status)
-          'downloading)
-      'preparing)
-     ((eq (plist-get (slackit-media--content-state content-key) :status)
-          'error)
-      'failed)
-     ((and audio (eq (slackit-media-audio-status audio) 'finished))
-      'finished)
+     ((eq transfer-status 'downloading) 'preparing)
+     ((eq transfer-status 'error) 'failed)
+     ((null session-status) 'idle)
+     ((eq session-status 'starting) 'preparing)
+     ((memq session-status '(playing paused finished failed))
+      session-status)
      (t 'idle))))
+
+(defun slackit-media--audio-played-seconds (content-key)
+  "Return current Appkit playback progress for audio CONTENT-KEY."
+  (when-let* ((session
+               (gethash content-key slackit-media--audio-sessions))
+              ((appkit-media-player-session-p session)))
+    (appkit-media-player-played-seconds session)))
 
 (defun slackit-media--insert-item-body (item context prefix-state)
   "Insert ITEM preview or audio control through CONTEXT and PREFIX-STATE."
@@ -1230,6 +1182,8 @@ deterministic operation in `slackit-media-insert-message-cards'."
        :duration-seconds
        (and (numberp (plist-get item :duration-ms))
             (/ (max 0 (plist-get item :duration-ms)) 1000.0))
+       :played-seconds
+       (slackit-media--audio-played-seconds content-key)
        :prefix prefix-state
        :face 'shadow
        :action (plist-get context :open-action)))))

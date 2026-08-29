@@ -347,10 +347,12 @@ plus =d= cookie, with redirects disabled.  Login HTML, empty content, stale
 generation callbacks, and partial files are rejected; Unix cache directories
 and completed files use modes =0700= and =0600=.  Media card contexts and
 resource keys contain only opaque account-qualified hashes, never URLs or
-credentials.  Photos/GIFs open through Appkit's local image runtime, videos
-play from local files through Appkit's lifecycle-owned player, audio downloads
-before local playback, and documents download before the configured local file
-opener.  Appkit card actions expose open/play, download, cancel, and save-as;
+credentials.  Photos/GIFs open through Appkit's local image runtime.  Videos
+play from local files through Appkit's lifecycle-owned player.  Audio downloads
+before entering an Appkit-owned, Telega-style playback session whose progress,
+pause/resume restart, process, and account handle are protocol-neutral.
+Documents download before the configured local file opener.  Appkit card
+actions expose open/play, download, cancel, and save-as;
 media actions never fall back to a browser.
 
 Initial room history uses =conversations.history=.  The room owns its returned
