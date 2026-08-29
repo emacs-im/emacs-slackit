@@ -41,7 +41,9 @@
 
 (defcustom slackit-media-audio-player-command
   (cond
-   ((executable-find "mpv") '("mpv" "--no-video" "--force-window=no"))
+   ((executable-find "mpv")
+    '("mpv" "--no-video" "--force-window=no"
+      "--keep-open=no" "--idle=no"))
    ((executable-find "ffplay") '("ffplay" "-nodisp" "-autoexit"))
    ((executable-find "vlc") '("vlc" "--play-and-exit"))
    (t nil))
@@ -523,6 +525,12 @@ media source."
           "."
           (slackit-media--source-extension source name)))
 
+(defun slackit-media--existing-content-file
+    (resource-key source &optional name)
+  "Return existing content file for RESOURCE-KEY, SOURCE, and optional NAME."
+  (let ((file (slackit-media--private-cache-file resource-key source name)))
+    (and (file-regular-p file) file)))
+
 (defun slackit-media--html-file-p (file)
   "Return non-nil when FILE begins with an HTML document."
   (when (file-regular-p file)
@@ -588,7 +596,9 @@ media source."
          (key (slackit-media-fetch-resource-key owner))
          (cache-file
           (slackit-media--private-cache-file
-           key source (plist-get item :cache-name)))
+           key source
+           (and (eq 'content (slackit-media-fetch-purpose owner))
+                (plist-get item :cache-name))))
          (plz-curl-default-args
           (remove "--location" plz-curl-default-args)))
     (unless (slackit-media--private-source-p source)
@@ -773,7 +783,11 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
          (purpose (or (plist-get item :purpose) 'preview))
          (kind (or (plist-get item :kind) 'photo))
          (content-p (eq purpose 'content))
-         (cached-file (slackit-media--cached-file key))
+         (cached-file
+          (if content-p
+              (slackit-media--existing-content-file
+               key source (plist-get item :cache-name))
+            (slackit-media--cached-file key)))
          (cached-image
           (and cached-file
                (or (not content-p) (eq kind 'photo))
@@ -867,7 +881,12 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
 
 (defun slackit-media--content-cached-file (content-key spec)
   "Return validated CONTENT-KEY local file described by SPEC."
-  (let* ((file (slackit-media--cached-file content-key))
+  (let* ((file
+          (and spec
+               (slackit-media--existing-content-file
+                content-key
+                (slackit-media-open-spec-source spec)
+                (slackit-media-open-spec-name spec))))
          (kind (and spec (slackit-media-open-spec-kind spec))))
     (and file
          (if (eq kind 'photo)
@@ -882,11 +901,11 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
                     (slackit-media--content-cached-file content-key spec)))
          (active (gethash content-key slackit-media--fetches)))
     (cond
-     (file (list :status 'downloaded :path file))
      (active
       (list :status 'downloading
             :bytes-total
             (and spec (slackit-media-open-spec-size spec))))
+     (file (list :status 'downloaded :path file))
      ((gethash content-key slackit-media--failures)
       (list :status 'error :error "request_failed"))
      (t (list :status 'not-downloaded)))))
@@ -963,13 +982,25 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
      (slackit-media-audio-resource-key state)
      slackit-media--audio-states)))
 
+(defun slackit-media--audio-command-arguments ()
+  "Return audio player arguments with bounded MPV lifecycle options."
+  (let ((arguments
+         (appkit-media-command-arguments
+          slackit-media-audio-player-command)))
+    (when (and arguments
+               (equal "mpv"
+                      (file-name-nondirectory (car arguments))))
+      (dolist (option '("--keep-open=no" "--idle=no"))
+        (unless (member option arguments)
+          (setq arguments (append arguments (list option))))))
+    arguments))
+
+
 (defun slackit-media--start-audio-file (content-key file)
   "Start or stop local audio FILE playback for CONTENT-KEY."
   (let* ((spec (slackit-media--content-spec-current content-key))
          (app (and spec (slackit-media-open-spec-app spec)))
-         (arguments
-          (appkit-media-command-arguments
-           slackit-media-audio-player-command))
+         (arguments (slackit-media--audio-command-arguments))
          (existing (gethash content-key slackit-media--audio-states)))
     (unless (and spec
                  arguments

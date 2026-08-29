@@ -302,6 +302,17 @@ Slack =:emoji:= tokens from stable protocol identities.  Message bodies and
 actionable reaction chips share the same display resolver while canonical text
 and reaction names remain unchanged for copy and wire operations.
 
+Inline code is fixed-pitch.  Fenced code additionally uses native Font Lock
+when Slack supplies an exact language for a matching Block Kit
+=rich_text_preformatted= element or a language-tagged Markdown fence.
+=slackit-code.el= resolves that protocol language through the public
+=org-src-get-lang-mode-if-bound= API, so installed modes and Emacs major-mode
+remapping remain authoritative.  It never infers a language from code content
+or conversation names; missing and unsupported languages stay fixed-pitch.
+Fontification runs in hook-suppressed Slackit-owned scratch buffers, copies
+only face properties, and uses bounded caches retired with the owning account.
+Canonical message text, Block Kit payloads, and copied text remain unchanged.
+
 Room and thread rows use the shared Appkit chat presentation primitives also
 used by QQ and Disco: deterministic identity-colored sender headings,
 center-cropped two-line circular avatars with initials fallbacks, responsive

@@ -993,6 +993,74 @@
         (clrhash slackit-media--audio-states)
         (when (file-directory-p root) (delete-directory root t))))))
 
+(ert-deftest slackit-contract-video-poster-keeps-preview-file-extension ()
+  (slackit-test-with-app (app "video-poster")
+    (let* ((root (make-temp-file "slackit-video-poster-" t))
+           (slackit-media-cache-directory
+            (expand-file-name "media/" root))
+           (poster-url
+            "https://files.slack.com/files-tmb/T1-FV/poster.jpeg")
+           (message
+            (slackit-normalize-message
+             `((channel . "C1")
+               (ts . "1.000002")
+               (files
+                . (((id . "FV")
+                    (name . "movie.mp4")
+                    (mimetype . "video/mp4")
+                    (thumb_video . ,poster-url)
+                    (url_private_download
+                     . "https://files.slack.com/files-pri/T1-FV/movie.mp4")))))
+             "C1")))
+      (unwind-protect
+          (progn
+            (clrhash slackit-media--fetches)
+            (clrhash slackit-media--failures)
+            (clrhash slackit-media--image-cache)
+            (clrhash slackit-media--open-specs)
+            (cl-letf
+                (((symbol-function
+                   'appkit-media-inline-image-rendering-available-p)
+                  (lambda () t))
+                 ((symbol-function 'plz)
+                  (lambda (_method _url &rest arguments)
+                    (let ((file (cadr (plist-get arguments :as))))
+                      (with-temp-file file
+                        (set-buffer-multibyte nil)
+                        (insert "synthetic jpeg"))
+                      (funcall (plist-get arguments :then) file))
+                    nil))
+                 ((symbol-function 'appkit-media-preview-image-from-file)
+                  (lambda (_file) 'decoded-video-poster)))
+              (slackit-media-ensure-message app message)
+              (let* ((item (car (slackit-media--file-items app message)))
+                     (key (plist-get item :resource-key))
+                     (file (slackit-media--cached-file key)))
+                (should (equal "jpeg" (file-name-extension file)))
+                (should (eq 'decoded-video-poster
+                            (slackit-media--cached-image key))))))
+        (clrhash slackit-media--fetches)
+        (clrhash slackit-media--failures)
+        (clrhash slackit-media--image-cache)
+        (clrhash slackit-media--open-specs)
+        (when (file-directory-p root) (delete-directory root t))))))
+
+(ert-deftest slackit-contract-audio-mpv-cannot-inherit-keep-open ()
+  (let* ((slackit-media-audio-player-command
+          '("mpv" "--no-video" "--keep-open=yes"))
+         (arguments (slackit-media--audio-command-arguments)))
+    (should (equal '("--keep-open=no" "--idle=no")
+                   (last arguments 2)))
+    (should (= 1 (seq-count
+                  (lambda (argument)
+                    (equal argument "--keep-open=no"))
+                  arguments))))
+  (let ((slackit-media-audio-player-command
+         '("ffplay" "-nodisp" "-autoexit")))
+    (should
+     (equal slackit-media-audio-player-command
+            (slackit-media--audio-command-arguments)))))
+
 (ert-deftest slackit-contract-media-kinds-download-before-local-dispatch ()
   (slackit-test-with-app (app "media-kinds")
     (let* ((root (make-temp-file "slackit-media-kinds-" t))
@@ -1084,6 +1152,18 @@
                 (should (file-regular-p played-video))
                 (should (file-regular-p played-audio))
                 (should (file-regular-p opened-document))
+                (dolist (item (seq-take items 3))
+                  (let* ((content-key
+                          (plist-get item :content-resource-key))
+                         (fetch-count (length fetched)))
+                    (should
+                     (eq 'downloaded
+                         (plist-get
+                          (slackit-media--content-state content-key)
+                          :status)))
+                    (should (file-regular-p
+                             (slackit-media--download-content content-key)))
+                    (should (= fetch-count (length fetched)))))
                 (let* ((bad-item (nth 3 items))
                        (bad-key
                         (plist-get bad-item :content-resource-key))
