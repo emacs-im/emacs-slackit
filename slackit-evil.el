@@ -39,7 +39,7 @@ When nil, leave Evil's initial-state selection untouched."
   :group 'slackit-evil)
 
 (defconst slackit-evil--application-modes
-  '(slackit-root-mode slackit-room-mode slackit-thread-mode)
+  '(slackit-root-mode slackit-room-mode slackit-thread-mode slackit-user-mode)
   "Major modes participating in Slackit's Evil integration.")
 
 (defconst slackit-evil--application-states '(normal motion)
@@ -77,8 +77,9 @@ When nil, leave Evil's initial-state selection untouched."
   (appkit-evil-define-keys slackit-evil--application-states
       'slackit-room-timeline-mode-map
     (kbd "q") #'quit-window
-    (kbd "RET") #'slackit-actions-open-thread
-    (kbd "<return>") #'slackit-actions-open-thread
+    (kbd "RET") #'slackit-actions-activate
+    (kbd "<return>") #'slackit-actions-activate
+    (kbd "T") #'slackit-actions-open-thread
     (kbd "i") #'appkit-chatbuf-focus-input
     (kbd "E") #'slackit-actions-edit
     (kbd "R") #'slackit-actions-react
@@ -86,6 +87,15 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "?") #'slackit-actions-transient)
   (appkit-evil-define-keys 'normal 'slackit-room-timeline-mode-map
     (kbd "D") #'slackit-actions-delete))
+(defun slackit-evil--define-user-keys ()
+  "Install user-profile modal bindings without shadowing local actions."
+  (appkit-evil-define-readonly-keys 'slackit-user-mode-map)
+  (appkit-evil-define-keys slackit-evil--application-states
+      'slackit-user-mode-map
+    (kbd "g r") #'slackit-user-refresh
+    (kbd "?") #'slackit-user-transient
+    (kbd "q") #'quit-window))
+
 
 (defun slackit-evil--refresh-live-buffers ()
   "Refresh Evil projections in existing Slackit application buffers."
@@ -104,6 +114,7 @@ Safe to call multiple times."
     (slackit-evil--set-initial-states)
     (slackit-evil--define-root-keys)
     (slackit-evil--define-room-keys)
+    (slackit-evil--define-user-keys)
     (slackit-evil--refresh-live-buffers)))
 
 (with-eval-after-load 'evil

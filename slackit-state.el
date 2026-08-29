@@ -201,6 +201,18 @@
   (and conversation-id
        (gethash conversation-id
                 (slackit-account-state-conversations state))))
+(defun slackit-state-im-conversation-id (state user-id)
+  "Return STATE's live direct-message conversation for USER-ID, or nil."
+  (seq-find
+   (lambda (conversation-id)
+     (let ((conversation
+            (slackit-state-conversation state conversation-id)))
+       (and (slackit-normalize-get conversation 'is_im)
+            (not (slackit-normalize-get conversation 'is_archived))
+            (equal user-id
+                   (slackit-normalize-get conversation 'user)))))
+   (slackit-account-state-conversation-order state)))
+
 
 (defun slackit-state-conversation-name (state conversation-id)
   "Return display name for CONVERSATION-ID in STATE."

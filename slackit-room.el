@@ -38,6 +38,7 @@
 (declare-function slackit-render-reference-dependencies "slackit-render" (text))
 (declare-function slackit-render-avatar-subject
                   "slackit-render" (state message))
+(declare-function slackit-actions-activate "slackit-actions" ())
 (declare-function slackit-actions-open-thread "slackit-actions" ())
 (declare-function slackit-actions-edit "slackit-actions" ())
 (declare-function slackit-actions-delete "slackit-actions" ())
@@ -89,7 +90,9 @@
 
 (defvar slackit-room-timeline-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "RET") #'slackit-actions-open-thread)
+    (define-key map (kbd "RET") #'slackit-actions-activate)
+    (define-key map (kbd "<return>") #'slackit-actions-activate)
+    (define-key map (kbd "T") #'slackit-actions-open-thread)
     (define-key map (kbd "e") #'slackit-actions-edit)
     (define-key map (kbd "d") #'slackit-actions-delete)
     (define-key map (kbd "r") #'slackit-actions-react)

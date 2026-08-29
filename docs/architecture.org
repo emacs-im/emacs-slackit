@@ -137,7 +137,7 @@ The Appkit application owns:
 - account-wide writes, including send, edit, delete, reaction, and mark-read
   operations, which must settle even if their originating room closes or
   realtime reconnects;
-- the root, room, and thread views for that account.
+- the root, room, thread, and exact user-profile views for that account.
 
 HTTP requests and account operations capture the account-lifecycle generation.
 WebSockets and liveness/reconnect timers capture the independent realtime
@@ -163,17 +163,20 @@ Stable view IDs are secret-free protocol identities:
 - root: =(root)=
 - conversation: =(room CONVERSATION-ID)=
 - thread: =(thread CONVERSATION-ID ROOT-TS)=
+- user: =(user USER-ID)=
 
 Suggested buffer names are =*Slackit:work*=,
-=*Slackit:work:#general*=, and =*Slackit:work:#general:thread ROOT-TS*=.
-Names are presentation only; Appkit fingerprints remain authoritative if users
-rename buffers.
+=*Slackit:work:#general*=, =*Slackit:work:#general:thread ROOT-TS*=, and
+=*Slackit:work:user USER-ID*=.  Names are presentation only; Appkit
+fingerprints remain authoritative if users rename buffers.
 
 Room and thread history requests are view-owned because cursors, exact windows,
 and loading state are view-local.  Their Appkit history owner and cancellable
-transport handle are retired together.  Every write is account-owned.  UI
-settlement is applied only when the originating view is still live and the
-captured message/composer revision is still current.
+transport handle are retired together.  Message writes are account-owned.
+The navigation-only =conversations.open= write is owned by its exact user view;
+closing that view retires the request and prevents a delayed room jump.  UI
+settlement is applied only when its captured account/view generation and
+message/composer identity remain current.
 
 * Canonical state
 
@@ -307,6 +310,14 @@ prefixes, actionable reaction chips, and bounded same-sender compaction.  These
 are display properties; copied message text remains free of alignment padding
 and avatar placeholders.
 
+=RET= is semantic activation, not a thread shortcut.  Inline action spans own
+the exact sender/avatar, user/channel reference, link, media, reaction, or
+reply-count behavior under point.  A plain message body does not infer a
+thread.  =T= and the actionable =[N replies]= span open the exact thread.
+The same action spans own mouse activation.  Their text-property keymaps take
+precedence over the timeline fallback and remain isolated from the writable
+composer.
+
 Both chat view kinds declare the Appkit =geometry= part and enable
 =appkit-view-enable-responsive-geometry=.  A coalesced geometry invalidation
 remeasures the canonical display window and force-redraws every visible
@@ -360,6 +371,31 @@ select different indexes.  Reply create/change/delete events update the open
 thread and its parent row metadata.  =thread_broadcast= reconciles into both
 views without duplicating either row.  Closing the thread does not cancel an
 already dispatched reply.
+
+** User profile
+
+=slackit-user-mode= is an Appkit view keyed by =(user USER-ID)=.  It renders
+only canonical account user state: circular avatar, display/real names,
+username, Slack status, title, pronouns, timezone, custom profile fields,
+authorized contact fields, role badges, and deactivation/bot state.  Opening a
+cached user renders immediately and starts one view-owned =users.info= refresh.
+The returned user ID must equal the requested opaque ID.  A killed/replaced
+view retires its operation and HTTP owner before a delayed callback can update
+state.
+
+Sender headings, avatar slices, and exact =<@USER-ID>= references use Appkit
+action spans to open the corresponding account-owned profile.  Pure =bot_id=
+identities are not projected as Slack users.  =user_change= events update the
+canonical user and invalidate only the matching profile plus dependent chat
+resources.
+
+The Message action first reuses a canonical live =is_im= conversation for the
+user.  Otherwise it sends one non-retried, view-owned =conversations.open=
+write, validates the returned channel/user identity, upserts the IM, and opens
+the ordinary =(room CONVERSATION-ID)= view.  Concurrent activation is
+deduplicated; stale view/account callbacks neither publish a conversation nor
+jump buffers.  User buttons, Evil bindings, and the user Transient all retain
+the same exact view scope.
 
 ** Composer and completion
 
@@ -421,6 +457,7 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-media.el= | Typed preview/content projection, private/public acquisition, local open/play, transfer state |
 | =slackit-render.el= | Safe message-row rendering, Slack reference expansion, fallback rows |
 | =slackit-thread.el= | Thread view, reply history, parent/reply projection, reply send |
+| =slackit-user.el= | Exact account-owned profile projection, refresh, avatar/contact actions, direct-message lifecycle |
 | =slackit-reaction.el= | Latest-intent reaction operation ownership and REST settlement |
 | =slackit-read.el= | Known read frontier, viewed-row advancement, coalesced mark operations |
 | =slackit-actions.el= | Stable row action dispatch, edit/delete/reply/reaction entry points |
@@ -449,7 +486,7 @@ is complete only when one or more registered accounts can:
 4. reach realtime =hello= through the authenticated Web/Desktop gateway,
    maintain ping/pong, rebuild reconnects with a generation fence, and keep
    user/conversation metadata current;
-5. open an Appkit directory root and the exact account-owned conversation room;
+5. open an Appkit directory root, exact account-owned conversation room, and user profile;
 6. load the latest exact message window, page older with the returned cursor,
    and merge pages safely against later realtime edits/deletes;
 7. render Slack references, safe links/code, standard/workspace emoji,
@@ -466,9 +503,12 @@ is complete only when one or more registered accounts can:
 13. render, add, and remove emoji reaction chips with REST/realtime race safety;
 14. advance and explicitly mark read only through an authoritative reached row,
     without =client.counts= or fabricated unread badges;
-15. stop with no live Slackit WebSocket, timer, request, operation, login
+15. activate sender/avatar/mention/media/reaction/reply-count semantics through
+    exact =RET=/mouse action spans, with =T= reserved for explicit threads;
+16. reuse or safely create an account-local direct-message room from a user profile;
+17. stop with no live Slackit WebSocket, timer, request, operation, login
     capture, or view left behind; and
-16. coexist with =slack= and expose optional Evil plus exact-scope Transient menus.
+18. coexist with =slack= and expose optional Evil plus exact-scope Transient menus.
 
 Deferred after this slice: remaining rich Block Kit/attachments and WYSIWYG,
 media upload, global search, notifications, unread/modeline count summaries,

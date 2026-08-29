@@ -9,6 +9,8 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'button)
+(require 'appkit-ui)
 (require 'subr-x)
 (require 'appkit-core)
 (require 'appkit-chatbuf)
@@ -30,6 +32,22 @@
                    (slackit-runtime-state app) conversation-id ts)))
     (unless message (user-error "slackit: message no longer exists"))
     (list app conversation-id ts message)))
+(defun slackit-actions-activate ()
+  "Activate the most specific semantic action at point.
+
+Inline Appkit actions and ordinary text buttons own `RET' before the timeline
+map.  This fallback deliberately does not infer a thread action from a plain
+message row."
+  (interactive)
+  (cond
+   ((appkit-ui-activate-at) t)
+   ((when-let* ((button (button-at (point))))
+      (button-activate button)
+      t))
+   (t
+    (message "slackit: no action at point")
+    nil)))
+
 
 (defun slackit-actions--require-owned (state message)
   "Reject MESSAGE unless it belongs to current user in STATE."

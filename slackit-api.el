@@ -91,15 +91,29 @@
 
 
 (cl-defun slackit-api-user-info
-    (app user-id &key on-success on-error)
-  "Fetch exact Slack USER-ID for APP."
+    (app user-id &key owner on-success on-error)
+  "Fetch exact Slack USER-ID for APP under optional lifecycle OWNER."
   (slackit-api-request
    app "users.info"
    :method 'get
    :parameters `((user . ,user-id))
    :idempotent-p t
+   :owner owner
    :on-success on-success
    :on-error on-error))
+(cl-defun slackit-api-conversations-open
+    (app user-id &key owner on-success on-error)
+  "Open or resume APP's direct-message conversation with USER-ID.
+
+OWNER, when non-nil, owns cancellation of this non-retried write."
+  (slackit-api-request
+   app "conversations.open"
+   :method 'post
+   :parameters `((users . ,user-id))
+   :owner owner
+   :on-success on-success
+   :on-error on-error))
+
 
 (cl-defun slackit-api-conversations-list-all
     (app &key on-page on-complete on-error)

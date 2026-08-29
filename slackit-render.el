@@ -29,6 +29,13 @@
 (declare-function slackit-reaction-toggle
                   "slackit-reaction"
                   (app conversation-id ts name))
+(declare-function slackit-thread-open
+                  "slackit-thread"
+                  (app conversation-id root-ts &optional select))
+(declare-function slackit-room-open
+                  "slackit-room" (app conversation-id &optional select))
+(declare-function slackit-user-open
+                  "slackit-user" (app user-id &optional select))
 
 (defun slackit-render-decode-entities (text)
   "Decode Slack's supported HTML entities in TEXT exactly once."
@@ -63,16 +70,21 @@
   (cond
    ((string-match "\\`@\\([[:alnum:]]+\\)\\'" token)
     (let ((id (match-string 1 token)))
-      (list 'text (concat "@" (slackit-state-user-name state id)))))
+      (list 'user
+            (concat "@" (slackit-state-user-name state id))
+            id)))
    ((string-match "\\`#\\([[:alnum:]]+\\)\\(?:|\\(.*\\)\\)?\\'" token)
     (let* ((id (match-string 1 token))
            (fallback (and (match-string 2 token)
                           (slackit-render-decode-entities
                            (match-string 2 token))))
-           (known (slackit-state-conversation state id)))
-      (list 'text (concat "#" (if known
+           (known (slackit-state-conversation state id))
+           (label (concat "#" (if known
                                   (slackit-state-conversation-name state id)
-                                (or fallback id))))))
+                                (or fallback id)))))
+      (if known
+          (list 'conversation label id)
+        (list 'text label))))
    ((string-match "\\`!subteam\\^\\([^|]+\\)\\(?:|\\(.*\\)\\)?\\'" token)
     (list 'text
           (if-let* ((fallback (match-string 2 token)))
@@ -90,10 +102,24 @@
       (list 'link (or label url) url)))
    (t (list 'text (concat "<" token ">")))))
 
-(defun slackit-render--insert-reference (state token)
-  "Insert Slack TOKEN expanded against STATE."
+(defun slackit-render--insert-reference (app state token)
+  "Insert Slack TOKEN expanded against STATE for exact APP."
   (pcase (slackit-render--reference-label state token)
     (`(link ,label ,url) (slackit-render--insert-link label url))
+    (`(user ,label ,user-id)
+     (let ((start (point)))
+       (insert label)
+       (appkit-ui-add-action
+        start (point)
+        (apply-partially #'slackit-user-open app user-id t)
+        :help-echo "Open user profile")))
+    (`(conversation ,label ,conversation-id)
+     (let ((start (point)))
+       (insert label)
+       (appkit-ui-add-action
+        start (point)
+        (apply-partially #'slackit-room-open app conversation-id t)
+        :help-echo "Open conversation")))
     (`(text ,label) (insert label))))
 
 (defun slackit-render-insert-text (app state text)
@@ -132,7 +158,7 @@
           (if end
               (progn
                 (slackit-render--insert-reference
-                 state (substring source (1+ position) end))
+                 app state (substring source (1+ position) end))
                 (setq position (1+ end)))
             (insert "<")
             (setq position (1+ position)))))
@@ -240,7 +266,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
 (defun slackit-render--avatar-prefixes (app state message)
   "Return two-line circular avatar prefixes for APP MESSAGE in STATE."
   (let* ((subject (slackit-render-avatar-subject state message))
-         (subject-id (and subject (slackit-normalize-get subject 'id)))
+         (user-id (slackit-normalize-get message 'user))
          (name (slackit-render--sender-name state message))
          (pixel-size (appkit-chat-avatar-two-line-pixel-size))
          (image
@@ -256,12 +282,16 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
            :resize nil)))
     (dolist (key '(:header :first-body))
       (let ((prefix (copy-sequence (plist-get prefixes key))))
-        (when (and (stringp prefix) (> (length prefix) 0))
+        (when (and user-id (stringp prefix) (> (length prefix) 0))
           (add-text-properties
            0 (length prefix)
-           (list 'slackit-user-id subject-id
-                 'help-echo name
-                 'mouse-face 'highlight)
+           (list 'slackit-user-id user-id
+                 appkit-ui-action-property
+                 (apply-partially #'slackit-user-open app user-id t)
+                 'keymap appkit-ui-action-map
+                 'help-echo "Open user profile"
+                 'mouse-face 'highlight
+                 'pointer 'hand)
            prefix))
         (setq prefixes (plist-put prefixes key prefix))))
     prefixes))
@@ -297,6 +327,10 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
   "Toggle normalized REACTION on exact APP CONVERSATION-ID and TS."
   (when-let* ((name (slackit-normalize-get reaction 'name)))
     (slackit-reaction-toggle app conversation-id ts name)))
+(defun slackit-render--open-thread (app conversation-id root-ts)
+  "Open APP's exact CONVERSATION-ID thread rooted at ROOT-TS."
+  (slackit-thread-open app conversation-id root-ts t))
+
 
 (defun slackit-render--insert-reactions (app state message)
   "Insert actionable emoji reaction chips for APP MESSAGE using STATE."
@@ -335,18 +369,22 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
       (slackit-render-insert-text app state text))))
 
 (defun slackit-render--insert-heading
-    (state message sender timestamp header-prefix body-rest-prefix)
-  "Insert MESSAGE heading for SENDER and TIMESTAMP in STATE."
+    (app state message sender timestamp header-prefix body-rest-prefix)
+  "Insert MESSAGE heading for SENDER and TIMESTAMP in STATE owned by APP."
   (let* ((start (point))
-         (sender-id (slackit-render--sender-id message))
+         (user-id (slackit-normalize-get message 'user))
          (sender-start (point)))
     (insert sender)
     (add-text-properties
      sender-start (point)
      (list 'face (slackit-render--sender-face state message)
-           'slackit-user-id sender-id
-           'mouse-face 'highlight
+           'slackit-user-id user-id
            'help-echo sender))
+    (when user-id
+      (appkit-ui-add-action
+       sender-start (point)
+       (apply-partially #'slackit-user-open app user-id t)
+       :help-echo "Open user profile"))
     (let ((time-span
            (slackit-render--insert-right-aligned-time
             (slackit-render--clock timestamp t)
@@ -384,7 +422,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
              first-body-prefix rest-body-prefix))))
     (unless compact
       (slackit-render--insert-heading
-       state message sender timestamp header-prefix rest-body-prefix))
+       app state message sender timestamp header-prefix rest-body-prefix))
     (let ((body-start (point)))
       (slackit-render--insert-primary-content app state message)
       (when compact
@@ -408,8 +446,21 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
     (let ((details-start (point)))
       (when-let* ((count (slackit-normalize-get message 'reply_count)))
         (when (> (or count 0) 0)
-          (insert (propertize (format "  [%d replies]\n" count)
-                              'face 'slackit-status))))
+          (let* ((conversation-id
+                  (slackit-normalize-get message 'channel))
+                 (root-ts
+                  (or (slackit-normalize-get message 'thread_ts)
+                      (slackit-normalize-get message 'ts)))
+                 (label-start (point)))
+            (insert (format "  [%d replies]" count))
+            (when (and conversation-id root-ts)
+              (appkit-ui-add-action
+               label-start (point)
+               (apply-partially #'slackit-render--open-thread
+                                app conversation-id root-ts)
+               :help-echo "Open thread"
+               :face 'slackit-status))
+            (insert "\n"))))
       (slackit-render--insert-reactions app state message)
       (appkit-ui-apply-line-prefix
        details-start (point) body-prefix-state))))

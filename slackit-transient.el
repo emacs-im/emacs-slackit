@@ -22,12 +22,14 @@
 (require 'slackit-compose)
 (require 'slackit-read)
 (require 'slackit-root)
+(require 'slackit-user)
 
 (cl-defstruct (slackit-transient-scope
                (:constructor slackit-transient--scope-create))
   "Immutable target captured when a Slackit command menu opens."
   view
   view-id
+  user-id
   conversation-id
   message-ts
   entry-payload
@@ -60,6 +62,17 @@
                 (equal slackit-room--conversation-id conversation-id))
               (slackit-state-conversation
                (slackit-runtime-state app) conversation-id)))))
+(defun slackit-transient--user-view-valid-p (scope)
+  "Return non-nil when SCOPE still owns its exact user profile."
+  (and (slackit-transient--view-valid-p scope)
+       (let* ((view (slackit-transient-scope-view scope))
+              (view-id (slackit-transient-scope-view-id scope))
+              (user-id (slackit-transient-scope-user-id scope)))
+         (and (eq (car-safe view-id) 'user)
+              (equal user-id (cadr view-id))
+              (with-current-buffer (appkit-view-buffer view)
+                (equal slackit-user--user-id user-id))))))
+
 
 (defun slackit-transient--conversation-valid-p (scope)
   "Return non-nil when SCOPE's exact conversation is still canonical."
@@ -120,6 +133,20 @@
      :view-id (copy-tree (appkit-view-id view))
      :conversation-id (and payload (copy-tree payload))
      :entry-payload (and payload (copy-tree payload)))))
+(defun slackit-transient--capture-user-scope ()
+  "Capture the exact current Slackit user profile."
+  (let* ((view (slackit-transient--capture-view '(user)))
+         (view-id (appkit-view-id view))
+         (user-id (cadr view-id))
+         (scope
+          (slackit-transient--scope-create
+           :view view
+           :view-id (copy-tree view-id)
+           :user-id (and user-id (copy-sequence user-id)))))
+    (unless (slackit-transient--user-view-valid-p scope)
+      (user-error "slackit: the user target is no longer canonical"))
+    scope))
+
 
 (defun slackit-transient--capture-room-scope (&optional require-message)
   "Capture the current room view and exact row.
@@ -192,6 +219,13 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (let ((scope (slackit-transient--prefix-scope 'slackit-actions-transient)))
     (slackit-transient--require-message scope)
     scope))
+(defun slackit-transient--user-scope ()
+  "Return and revalidate the active user menu scope."
+  (let ((scope (slackit-transient--prefix-scope 'slackit-user-transient)))
+    (unless (slackit-transient--user-view-valid-p scope)
+      (user-error "slackit: the user view that opened this menu is stale"))
+    scope))
+
 
 (defun slackit-transient--call-in-view (scope function)
   "Call zero-argument FUNCTION in SCOPE's exact registered view."
@@ -306,6 +340,15 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
 (defun slackit-transient--room-quit-inapt-p ()
   "Return non-nil when the room source window cannot be quit."
   (slackit-transient--quit-inapt-p 'slackit-room-transient))
+(defun slackit-transient--user-view-inapt-p ()
+  "Return non-nil when the user prefix has lost its exact view."
+  (not (slackit-transient--user-view-valid-p
+        (slackit-transient--prefix-scope 'slackit-user-transient))))
+
+(defun slackit-transient--user-quit-inapt-p ()
+  "Return non-nil when the user source window cannot be quit."
+  (slackit-transient--quit-inapt-p 'slackit-user-transient))
+
 
 (defun slackit-transient--root-description ()
   "Return the exact root menu title."
@@ -346,6 +389,20 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
                    (slackit-transient-scope-view scope)))
                  (slackit-transient-scope-conversation-id scope)))
       "Slackit message · stale context")))
+(defun slackit-transient--user-description ()
+  "Return the exact user-profile menu title."
+  (let* ((scope
+          (slackit-transient--prefix-scope 'slackit-user-transient))
+         (view (and (slackit-transient--user-view-valid-p scope)
+                    (slackit-transient-scope-view scope))))
+    (if (not view)
+        "Slackit user · stale context"
+      (let* ((user-id (slackit-transient-scope-user-id scope))
+             (state (slackit-runtime-state (appkit-view-app view))))
+        (format "%s · %s"
+                (slackit-state-user-name state user-id)
+                user-id)))))
+
 
 (defun slackit-transient--quit-view (scope)
   "Quit the window displaying SCOPE's exact view."
@@ -600,6 +657,42 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   :inapt-if #'slackit-transient--actions-media-save-inapt-p
   (interactive (list (slackit-transient--actions-scope)))
   (slackit-transient--call-media-action scope 'save-as))
+(transient-define-suffix slackit-transient-user-refresh (scope)
+  "Refresh the exact captured user profile."
+  :inapt-if #'slackit-transient--user-view-inapt-p
+  (interactive (list (slackit-transient--user-scope)))
+  (slackit-transient--call-in-view scope #'slackit-user-refresh))
+
+(transient-define-suffix slackit-transient-user-message (scope)
+  "Open a direct message with the exact captured user."
+  :inapt-if #'slackit-transient--user-view-inapt-p
+  (interactive (list (slackit-transient--user-scope)))
+  (slackit-transient--call-in-view scope #'slackit-user-open-chat))
+
+(transient-define-suffix slackit-transient-user-avatar (scope)
+  "Open the exact captured user's cached avatar."
+  :inapt-if #'slackit-transient--user-view-inapt-p
+  (interactive (list (slackit-transient--user-scope)))
+  (slackit-transient--call-in-view scope #'slackit-user-open-avatar))
+
+(transient-define-suffix slackit-transient-user-copy-mention (scope)
+  "Copy an exact mention for the captured user."
+  :inapt-if #'slackit-transient--user-view-inapt-p
+  (interactive (list (slackit-transient--user-scope)))
+  (slackit-transient--call-in-view scope #'slackit-user-copy-mention))
+
+(transient-define-suffix slackit-transient-user-copy-id (scope)
+  "Copy the exact captured Slack member ID."
+  :inapt-if #'slackit-transient--user-view-inapt-p
+  (interactive (list (slackit-transient--user-scope)))
+  (slackit-transient--call-in-view scope #'slackit-user-copy-id))
+
+(transient-define-suffix slackit-transient-user-quit-window (scope)
+  "Quit the exact captured user view window."
+  :inapt-if #'slackit-transient--user-quit-inapt-p
+  (interactive (list (slackit-transient--user-scope)))
+  (slackit-transient--quit-view scope))
+
 
 ;;;###autoload(autoload 'slackit-root-transient "slackit-transient" nil t)
 (transient-define-prefix slackit-root-transient (scope)
@@ -647,7 +740,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   "Open actions scoped to one exact canonical Slack message."
   [:description slackit-transient--actions-description]
   [["Message"
-    ("RET" "Open thread" slackit-transient-actions-open-thread)
+    ("T" "Open thread" slackit-transient-actions-open-thread)
     ("e" "Edit" slackit-transient-actions-edit)
     ("d" "Delete…" slackit-transient-actions-delete)
     ("r" "Toggle reaction…" slackit-transient-actions-react)
@@ -663,6 +756,24 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     (user-error "slackit: invalid message menu scope"))
   (slackit-transient--require-message scope)
   (transient-setup 'slackit-actions-transient nil nil :scope scope))
+
+;;;###autoload(autoload 'slackit-user-transient "slackit-transient" nil t)
+(transient-define-prefix slackit-user-transient (scope)
+  "Open commands scoped to one exact Slack user profile."
+  [:description slackit-transient--user-description]
+  [["User"
+    ("m" "Message" slackit-transient-user-message)
+    ("g" "Refresh profile" slackit-transient-user-refresh)
+    ("a" "Open avatar" slackit-transient-user-avatar)]
+   ["Copy"
+    ("w" "Copy mention" slackit-transient-user-copy-mention)
+    ("Y" "Copy member ID" slackit-transient-user-copy-id)]
+   ["View"
+    ("q" "Quit window" slackit-transient-user-quit-window)]]
+  (interactive (list (slackit-transient--capture-user-scope)))
+  (unless (slackit-transient--user-view-valid-p scope)
+    (user-error "slackit: invalid user menu scope"))
+  (transient-setup 'slackit-user-transient nil nil :scope scope))
 
 (provide 'slackit-transient)
 

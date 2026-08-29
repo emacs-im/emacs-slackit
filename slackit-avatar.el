@@ -274,6 +274,24 @@ an existing private disk entry or start its account-owned acquisition."
           (when-let* ((image (slackit-avatar--source-image file size)))
             (puthash cache-key image slackit-avatar--image-cache)
             image)))))
+(defun slackit-avatar-cached-file (app user)
+  "Return APP USER's validated local avatar file, or nil."
+  (when-let* ((resource-key (slackit-avatar-resource-key app user))
+              (source (gethash resource-key slackit-avatar--sources))
+              (file (car source))
+              ((file-regular-p file)))
+    file))
+
+(defun slackit-avatar-open (app user)
+  "Open APP USER's cached avatar locally through Appkit."
+  (let ((file (slackit-avatar-cached-file app user)))
+    (unless file
+      (user-error "slackit: avatar is not available locally"))
+    (appkit-media-open-resource
+     (appkit-media-resource-create :file file)
+     :kind 'image
+     :client-label "slackit")))
+
 
 (defun slackit-avatar-ensure (app user)
   "Ensure APP USER's avatar source is ready or being acquired.

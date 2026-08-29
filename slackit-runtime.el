@@ -308,41 +308,101 @@ browser-session identity."
     (remhash (slackit-operation-key operation) (appkit-app-request-table app))
     t))
 
+(defun slackit-runtime--user-view-current-p (app view user-id)
+  "Return non-nil when VIEW is APP's exact live USER-ID profile view."
+  (let ((view-id (list 'user user-id)))
+    (and (appkit-view-live-p view)
+         (eq (appkit-view-app view) app)
+         (equal (appkit-view-id view) view-id)
+         (eq view (appkit-view-for-id app view-id)))))
+
+(defun slackit-runtime--publish-user-info-error
+    (app operation error-data)
+  "Publish redacted ERROR-DATA to OPERATION's exact user view."
+  (let ((view (slackit-operation-view operation))
+        (user-id (slackit-operation-payload operation))
+        (code (or (plist-get error-data :code) "request_failed")))
+    (when (slackit-runtime--user-view-current-p app view user-id)
+      (appkit-view-enqueue-event
+       view (list :kind 'user-profile-error
+                  :user-id user-id
+                  :code (format "%s" code)))
+      (appkit-request-sync view :part 'profile))))
+(defun slackit-runtime--user-info-owner-current-p (app operation)
+  "Return non-nil when OPERATION's optional profile view remains current."
+  (let ((view (slackit-operation-view operation))
+        (user-id (slackit-operation-payload operation)))
+    (or (null view)
+        (slackit-runtime--user-view-current-p app view user-id))))
+
+
 (defun slackit-runtime--user-info-success (app operation body)
   "Settle current lazy user OPERATION for APP from API BODY."
   (when (slackit-runtime-operation-current-p app operation)
-    (let* ((state (slackit-runtime-state app))
-           (requested-id (slackit-operation-payload operation))
-           (user (slackit-normalize-get body 'user))
-           (returned-id (slackit-normalize-get user 'id)))
-      (slackit-runtime-operation-end app operation)
-      (when (and user (equal requested-id returned-id))
-        (slackit-state-put-user state user)
-        (slackit-runtime-publish-changes
-         app (list (list :kind 'user :user-id requested-id)))))))
+    (if (not (slackit-runtime--user-info-owner-current-p app operation))
+        (slackit-runtime-operation-end app operation)
+      (let* ((state (slackit-runtime-state app))
+             (requested-id (slackit-operation-payload operation))
+             (user (slackit-normalize-get body 'user))
+             (returned-id (slackit-normalize-get user 'id)))
+        (if (and user (equal requested-id returned-id))
+            (progn
+              (slackit-runtime-operation-end app operation)
+              (slackit-state-put-user state user)
+              (slackit-runtime-publish-changes
+               app (list (list :kind 'user :user-id requested-id))))
+          (slackit-runtime--publish-user-info-error
+           app operation '(:code "invalid_response"))
+          (slackit-runtime-operation-end app operation))))))
 
-(defun slackit-runtime--user-info-failure (app operation _error)
-  "Settle failed lazy user OPERATION for APP without exposing its response."
-  (slackit-runtime-operation-end app operation))
+(defun slackit-runtime--user-info-failure (app operation error-data)
+  "Settle failed lazy user OPERATION without exposing its response."
+  (when (slackit-runtime-operation-current-p app operation)
+    (slackit-runtime--publish-user-info-error app operation error-data)
+    (slackit-runtime-operation-end app operation)))
 
-(defun slackit-runtime-ensure-user (app user-id)
-  "Fetch unknown Slack USER-ID once for live APP.
+(defun slackit-runtime-user-pending-p (app user-id)
+  "Return non-nil when APP owns a current USER-ID profile request."
+  (let ((operation
+         (and (appkit-app-live-p app)
+              (gethash (list 'user user-id)
+                       (appkit-app-request-table app)))))
+    (and (slackit-runtime-operation-current-p app operation) operation)))
 
-Return the existing pending operation, a new operation, or nil when USER-ID is
-already cached or is not a Slack user identity."
+(cl-defun slackit-runtime-ensure-user
+    (app user-id &key force view)
+  "Fetch Slack USER-ID once for live APP.
+
+Normally fetch only an unknown user.  FORCE refreshes a cached user.  VIEW,
+when it is the exact `(user USER-ID)' view, owns presentation-only failure
+notification.  Return the current/new operation, or nil for an invalid or
+already-cached identity."
   (when (and (appkit-app-live-p app)
              (stringp user-id)
              (not (string-empty-p user-id))
              (not (string-prefix-p "B" user-id))
-             (not (slackit-state-user (slackit-runtime-state app) user-id)))
+             (or force
+                 (not (slackit-state-user
+                       (slackit-runtime-state app) user-id))))
     (let* ((key (list 'user user-id))
            (pending (gethash key (appkit-app-request-table app))))
       (if (slackit-runtime-operation-current-p app pending)
-          pending
+          (progn
+            (when (and (null (slackit-operation-view pending))
+                       (slackit-runtime--user-view-current-p
+                        app view user-id))
+              (setf (slackit-operation-view pending) view))
+            pending)
         (let ((operation
-               (slackit-runtime-operation-begin app key nil nil user-id)))
+               (slackit-runtime-operation-begin
+                app key
+                (and (slackit-runtime--user-view-current-p
+                      app view user-id)
+                     view)
+                nil user-id)))
           (slackit-api-user-info
            app user-id
+           :owner (slackit-operation-view operation)
            :on-success
            (apply-partially
             #'slackit-runtime--user-info-success app operation)
@@ -371,6 +431,11 @@ already cached or is not a Slack user identity."
          (ts (plist-get change :ts))
          (user-id (plist-get change :user-id)))
     (cond
+     ((and (eq view-kind 'user)
+           (eq kind 'user)
+           (equal (cadr id) user-id))
+      (appkit-view-enqueue-event view change)
+      (appkit-request-sync view :structure t :part 'profile))
      ((eq view-kind 'root)
       (cond
        ((and conversation-id

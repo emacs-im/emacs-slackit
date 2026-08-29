@@ -38,6 +38,7 @@
 (require 'slackit-reaction)
 (require 'slackit-read)
 (require 'slackit-actions)
+(require 'slackit-user)
 (require 'slackit-root)
 (require 'slackit-transient)
 
