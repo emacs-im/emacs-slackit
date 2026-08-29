@@ -6,13 +6,12 @@
 
 ;; Display-only inline/fenced code styling and native Font Lock projection.
 ;; Slack-provided language metadata is authoritative.  Unknown or absent
-;; languages never trigger content inference; an explicit fallback mode is the
-;; only way to fontify old, unlabelled Slack code blocks.
+;; languages remain fixed-pitch and never trigger content inference.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'seq)
+(require 'org-src)
 (require 'subr-x)
 (require 'appkit-core)
 (require 'slackit-normalize)
@@ -25,73 +24,6 @@
 (defcustom slackit-code-fontify-blocks t
   "When non-nil, fontify code blocks with an authoritative language mode."
   :type 'boolean
-  :group 'slackit-code)
-
-(defcustom slackit-code-default-mode nil
-  "Explicit fallback major mode for code blocks without Slack language data.
-
-Nil means unlabelled blocks receive only `slackit-code-block' styling.  Slackit
-never infers a mode from message contents or a conversation name."
-  :type '(choice (const :tag "No fallback syntax mode" nil)
-          (symbol :tag "Major mode"))
-  :group 'slackit-code)
-
-(defcustom slackit-code-language-modes
-  '(("ada" . ada-mode)
-    ("awk" . awk-mode)
-    ("bash" . sh-mode)
-    ("c" . c-mode)
-    ("clj" . clojure-mode)
-    ("cljc" . clojure-mode)
-    ("clojure" . clojure-mode)
-    ("cljs" . clojure-mode)
-    ("cpp" . c++-mode)
-    ("c++" . c++-mode)
-    ("csharp" . csharp-mode)
-    ("c#" . csharp-mode)
-    ("css" . css-mode)
-    ("diff" . diff-mode)
-    ("elisp" . emacs-lisp-mode)
-    ("emacs-lisp" . emacs-lisp-mode)
-    ("emacslisp" . emacs-lisp-mode)
-    ("elixir" . elixir-mode)
-    ("erlang" . erlang-mode)
-    ("go" . go-mode)
-    ("haskell" . haskell-mode)
-    ("html" . html-mode)
-    ("java" . java-mode)
-    ("javascript" . js-mode)
-    ("js" . js-mode)
-    ("json" . js-json-mode)
-    ("kotlin" . kotlin-mode)
-    ("latex" . latex-mode)
-    ("lisp" . lisp-mode)
-    ("lua" . lua-mode)
-    ("markdown" . markdown-mode)
-    ("md" . markdown-mode)
-    ("objc" . objc-mode)
-    ("org" . org-mode)
-    ("perl" . perl-mode)
-    ("php" . php-mode)
-    ("python" . python-mode)
-    ("r" . ess-r-mode)
-    ("ruby" . ruby-mode)
-    ("rust" . rust-mode)
-    ("scala" . scala-mode)
-    ("scheme" . scheme-mode)
-    ("sh" . sh-mode)
-    ("shell" . sh-mode)
-    ("sql" . sql-mode)
-    ("swift" . swift-mode)
-    ("typescript" . typescript-mode)
-    ("ts" . typescript-mode)
-    ("xml" . xml-mode)
-    ("yaml" . yaml-mode)
-    ("yml" . yaml-mode)
-    ("zig" . zig-mode))
-  "Slack language names mapped to candidate Emacs major modes."
-  :type '(repeat (cons (string :tag "Slack language")
-                       (symbol :tag "Major mode")))
   :group 'slackit-code)
 
 (defcustom slackit-code-cache-limit 256
@@ -233,20 +165,9 @@ is consumed, so duplicate code blocks retain their distinct ordered metadata."
             descriptors))))
 
 (defun slackit-code-mode-for-language (language)
-  "Return an available Emacs major mode for Slack LANGUAGE, or nil."
+  "Return Emacs's source major mode for Slack LANGUAGE, or nil."
   (when-let* ((name (slackit-code--normalize-language language)))
-    (let* ((mapped (cdr (assoc name slackit-code-language-modes)))
-           (direct (intern (concat name "-mode")))
-           (tree-sitter (intern (concat name "-ts-mode"))))
-      (seq-find (lambda (mode)
-                  (and (symbolp mode) (fboundp mode)))
-                (delete-dups (delq nil (list mapped tree-sitter direct)))))))
-
-(defun slackit-code--usable-default-mode ()
-  "Return configured fallback code mode when callable, or nil."
-  (and (symbolp slackit-code-default-mode)
-       (fboundp slackit-code-default-mode)
-       slackit-code-default-mode))
+    (org-src-get-lang-mode-if-bound name)))
 
 (defun slackit-code--fontification-buffer (mode)
   "Return Slackit's empty, explicitly owned scratch buffer for MODE."
@@ -337,10 +258,7 @@ is consumed, so duplicate code blocks retain their distinct ordered metadata."
   "Return an opaque presentation cache key for MODE LANGUAGE and TEXT."
   (list mode language
         (secure-hash 'sha256 text)
-        slackit-code-fontify-blocks
-        slackit-code-default-mode
-        slackit-code-language-modes))
-
+        slackit-code-fontify-blocks))
 (defun slackit-code--cache-get (cache key)
   "Return a detached cached value from CACHE for KEY."
   (when-let* ((value (gethash key (slackit-code-cache-entries cache))))
@@ -372,9 +290,7 @@ is consumed, so duplicate code blocks retain their distinct ordered metadata."
          (normalized-language (slackit-code--normalize-language language))
          (mode
           (and slackit-code-fontify-blocks
-               (or (slackit-code-mode-for-language normalized-language)
-                   (and (null normalized-language)
-                        (slackit-code--usable-default-mode)))))
+               (slackit-code-mode-for-language normalized-language)))
          (cache (and mode (appkit-app-live-p app)
                      (slackit-code--app-cache app)))
          (key (and cache

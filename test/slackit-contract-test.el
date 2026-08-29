@@ -1830,10 +1830,7 @@
 
 (ert-deftest slackit-contract-code-fontification-is-hook-free-and-sanitized ()
   (slackit-test-with-app (app "code-font-lock")
-    (let ((slackit-code-language-modes
-           '(("elisp" . emacs-lisp-mode)))
-          (slackit-code-default-mode nil)
-          (emacs-lisp-mode-hook-runs 0)
+    (let ((emacs-lisp-mode-hook-runs 0)
           (emacs-lisp-mode-hook
            (list (lambda () (cl-incf emacs-lisp-mode-hook-runs))))
           first second)
@@ -1875,30 +1872,32 @@
         (should-not
          (string-match-p "value 1" (prin1-to-string cache-key)))))))
 
-(ert-deftest slackit-contract-unlabelled-code-never-runs-a-detector ()
+(ert-deftest slackit-contract-unlabelled-and-unknown-code-stay-fixed-pitch ()
   (slackit-test-with-app (app "code-no-detector")
-    (let ((slackit-code-default-mode nil)
-          (detector-called nil)
-          payload)
+    (let ((detector-called nil)
+          unlabelled
+          unknown)
       (cl-letf (((symbol-function 'language-detection-string)
                  (lambda (_text)
                    (setq detector-called t)
                    'emacslisp)))
-        (setq payload
-              (slackit-code-block-string
-               app "(let ((value 1)) value)" nil)))
-      (should-not detector-called)
-      (should-not (get-text-property 1 'slackit-code-mode payload))
-      (should
-       (slackit-test--face-includes-p
-        (get-text-property 1 'face payload)
-        'slackit-code-block))
-      (let ((slackit-code-default-mode 'emacs-lisp-mode))
-        (setq payload
+        (setq unlabelled
               (slackit-code-block-string
                app "(let ((value 1)) value)" nil))
-        (should (eq 'emacs-lisp-mode
-                    (get-text-property 1 'slackit-code-mode payload)))))))
+        (setq unknown
+              (slackit-code-block-string
+               app "(let ((value 1)) value)" "unsupported-language")))
+      (should-not detector-called)
+      (should-not (get-text-property 1 'slackit-code-mode unlabelled))
+      (should-not (get-text-property 1 'slackit-code-mode unknown))
+      (should (equal "unsupported-language"
+                     (get-text-property
+                      1 'slackit-code-language unknown)))
+      (dolist (payload (list unlabelled unknown))
+        (should
+         (slackit-test--face-includes-p
+          (get-text-property 1 'face payload)
+          'slackit-code-block))))))
 
 (ert-deftest slackit-contract-code-rendering-keeps-canonical-wire-text ()
   (slackit-test-with-app (app "code-render")
@@ -1918,9 +1917,7 @@
               (text . ,wire)
               (blocks
                . (((type . "rich_text")
-                   (elements . (,preformatted)))))))
-           (slackit-code-language-modes
-            '(("elisp" . emacs-lisp-mode))))
+                   (elements . (,preformatted))))))))
       (with-temp-buffer
         (slackit-render-insert-text app state wire message)
         (let ((rendered (buffer-string)))
@@ -1957,10 +1954,7 @@
             `((text . ,wire)
               (blocks
                . (((type . "rich_text")
-                   (elements . (,preformatted)))))))
-           (slackit-code-default-mode nil)
-           (slackit-code-language-modes
-            '(("elisp" . emacs-lisp-mode))))
+                   (elements . (,preformatted))))))))
       (with-temp-buffer
         (slackit-render-insert-text app state wire message)
         (should-not
@@ -1971,19 +1965,27 @@
 (ert-deftest slackit-contract-code-caches-are-account-lifecycle-owned ()
   (slackit-test-with-app (left "code-left")
     (slackit-test-with-app (right "code-right")
-      (let ((slackit-code-language-modes
-             '(("elisp" . emacs-lisp-mode))))
-        (slackit-code-block-string left "(let ((x 1)) x)" "elisp")
-        (slackit-code-block-string right "(let ((x 1)) x)" "elisp")
-        (let ((left-cache (gethash left slackit-code--app-caches))
-              (right-cache (gethash right slackit-code--app-caches)))
-          (should (slackit-code-cache-p left-cache))
-          (should (slackit-code-cache-p right-cache))
-          (should-not (eq left-cache right-cache))
-          (slackit-runtime-stop-account left)
-          (should-not (gethash left slackit-code--app-caches))
-          (should (eq right-cache
-                      (gethash right slackit-code--app-caches))))))))
+      (slackit-code-block-string left "(let ((x 1)) x)" "elisp")
+      (slackit-code-block-string right "(let ((x 1)) x)" "elisp")
+      (let ((left-cache (gethash left slackit-code--app-caches))
+            (right-cache (gethash right slackit-code--app-caches)))
+        (should (slackit-code-cache-p left-cache))
+        (should (slackit-code-cache-p right-cache))
+        (should-not (eq left-cache right-cache))
+        (slackit-runtime-stop-account left)
+        (should-not (gethash left slackit-code--app-caches))
+        (should (eq right-cache
+                    (gethash right slackit-code--app-caches)))))))
+(ert-deftest slackit-contract-code-mode-resolution-is-emacs-owned ()
+  (should (eq 'emacs-lisp-mode
+              (slackit-code-mode-for-language "elisp")))
+  (let ((major-mode-remap-alist
+         '((python-mode . emacs-lisp-mode))))
+    (should (eq 'emacs-lisp-mode
+                (slackit-code-mode-for-language "python"))))
+  (should-not
+   (slackit-code-mode-for-language "unsupported-language")))
+
 
 (provide 'slackit-contract-test)
 
