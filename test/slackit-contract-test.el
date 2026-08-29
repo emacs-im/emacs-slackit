@@ -1761,6 +1761,230 @@
             (should (string-match-p "Right Alice" (buffer-string)))
             (should-not (string-match-p "Left Alice" (buffer-string)))))))))
 
+(defun slackit-test--face-includes-p (value face)
+  "Return non-nil when face VALUE includes FACE."
+  (if (listp value) (memq face value) (eq value face)))
+
+(ert-deftest slackit-contract-code-descriptors-prefer-protocol-language ()
+  (let* ((preformatted
+          '((type . "rich_text_preformatted")
+            (language . "Clojure")
+            (border . 1)
+            (elements
+             . (((type . "text") (text . "(defn f [])"))
+                ((type . "link")
+                 (text . " docs")
+                 (url . "https://example.test"))))))
+         (rich-message
+          `((blocks
+             . (((type . "rich_text")
+                 (elements . (,preformatted)))))))
+         (markdown-message
+          '((blocks
+             . (((type . "markdown")
+                 (text . "```python\nprint(1)\n```"))))))
+         (descriptors
+          (append (slackit-code-message-descriptors rich-message)
+                  (slackit-code-message-descriptors markdown-message)))
+         (rich (nth 0 descriptors))
+         (markdown (nth 1 descriptors)))
+    (should (= 2 (length descriptors)))
+    (should (equal "(defn f []) docs"
+                   (slackit-code-descriptor-text rich)))
+    (should (equal "clojure"
+                   (slackit-code-descriptor-language rich)))
+    (should (eq 'rich-text-preformatted
+                (slackit-code-descriptor-source-kind rich)))
+    (should (= 1 (slackit-code-descriptor-border rich)))
+    (should (equal "print(1)" (slackit-code-descriptor-text markdown)))
+    (should (equal "python"
+                   (slackit-code-descriptor-language markdown)))
+    (should
+     (eq 'markdown
+         (slackit-code-descriptor-source-kind markdown)))))
+
+(ert-deftest slackit-contract-code-descriptor-matching-is-exact-and-ordered ()
+  (let* ((first
+          (slackit-code-descriptor-create
+           :text "(same)" :language "elisp" :source-kind 'rich-text-preformatted))
+         (second
+          (slackit-code-descriptor-create
+           :text "(same)" :language "lisp" :source-kind 'rich-text-preformatted))
+         (third
+          (slackit-code-descriptor-create
+           :text "different" :language "python"
+           :source-kind 'rich-text-preformatted))
+         (one
+          (slackit-code-consume-descriptor
+           (list first second third) "(same)"))
+         (two
+          (slackit-code-consume-descriptor
+           (plist-get one :remaining) "(same)"))
+         (miss
+          (slackit-code-consume-descriptor
+           (plist-get two :remaining) "absent")))
+    (should (eq first (plist-get one :descriptor)))
+    (should (eq second (plist-get two :descriptor)))
+    (should-not (plist-get miss :descriptor))
+    (should (equal (list third) (plist-get miss :remaining)))))
+
+(ert-deftest slackit-contract-code-fontification-is-hook-free-and-sanitized ()
+  (slackit-test-with-app (app "code-font-lock")
+    (let ((slackit-code-language-modes
+           '(("elisp" . emacs-lisp-mode)))
+          (slackit-code-default-mode nil)
+          (emacs-lisp-mode-hook-runs 0)
+          (emacs-lisp-mode-hook
+           (list (lambda () (cl-incf emacs-lisp-mode-hook-runs))))
+          first second)
+      (setq first
+            (slackit-code-block-string
+             app "(let ((value 1)) value)" "elisp"))
+      (should (= 0 emacs-lisp-mode-hook-runs))
+      (should (eq 'block (get-text-property 1 'slackit-code-kind first)))
+      (should (eq 'emacs-lisp-mode
+                  (get-text-property 1 'slackit-code-mode first)))
+      (should (equal "elisp"
+                     (get-text-property 1 'slackit-code-language first)))
+      (should
+       (slackit-test--face-includes-p
+        (get-text-property 1 'face first)
+        'font-lock-keyword-face))
+      (should
+       (slackit-test--face-includes-p
+        (get-text-property 1 'face first)
+        'slackit-code-block))
+      (should-not (get-text-property 1 'keymap first))
+      (should-not (get-text-property 1 'syntax-table first))
+      (put-text-property 0 1 'slackit-test-canary t first)
+      (setq second
+            (slackit-code-block-string
+             app "(let ((value 1)) value)" "elisp"))
+      (should-not (get-text-property 0 'slackit-test-canary second))
+      (let ((buffer
+             (gethash 'emacs-lisp-mode
+                      slackit-code--fontification-buffers)))
+        (should (buffer-live-p buffer))
+        (with-current-buffer buffer
+          (should (= 0 (buffer-size)))))
+      (let* ((cache (gethash app slackit-code--app-caches))
+             (entries (slackit-code-cache-entries cache))
+             cache-key)
+        (maphash (lambda (key _value) (setq cache-key key)) entries)
+        (should (= 1 (hash-table-count entries)))
+        (should-not
+         (string-match-p "value 1" (prin1-to-string cache-key)))))))
+
+(ert-deftest slackit-contract-unlabelled-code-never-runs-a-detector ()
+  (slackit-test-with-app (app "code-no-detector")
+    (let ((slackit-code-default-mode nil)
+          (detector-called nil)
+          payload)
+      (cl-letf (((symbol-function 'language-detection-string)
+                 (lambda (_text)
+                   (setq detector-called t)
+                   'emacslisp)))
+        (setq payload
+              (slackit-code-block-string
+               app "(let ((value 1)) value)" nil)))
+      (should-not detector-called)
+      (should-not (get-text-property 1 'slackit-code-mode payload))
+      (should
+       (slackit-test--face-includes-p
+        (get-text-property 1 'face payload)
+        'slackit-code-block))
+      (let ((slackit-code-default-mode 'emacs-lisp-mode))
+        (setq payload
+              (slackit-code-block-string
+               app "(let ((value 1)) value)" nil))
+        (should (eq 'emacs-lisp-mode
+                    (get-text-property 1 'slackit-code-mode payload)))))))
+
+(ert-deftest slackit-contract-code-rendering-keeps-canonical-wire-text ()
+  (slackit-test-with-app (app "code-render")
+    (let* ((state (slackit-runtime-state app))
+           (wire
+            "before `inline` ```(let ((x :wave:)) <@U1>)``` after")
+           (preformatted
+            '((type . "rich_text_preformatted")
+              (language . "elisp")
+              (elements
+               . (((type . "text")
+                   (text . "(let ((x :wave:)) <@U1>)"))))))
+           (message
+            `((channel . "C1")
+              (ts . "1.000001")
+              (user . "U1")
+              (text . ,wire)
+              (blocks
+               . (((type . "rich_text")
+                   (elements . (,preformatted)))))))
+           (slackit-code-language-modes
+            '(("elisp" . emacs-lisp-mode))))
+      (with-temp-buffer
+        (slackit-render-insert-text app state wire message)
+        (let ((rendered (buffer-string)))
+          (should (equal
+                   "before inline (let ((x :wave:)) <@U1>) after"
+                   (substring-no-properties rendered)))
+          (goto-char (point-min))
+          (should (search-forward "inline" nil t))
+          (should (eq 'inline
+                      (get-text-property
+                       (match-beginning 0) 'slackit-code-kind)))
+          (should (search-forward "(let" nil t))
+          (should (eq 'block
+                      (get-text-property
+                       (match-beginning 0) 'slackit-code-kind)))
+          (should (eq 'emacs-lisp-mode
+                      (get-text-property
+                       (match-beginning 0) 'slackit-code-mode)))
+          (should (search-forward ":wave:" nil t))
+          (should (search-forward "<@U1>" nil t))))
+      (should (equal wire (slackit-normalize-get message 'text))))))
+
+(ert-deftest slackit-contract-code-language-requires-exact-block-match ()
+  (slackit-test-with-app (app "code-exact")
+    (let* ((state (slackit-runtime-state app))
+           (wire "```(defun actual ())```")
+           (preformatted
+            '((type . "rich_text_preformatted")
+              (language . "elisp")
+              (elements
+               . (((type . "text")
+                   (text . "(defun different ())"))))))
+           (message
+            `((text . ,wire)
+              (blocks
+               . (((type . "rich_text")
+                   (elements . (,preformatted)))))))
+           (slackit-code-default-mode nil)
+           (slackit-code-language-modes
+            '(("elisp" . emacs-lisp-mode))))
+      (with-temp-buffer
+        (slackit-render-insert-text app state wire message)
+        (should-not
+         (get-text-property (point-min) 'slackit-code-language))
+        (should-not
+         (get-text-property (point-min) 'slackit-code-mode))))))
+
+(ert-deftest slackit-contract-code-caches-are-account-lifecycle-owned ()
+  (slackit-test-with-app (left "code-left")
+    (slackit-test-with-app (right "code-right")
+      (let ((slackit-code-language-modes
+             '(("elisp" . emacs-lisp-mode))))
+        (slackit-code-block-string left "(let ((x 1)) x)" "elisp")
+        (slackit-code-block-string right "(let ((x 1)) x)" "elisp")
+        (let ((left-cache (gethash left slackit-code--app-caches))
+              (right-cache (gethash right slackit-code--app-caches)))
+          (should (slackit-code-cache-p left-cache))
+          (should (slackit-code-cache-p right-cache))
+          (should-not (eq left-cache right-cache))
+          (slackit-runtime-stop-account left)
+          (should-not (gethash left slackit-code--app-caches))
+          (should (eq right-cache
+                      (gethash right slackit-code--app-caches))))))))
+
 (provide 'slackit-contract-test)
 
 ;;; slackit-contract-test.el ends here

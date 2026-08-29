@@ -20,6 +20,7 @@
 (require 'appkit-name-color)
 (require 'appkit-ui)
 (require 'appkit-view)
+(require 'slackit-code)
 (require 'slackit-avatar)
 (require 'slackit-emoji)
 (require 'slackit-media)
@@ -122,22 +123,34 @@
         :help-echo "Open conversation")))
     (`(text ,label) (insert label))))
 
-(defun slackit-render-insert-text (app state text)
-  "Insert Slack TEXT safely for APP, expanding references through STATE."
+(defun slackit-render-insert-text (app state text &optional message)
+  "Insert Slack TEXT safely for APP, expanding references through STATE.
+
+When MESSAGE is non-nil, exact Block Kit code descriptors provide authoritative
+language metadata for matching fenced spans."
   (let ((position 0)
         (length (length (or text "")))
-        (source (or text "")))
+        (source (or text ""))
+        (code-descriptors
+         (and message (slackit-code-message-descriptors message))))
     (while (< position length)
       (cond
        ((and (<= (+ position 3) length)
              (string= (substring source position (+ position 3)) "```"))
         (let ((end (string-match "```" source (+ position 3))))
           (if end
-              (progn
-                (insert (propertize
-                         (slackit-render-decode-entities
-                          (substring source (+ position 3) end))
-                         'face 'font-lock-comment-face))
+              (let* ((code
+                      (slackit-render-decode-entities
+                       (substring source (+ position 3) end)))
+                     (match
+                      (slackit-code-consume-descriptor
+                       code-descriptors code))
+                     (descriptor (plist-get match :descriptor))
+                     (language
+                      (and descriptor
+                           (slackit-code-descriptor-language descriptor))))
+                (setq code-descriptors (plist-get match :remaining))
+                (insert (slackit-code-block-string app code language))
                 (setq position (+ end 3)))
             (insert (slackit-render-decode-entities
                      (substring source position)))
@@ -146,10 +159,10 @@
         (let ((end (cl-position ?` source :start (1+ position))))
           (if end
               (progn
-                (insert (propertize
-                         (slackit-render-decode-entities
-                          (substring source (1+ position) end))
-                         'face 'font-lock-constant-face))
+                (insert
+                 (slackit-code-inline-string
+                  (slackit-render-decode-entities
+                   (substring source (1+ position) end))))
                 (setq position (1+ end)))
             (insert "`")
             (setq position (1+ position)))))
@@ -366,7 +379,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
           (insert (propertize "[Unsupported Block Kit content]"
                               'face 'slackit-status)))
       (when (equal subtype "me_message") (insert "* "))
-      (slackit-render-insert-text app state text))))
+      (slackit-render-insert-text app state text message))))
 
 (defun slackit-render--insert-heading
     (app state message sender timestamp header-prefix body-rest-prefix)

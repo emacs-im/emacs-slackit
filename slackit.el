@@ -30,6 +30,7 @@
 (require 'slackit-history)
 (require 'slackit-emoji)
 (require 'slackit-media)
+(require 'slackit-code)
 (require 'slackit-render)
 (require 'slackit-completion)
 (require 'slackit-compose)
