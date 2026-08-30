@@ -17,5 +17,13 @@ Slackit requires Emacs 29.1, =browser-session=, =transient=, and the
 =M-x slackit=; an account without private auth opens an isolated browser login.
 =M-x slackit-register-account= remains a session-only headless fallback.
 
+In room and thread composers, =C-c C-a= opens the Slack attachment-action
+chooser; =C-c C-f= directly selects local media or a file.  Code blocks select
+an explicit language and open a separate, exact-view-owned native-mode editor
+before being atomically inserted and sent as Slack rich preformatted blocks.
+The chooser also supports an uploaded code snippet,
+media/file upload, an image with screen-reader text, and a clipboard image when
+graphical clipboard access is available.
+
 Architecture, security, lifecycle, and deferred-scope contracts are in
 [[file:docs/architecture.org][docs/architecture.org]].

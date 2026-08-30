@@ -158,24 +158,37 @@ OWNER, when non-nil, owns cancellation of this non-retried write."
    :on-error on-error))
 
 (cl-defun slackit-api-post-message
-    (app conversation-id text &key thread-ts on-success on-error)
-  "Post TEXT to CONVERSATION-ID, optionally under THREAD-TS."
+    (app conversation-id text &key thread-ts blocks on-success on-error)
+  "Post fallback TEXT and optional BLOCKS to CONVERSATION-ID.
+
+THREAD-TS places the message under one exact thread root.  BLOCKS is an ordered
+list of Slack Block Kit objects and is serialized as one JSON array."
   (slackit-api-request
    app "chat.postMessage"
    :method 'post
    :parameters `((channel . ,conversation-id)
                  (text . ,text)
+                 ,@(and blocks
+                        `((blocks . ,(json-serialize (vconcat blocks)))))
                  ,@(and thread-ts `((thread_ts . ,thread-ts))))
    :on-success on-success
    :on-error on-error))
 
 (cl-defun slackit-api-get-upload-url
-    (app filename length &key owner on-success on-error)
-  "Negotiate one external Slack upload for FILENAME containing LENGTH bytes."
+    (app filename length
+         &key snippet-type alt-text owner on-success on-error)
+  "Negotiate one external Slack upload for FILENAME containing LENGTH bytes.
+
+SNIPPET-TYPE requests Slack code-snippet syntax.  ALT-TEXT supplies an image
+description for screen readers."
   (slackit-api-request
    app "files.getUploadURLExternal"
    :method 'post
-   :parameters `((filename . ,filename) (length . ,length))
+   :parameters
+   `((filename . ,filename)
+     (length . ,length)
+     ,@(and snippet-type `((snippet_type . ,snippet-type)))
+     ,@(and alt-text `((alt_txt . ,alt-text))))
    :owner (or owner app)
    :on-success on-success
    :on-error on-error))
@@ -202,12 +215,16 @@ FILES is an ordered list of alists carrying Slack file `id' and optional
    :on-error on-error))
 
 (cl-defun slackit-api-update-message
-    (app conversation-id ts text &key on-success on-error)
-  "Replace message TS in CONVERSATION-ID with TEXT."
+    (app conversation-id ts text &key blocks on-success on-error)
+  "Replace message TS with fallback TEXT and optional Block Kit BLOCKS."
   (slackit-api-request
    app "chat.update"
    :method 'post
-   :parameters `((channel . ,conversation-id) (ts . ,ts) (text . ,text))
+   :parameters
+   `((channel . ,conversation-id)
+     (ts . ,ts)
+     (text . ,text)
+     ,@(and blocks `((blocks . ,(json-serialize (vconcat blocks))))))
    :on-success on-success
    :on-error on-error))
 

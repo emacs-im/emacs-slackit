@@ -14,11 +14,14 @@
 (require 'mailcap)
 (require 'subr-x)
 (require 'appkit-compose)
+(require 'appkit-compose-edit)
 (require 'appkit-core)
 (require 'appkit-invalidation)
 (require 'appkit-chatbuf)
 (require 'appkit-ui)
 (require 'slackit-api)
+(require 'slackit-customize)
+(require 'slackit-code)
 (require 'slackit-normalize)
 (require 'slackit-runtime)
 (require 'slackit-upload)
@@ -26,9 +29,14 @@
 
 (declare-function slackit-room-current-app "slackit-room" ())
 (declare-function slackit-room-current-conversation-id "slackit-room" ())
+(declare-function slackit-room-current-view "slackit-room" ())
 
 (defvar slackit-compose--attachment-serial 0
   "Process-local serial for opaque composer attachment identities.")
+
+(defconst slackit-compose--snippet-size-limit (* 1024 1024)
+  "Slack's documented external-upload limit for code snippets.")
+
 
 (defun slackit-compose--escape (text)
   "Escape ordinary composer TEXT for Slack mrkdwn transport."
@@ -37,12 +45,24 @@
     (setq value (replace-regexp-in-string "<" "&lt;" value t t))
     (replace-regexp-in-string ">" "&gt;" value t t)))
 
+(defun slackit-compose--code-block-object-p (object)
+  "Return non-nil when OBJECT is a Slackit code block."
+  (and (listp object) (eq (plist-get object :type) 'code-block)))
+
+(defun slackit-compose--code-block-wire (code)
+  "Return escaped Slack mrkdwn for CODE."
+  (format "```\n%s\n```"
+          (slackit-compose--escape
+           (string-trim (or code "") "\n+" "\n+"))))
+
 (defun slackit-compose--object-wire (object fallback)
   "Return Slack wire text for structured OBJECT or escaped FALLBACK."
   (let ((id (plist-get object :id)))
     (pcase (plist-get object :type)
       ('user (if id (format "<@%s>" id) (slackit-compose--escape fallback)))
       ('channel (if id (format "<#%s>" id) (slackit-compose--escape fallback)))
+      ('code-block
+       (slackit-compose--code-block-wire (plist-get object :code)))
       (_ (slackit-compose--escape fallback)))))
 
 (defun slackit-compose--attachment-object-p (object)
@@ -115,6 +135,74 @@ Attachment objects are transport plans, not visible Slack message text."
         (setq position next)))
     (apply #'concat (nreverse parts))))
 
+(defun slackit-compose--rich-section-block (text)
+  "Return one Slack mrkdwn section block containing TEXT."
+  (when (> (length text) 3000)
+    (user-error
+     "slackit: text adjacent to a code block exceeds Slack's section limit"))
+  `((type . "section")
+    (text . ((type . "mrkdwn") (text . ,text)))))
+
+(defun slackit-compose--rich-code-block (object)
+  "Return one language-declared Slack rich-text block for code OBJECT."
+  (let ((language (slackit-compose--language-token
+                   (plist-get object :language)))
+        (code (plist-get object :code)))
+    (unless language
+      (user-error "slackit: a code block requires an explicit language"))
+    (slackit-compose--validate-code-block code)
+    (list
+     (cons 'type "rich_text")
+     (cons
+      'elements
+      (vector
+       (list
+        (cons 'type "rich_text_preformatted")
+        (cons 'elements
+              (vector (list (cons 'type "text") (cons 'text code))))
+        (cons 'border 0)
+        (cons 'language language)))))))
+
+(defun slackit-compose-blocks (input)
+  "Compile INPUT containing code objects to ordered Slack Block Kit blocks.
+
+Return nil when INPUT has no code block, preserving the ordinary text-only API
+path.  Non-code spans retain Slack mrkdwn semantics through section blocks;
+code spans become language-declared `rich_text_preformatted' elements."
+  (let ((position 0)
+        (finish (length (or input "")))
+        ordinary
+        blocks
+        code-seen-p)
+    (cl-labels
+        ((flush-ordinary
+          ()
+          (let ((text (apply #'concat (nreverse ordinary))))
+            (setq ordinary nil)
+            (when (string-match-p "\\S-" text)
+              (push (slackit-compose--rich-section-block text) blocks)))))
+      (while (< position finish)
+        (let* ((object
+                (get-text-property
+                 position appkit-chatbuf-input-object-property input))
+               (next
+                (appkit-chatbuf-next-input-object-change
+                 position input finish))
+               (span (substring input position next)))
+          (if (slackit-compose--code-block-object-p object)
+              (progn
+                (flush-ordinary)
+                (push (slackit-compose--rich-code-block object) blocks)
+                (setq code-seen-p t))
+            (push (slackit-compose-serialize span) ordinary))
+          (setq position next)))
+      (flush-ordinary))
+    (when code-seen-p
+      (setq blocks (nreverse blocks))
+      (when (> (length blocks) 50)
+        (user-error "slackit: code-rich message exceeds Slack's 50-block limit"))
+      blocks)))
+
 (defun slackit-compose--attachment-kind (name)
   "Return presentation kind for local attachment NAME."
   (let ((mime
@@ -132,6 +220,7 @@ Attachment objects are transport plans, not visible Slack message text."
     ('image "Image")
     ('video "Video")
     ('audio "Audio")
+    ('snippet "Snippet")
     (_ "File")))
 
 (defun slackit-compose--attachment-spec (file)
@@ -170,27 +259,285 @@ Attachment objects are transport plans, not visible Slack message text."
        (appkit-compose-operation-active-p)
        (eq (appkit-compose-operation-kind) 'slack-upload)))
 
-(defun slackit-compose-attach-file (file)
-  "Attach readable local FILE to the current Slack composer."
-  (interactive (list (read-file-name "Attach file: " nil nil t)))
+(defun slackit-compose--attachment-actions ()
+  "Return currently available configured attachment action names and commands."
+  (cl-loop
+   for (name predicate command) in slackit-compose-attach-commands
+   when
+   (and (stringp name)
+        (commandp command)
+        (or (null predicate)
+            (and (functionp predicate)
+                 (condition-case nil (funcall predicate) (error nil)))))
+   collect (cons name command)))
+
+(defun slackit-compose-attach ()
+  "Choose an available attachment action, then invoke its command.
+
+This is the Telega-style generic attachment entry point.  Direct local
+media/file selection remains available through `slackit-compose-attach-file'."
+  (interactive)
+  (let ((actions (slackit-compose--attachment-actions)))
+    (unless actions
+      (user-error "slackit: no attachment actions are available"))
+    (let* ((name (completing-read "Attach: " actions nil t))
+           (command (alist-get name actions nil nil #'equal)))
+      (call-interactively command))))
+
+(defun slackit-compose--ensure-file-attachable ()
+  "Reject composer states that cannot accept a Slack file object."
   (when (slackit-compose-upload-active-p)
     (user-error "slackit: wait for or cancel the current upload"))
   (when (eq (appkit-chatbuf-aux-type) 'edit)
-    (user-error "slackit: file attachments cannot be added while editing"))
-  (let* ((attachment (slackit-compose--attachment-spec file))
-         (path (plist-get attachment :path)))
+    (user-error "slackit: file attachments cannot be added while editing")))
+
+(defun slackit-compose--insert-attachment (attachment)
+  "Insert validated ATTACHMENT atomically into the current composer."
+  (slackit-compose--ensure-file-attachable)
+  (let ((path (plist-get attachment :path)))
     (when (cl-find path (slackit-compose-attachments)
                    :key (lambda (item) (plist-get item :path))
                    :test #'equal)
-      (user-error "slackit: this file is already attached"))
-    (appkit-chatbuf-focus-input)
-    (appkit-chatbuf-input-insert
-     (slackit-compose--attachment-text attachment)
-     :object attachment)
-    attachment))
+      (user-error "slackit: this file is already attached")))
+  (appkit-chatbuf-focus-input)
+  (appkit-chatbuf-input-insert
+   (slackit-compose--attachment-text attachment)
+   :object attachment)
+  attachment)
 
-(defun slackit-compose--attachment-region (id)
-  "Return current input region occupied by attachment ID, or nil."
+(defun slackit-compose--language-token (value)
+  "Return validated optional Slack code-snippet language token VALUE."
+  (let ((token (string-trim (or value ""))))
+    (cond
+     ((string-empty-p token) nil)
+     ((not (string-match-p "\\`[[:alnum:]+#._-]+\\'" token))
+      (user-error "slackit: language must be one token"))
+     (t token))))
+
+(defun slackit-compose--read-code-language (&optional default)
+  "Read an explicit native code editing language, defaulting to DEFAULT."
+  (let ((languages
+         (sort
+          (delete-dups
+           (mapcar (lambda (entry) (format "%s" (car entry)))
+                   org-src-lang-modes))
+          #'string<)))
+    (or
+     (slackit-compose--language-token
+      (completing-read
+       "Code language: " languages nil nil nil nil default))
+     (user-error "slackit: a code block requires an explicit language"))))
+
+(defun slackit-compose--code-edit-mode (language)
+  "Return native, remapped editing mode for explicit LANGUAGE."
+  (let* ((native (and language
+                      (slackit-code-mode-for-language language)))
+         (remapped
+          (and native
+               (boundp 'major-mode-remap-alist)
+               (alist-get native major-mode-remap-alist))))
+    (if (commandp (or remapped native))
+        (or remapped native)
+      #'text-mode)))
+
+(defun slackit-compose--validate-code-block (code)
+  "Reject CODE that cannot be represented as one Slack mrkdwn block."
+  (when (string-empty-p (string-trim code))
+    (user-error "slackit: code block is empty"))
+  (when (string-match-p "```" code)
+    (user-error "slackit: fenced code belongs in a code snippet"))
+  t)
+
+(defun slackit-compose--code-block-presentation (object)
+  "Return one-line composer card for code-block OBJECT."
+  (let* ((code (or (plist-get object :code) ""))
+         (lines (1+ (cl-count ?\n code)))
+         (characters (length code)))
+    (format "[Code block%s] %d line%s · %d char%s"
+            (if-let* ((language (plist-get object :language)))
+                (format " · %s" language)
+              "")
+            lines (if (= lines 1) "" "s")
+            characters (if (= characters 1) "" "s"))))
+
+(defun slackit-compose--insert-code-block-object (object existing)
+  "Insert code-block OBJECT, replacing EXISTING when non-nil."
+  (if existing
+      (let ((region
+             (slackit-compose--input-object-region
+              (plist-get existing :id)
+              #'slackit-compose--code-block-object-p)))
+        (unless region
+          (user-error "slackit: the code block changed while editing"))
+        (goto-char (car region))
+        (delete-region (car region) (cdr region)))
+    (appkit-chatbuf-focus-input)
+    (let ((current (appkit-chatbuf-input-state)))
+      (unless (or (string-empty-p current)
+                  (string-suffix-p "\n" current))
+        (appkit-chatbuf-input-insert "\n"))))
+  (appkit-chatbuf-input-insert
+   (slackit-compose--code-block-presentation object)
+   :object object
+   :properties '(font-lock-face fixed-pitch))
+  object)
+
+(defun slackit-compose-insert-code-block (language)
+  "Edit a Slack code block in a separate native-mode buffer, then insert it.
+
+When point is on an existing Slackit code-block object, edit and replace that
+object atomically.  Cancellation leaves the exact room/thread draft unchanged."
+  (interactive
+   (let ((object (appkit-chatbuf-input-object-at-point)))
+     (list
+      (slackit-compose--read-code-language
+       (and (slackit-compose--code-block-object-p object)
+            (plist-get object :language))))))
+  (let* ((language
+          (or (slackit-compose--language-token language)
+              (user-error
+               "slackit: a code block requires an explicit language")))
+         (view (slackit-room-current-view))
+         (composer-buffer (current-buffer))
+         (existing
+          (let ((object (appkit-chatbuf-input-object-at-point)))
+            (and (slackit-compose--code-block-object-p object) object)))
+         (code
+          (appkit-compose-edit-buffer
+           view (or (plist-get existing :code) "")
+           :mode (slackit-compose--code-edit-mode language)
+           :buffer-name "*Slackit Code Block*"
+           :display-action slackit-compose-code-edit-display-buffer-action
+           :validation-function #'slackit-compose--validate-code-block)))
+    (when code
+      (unless (and (appkit-view-live-p view)
+                   (buffer-live-p composer-buffer))
+        (user-error "slackit: the originating composer is no longer live"))
+      (with-current-buffer composer-buffer
+        (unless (eq view (appkit-current-view))
+          (user-error "slackit: the originating composer changed"))
+        (slackit-compose--insert-code-block-object
+         (list :type 'code-block
+               :id (or (plist-get existing :id)
+                       (format "code-block-%x"
+                               (cl-incf slackit-compose--attachment-serial)))
+               :language language
+               :code code)
+         existing)))))
+
+(defun slackit-compose-attach-file (file)
+  "Attach readable local media or FILE to the current Slack composer."
+  (interactive (list (read-file-name "Attach media/file: " nil nil t)))
+  (slackit-compose--insert-attachment
+   (slackit-compose--attachment-spec file)))
+
+(defun slackit-compose--alt-text (value)
+  "Return validated optional Slack image alternative text VALUE."
+  (let ((text (string-trim (or value ""))))
+    (cond
+     ((string-empty-p text) nil)
+     ((> (length text) 1000)
+      (user-error "slackit: image description exceeds 1000 characters"))
+     ((string-match-p "\0" text)
+      (user-error "slackit: image description is invalid"))
+     (t text))))
+
+(defun slackit-compose-attach-image (file alt-text)
+  "Attach local image FILE with optional screen-reader ALT-TEXT."
+  (interactive
+   (list (read-file-name "Attach image: " nil nil t)
+         (read-string "Image description (optional): ")))
+  (let ((attachment (slackit-compose--attachment-spec file))
+        (description (slackit-compose--alt-text alt-text)))
+    (unless (eq (plist-get attachment :kind) 'image)
+      (user-error "slackit: selected file is not a recognized image"))
+    (when description
+      (setq attachment (plist-put attachment :alt-text description)))
+    (slackit-compose--insert-attachment attachment)))
+
+(defun slackit-compose-attach-code-snippet (file snippet-type)
+  "Attach local FILE as a Slack code snippet of optional SNIPPET-TYPE."
+  (interactive
+   (list (read-file-name "Attach code snippet: " nil nil t)
+         (read-string "Snippet language (optional): ")))
+  (let ((attachment (slackit-compose--attachment-spec file))
+        (language (slackit-compose--language-token snippet-type)))
+    (when (> (plist-get attachment :size)
+             slackit-compose--snippet-size-limit)
+      (user-error "slackit: code snippets cannot exceed 1 MiB"))
+    (setq attachment (plist-put attachment :kind 'snippet))
+    (when language
+      (setq attachment (plist-put attachment :snippet-type language)))
+    (slackit-compose--insert-attachment attachment)))
+
+(defun slackit-compose-clipboard-image-available-p ()
+  "Return non-nil when this frame can acquire graphical clipboard data."
+  (and (display-graphic-p) (fboundp 'gui-get-selection)))
+
+(defun slackit-compose--clipboard-image-data ()
+  "Return (SUFFIX . BYTES) for the first supported clipboard image."
+  (or
+   (cl-loop
+    for (mime . suffix) in '((image/png . ".png") (image/jpeg . ".jpg"))
+    for data =
+    (let ((selection-coding-system 'no-conversion))
+      (condition-case nil
+          (gui-get-selection 'CLIPBOARD mime)
+        (error nil)))
+    when (and (stringp data) (> (length data) 0))
+    return (cons suffix data))
+   (user-error "slackit: the clipboard has no PNG or JPEG image")))
+
+(defun slackit-compose--delete-temporary-file (state)
+  "Delete private clipboard staging file and directory in STATE."
+  (ignore-errors (delete-file (plist-get state :path)))
+  (ignore-errors (delete-directory (plist-get state :directory))))
+
+(defun slackit-compose--stage-clipboard-image (suffix bytes)
+  "Stage clipboard image BYTES with SUFFIX in a private temporary directory."
+  (let* ((directory (make-temp-file "slackit-compose-" t))
+         (path (expand-file-name (concat "clipboard" suffix) directory))
+         succeeded)
+    (unwind-protect
+        (condition-case nil
+            (let ((coding-system-for-write 'no-conversion))
+              (set-file-modes directory #o700)
+              (write-region bytes nil path nil 'silent)
+              (set-file-modes path #o600)
+              (setq succeeded t)
+              path)
+          (error
+           (user-error "slackit: could not stage the clipboard image")))
+      (unless succeeded
+        (slackit-compose--delete-temporary-file
+         (list :path path :directory directory))))))
+
+(defun slackit-compose-attach-clipboard-image (alt-text)
+  "Attach a PNG or JPEG clipboard image with optional ALT-TEXT."
+  (interactive (list (read-string "Image description (optional): ")))
+  (slackit-compose--ensure-file-attachable)
+  (pcase-let* ((`(,suffix . ,bytes) (slackit-compose--clipboard-image-data))
+               (path (slackit-compose--stage-clipboard-image suffix bytes))
+               (state (list :path path :directory (file-name-directory
+                                                   (directory-file-name path))))
+               (handle
+                (appkit-register-handle
+                 (slackit-room-current-view)
+                 'slackit-compose-temporary-file state
+                 #'slackit-compose--delete-temporary-file))
+               (attachment (slackit-compose--attachment-spec path))
+               (description (slackit-compose--alt-text alt-text)))
+    (setq attachment (plist-put attachment :temporary-handle handle))
+    (when description
+      (setq attachment (plist-put attachment :alt-text description)))
+    (condition-case error-data
+        (slackit-compose--insert-attachment attachment)
+      ((error quit)
+       (appkit-cancel-handle handle)
+       (signal (car error-data) (cdr error-data))))))
+
+(defun slackit-compose--input-object-region (id predicate)
+  "Return input region for object ID satisfying PREDICATE, or nil."
   (when-let* ((bounds (appkit-chatbuf-input-region-bounds)))
     (let ((position (car bounds))
           (finish (cdr bounds))
@@ -202,7 +549,7 @@ Attachment objects are transport plans, not visible Slack message text."
                (next
                 (appkit-chatbuf-next-input-object-change
                  position nil finish)))
-          (when (and (slackit-compose--attachment-object-p object)
+          (when (and (funcall predicate object)
                      (equal id (plist-get object :id)))
             (setq found (cons position next)))
           (setq position next)))
@@ -239,10 +586,13 @@ Interactively prefer the attachment at point, otherwise select by safe name."
     (unless target
       (user-error "slackit: this composer has no attachment"))
     (when-let* ((region
-                 (slackit-compose--attachment-region
-                  (plist-get target :id))))
+                 (slackit-compose--input-object-region
+                  (plist-get target :id)
+                  #'slackit-compose--attachment-object-p)))
       (delete-region (car region) (cdr region))
       (appkit-chatbuf-input-state-sync)
+      (when-let* ((handle (plist-get target :temporary-handle)))
+        (appkit-cancel-handle handle))
       target)))
 
 (defun slackit-compose--response-message
@@ -371,7 +721,13 @@ Interactively prefer the attachment at point, otherwise select by safe name."
                (list :kind kind
                      :revision revision
                      :input (slackit-compose-strip-attachments input)
-                     :aux aux)
+                     :aux aux
+                     :temporary-handles
+                     (delq nil
+                           (mapcar
+                            (lambda (item)
+                              (plist-get item :temporary-handle))
+                            items)))
                (and error-data
                     (list
                      :code
@@ -450,6 +806,8 @@ Interactively prefer the attachment at point, otherwise select by safe name."
               request
               (slackit-api-get-upload-url
                app (plist-get attachment :name) size
+               :snippet-type (plist-get attachment :snippet-type)
+               :alt-text (plist-get attachment :alt-text)
                :owner view
                :on-success
                (lambda (body)
@@ -571,6 +929,7 @@ with the captured text as one completion write."
          (input (appkit-chatbuf-input-state))
          (attachments (slackit-compose-attachments input))
          (wire-text (slackit-compose-serialize input))
+         (blocks (slackit-compose-blocks input))
          (revision (appkit-chatbuf-composer-revision))
          (aux (copy-tree (appkit-chatbuf-aux-state)))
          (view-id (appkit-view-id view))
@@ -594,6 +953,9 @@ with the captured text as one completion write."
       (user-error "slackit: this composer already owns an upload"))
     (when (and edit-p attachments)
       (user-error "slackit: file attachments cannot be added while editing"))
+    (when (and attachments blocks)
+      (user-error
+       "slackit: send language-declared code blocks separately from files"))
     (if attachments
         (slackit-compose--submit-upload
          app view revision input aux conversation-id root-ts wire-text attachments)
@@ -612,6 +974,7 @@ with the captured text as one completion write."
                 (user-error "slackit: edited message no longer exists"))
               (slackit-api-update-message
                app conversation-id message-ts wire-text
+               :blocks blocks
                :on-success
                (lambda (body)
                  (slackit-compose--settle-success
@@ -625,6 +988,7 @@ with the captured text as one completion write."
           (slackit-api-post-message
            app conversation-id wire-text
            :thread-ts root-ts
+           :blocks blocks
            :on-success
            (lambda (body)
              (slackit-compose--settle-success
@@ -643,6 +1007,8 @@ with the captured text as one completion write."
                (equal aux (appkit-chatbuf-aux-state)))
       (pcase (plist-get event :kind)
         ('compose-success
+         (dolist (handle (plist-get event :temporary-handles))
+           (appkit-cancel-handle handle))
          (appkit-chatbuf-input-history-push (plist-get event :input))
          (appkit-chatbuf-input-set-text "")
          (appkit-chatbuf-aux-reset)
@@ -667,8 +1033,12 @@ with the captured text as one completion write."
                  (memq (car-safe view-id) '(room thread)))
       (user-error "slackit: no live room or thread view"))
     (when (appkit-chatbuf-aux-active-p)
-      (appkit-chatbuf-input-set-text "")
-      (appkit-chatbuf-aux-reset))))
+      (let ((attachments (slackit-compose-attachments)))
+        (appkit-chatbuf-input-set-text "")
+        (appkit-chatbuf-aux-reset)
+        (dolist (attachment attachments)
+          (when-let* ((handle (plist-get attachment :temporary-handle)))
+            (appkit-cancel-handle handle)))))))
 
 (defun slackit-compose-cancel-dwim ()
   "Cancel an upload first, otherwise clear reply/edit composer context."

@@ -414,14 +414,54 @@ the same exact view scope.
 
 The composer serializes ordinary text plus structured =@user= and =#channel=
 objects to exact Slack ID forms.  Candidate labels are account-local and
-collision-safe; display text is never the wire identity.  Local files use the
-same Appkit atomic input-object boundary as Telega-style attachments: the safe
-name/type/size label is editable composer presentation, while the local path
-remains Slackit-owned object data and never becomes message text.  The same
-composer auxiliary state supports a plain room send, a thread reply, and
-editing one owned message.  Attachments are accepted for room sends and thread
-replies, not message edits.  It does not implement rich WYSIWYG or Block Kit
-authoring.
+collision-safe; display text is never the wire identity.  =C-c C-a= is a
+Telega-style attachment-action dispatcher rather than an immediate file
+prompt.  Its ordered, customizable actions expose only distinct Slack or local
+acquisition semantics: an editable fenced code block, an uploaded code
+snippet, unified media/file selection, an image carrying =alt_txt=, and a
+clipboard image when graphical clipboard data is available.  =C-c C-f= is the
+direct media/file shortcut.
+
+Local files use the same Appkit atomic input-object boundary as Telega-style
+attachments: the safe name/type/size label is composer presentation, while the
+local path remains Slackit-owned object data and never becomes message text.
+A code-block action first selects an explicit editing language, resolves its
+native Emacs mode through Org plus =major-mode-remap-alist=, and opens
+=appkit-compose-edit-buffer= under the exact room/thread view.  Appkit owns the
+temporary recursive editor, finish/cancel keys, native-mode keymap layering,
+buffer cleanup, and owner shutdown.  Slackit validates the returned code and
+atomically inserts or replaces a structured code-block object.  Composer
+presentation is deliberately one line—language plus line/character counts—so
+multiline source never violates Appkit's cursor-intangible object geometry.
+Cancellation does not mutate the composer.
+
+Slack mrkdwn fences cannot declare a language.  A code-rich room send, thread
+reply, or edit therefore carries two coordinated representations:
+
+- top-level =text= is an escaped fenced fallback for notifications,
+  accessibility, and clients that ignore blocks;
+- =blocks= preserves ordered non-code spans as =section/mrkdwn= and compiles
+  each code object to
+  =rich_text/rich_text_preformatted(language=LANGUAGE)=.
+
+The explicit language is therefore both local native-mode metadata and Slack
+syntax-highlighting metadata.  Code blocks require it.  Slack file completion
+accepts only =initial_comment= rather than arbitrary blocks, so one submission
+cannot mix language-declared code objects with uploaded files; Slackit rejects
+that combination instead of silently dropping the language.
+
+Code snippets carry the explicit optional =snippet_type= through upload
+negotiation and enforce Slack's documented 1 MiB limit.  Clipboard bytes are
+frozen in a private =0700= temporary directory with a =0600= file; a view-owned
+Appkit handle removes it when the attachment is deleted, its successful
+unchanged draft settles, or the view stops.  Cancellation retains that draft
+and temporary file.
+
+The same composer auxiliary state supports a plain room send, a thread reply,
+and editing one owned message.  File attachments are accepted for room sends
+and thread replies, not message edits.  Slackit does not implement general rich
+WYSIWYG or arbitrary Block Kit authoring; the code-block compiler is one narrow
+typed transport.
 
 Text writes freeze their semantic input and Appkit composer revision while the
 account-owned request is in flight.  File sends additionally use one
@@ -498,8 +538,8 @@ controllers become a =disco-room.el=-sized unit.
 Media support is capability-separated inside =slackit-media.el=: public preview
 fetches carry no credentials; exact private Slack file transfers are
 account-owned and no-redirect; external page links remain distinct from media
-actions.  Uploads and unsupported Block Kit elements are not represented by
-empty scaffolds.
+actions.  Unsupported Block Kit elements are not represented by empty
+scaffolds.
 
 * First daily-use vertical slice
 
@@ -526,8 +566,9 @@ is complete only when one or more registered accounts can:
 8. complete =@user=, =#channel=, and Slack =:emoji:= names from exact account-local identities;
 9. apply realtime top-level, nested change/delete, reply/broadcast, reaction,
    marked, user, and joined-conversation lifecycle events;
-10. send room text and reconcile HTTP/realtime arrival in either order without
-    an optimistic row or automatic write retry;
+10. send room text or an ordered external-upload file share and reconcile
+    HTTP/realtime arrival in either order without an optimistic row or
+    automatic write retry;
 11. open a stable thread view, load/page replies, receive reply mutations, and
     send a reply;
 12. edit and delete an owned message with revision/tombstone-safe settlement;
@@ -541,11 +582,12 @@ is complete only when one or more registered accounts can:
     capture, or view left behind; and
 18. coexist with =slack= and expose optional Evil plus exact-scope Transient menus.
 
-Deferred after this slice: remaining rich Block Kit/attachments and WYSIWYG,
-media upload, global search, notifications, unread/modeline count summaries,
-typing, presence, DND, thread subscription/activity endpoints, pins/saved
-items, scheduled messages, workspace administration, OAuth/token refresh/
-Socket Mode, enterprise-token selection, and optimistic local timeline rows.
+Deferred after this slice: remaining rich Block Kit attachments and WYSIWYG,
+screenshot/recording acquisition, global search, notifications,
+unread/modeline count summaries, typing, presence, DND, thread
+subscription/activity endpoints, pins/saved items, scheduled messages,
+workspace administration, OAuth/token refresh/Socket Mode, enterprise-token
+selection, and optimistic local timeline rows.
 Unsupported content remains visible without silently expanding a deferred
 transport surface.
 

@@ -17,6 +17,33 @@
   :group 'applications
   :prefix "slackit-")
 
+(defcustom slackit-compose-attach-commands
+  '(("code block" nil slackit-compose-insert-code-block)
+    ("code snippet" nil slackit-compose-attach-code-snippet)
+    ("media/file" nil slackit-compose-attach-file)
+    ("image with alt text" nil slackit-compose-attach-image)
+    ("clipboard image"
+     slackit-compose-clipboard-image-available-p
+     slackit-compose-attach-clipboard-image))
+  "Ordered attachment actions offered by `slackit-compose-attach'.
+
+Each entry is (NAME AVAILABLE-P COMMAND).  AVAILABLE-P is nil or a predicate
+called when the chooser opens.  COMMAND must edit the current Appkit composer;
+it must not send immediately.  This mirrors Telega's generic attachment
+dispatcher while exposing only Slack capabilities with real local semantics."
+  :type
+  '(repeat
+    (list (string :tag "Name")
+          (choice (const :tag "Always available" nil)
+                  (function :tag "Availability predicate"))
+          (function :tag "Interactive command")))
+  :group 'slackit)
+
+(defcustom slackit-compose-code-edit-display-buffer-action
+  '((display-buffer-below-selected))
+  "Display action used for the temporary Slack code-block editor."
+  :type (get 'display-buffer-alist 'custom-type)
+  :group 'slackit)
 
 (defconst slackit-browser-user-agent
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"

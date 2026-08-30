@@ -492,12 +492,12 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (interactive (list (slackit-transient--room-scope)))
   (slackit-transient--call-in-view scope #'slackit-compose-submit))
 
-(transient-define-suffix slackit-transient-room-attach-file (scope)
-  "Attach one local file to the exact captured view's composer."
+(transient-define-suffix slackit-transient-room-attach (scope)
+  "Choose an attachment action for the exact captured view's composer."
   :inapt-if #'slackit-transient--room-inapt-p
   (interactive (list (slackit-transient--room-scope)))
   (slackit-transient--call-in-view
-   scope (lambda () (call-interactively #'slackit-compose-attach-file))))
+   scope (lambda () (call-interactively #'slackit-compose-attach))))
 
 (transient-define-suffix slackit-transient-room-remove-attachment (scope)
   "Remove one attachment from the exact captured view's composer."
@@ -740,7 +740,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     ("o" "Load older" slackit-transient-room-load-older)]
    ["Composer"
     ("c" "Send" slackit-transient-room-submit)
-    ("a" "Attach file" slackit-transient-room-attach-file)
+    ("a" "Attach…" slackit-transient-room-attach)
     ("d" "Remove attachment" slackit-transient-room-remove-attachment)
     ("k" "Cancel upload/context" slackit-transient-room-cancel-context)]
    ["View"

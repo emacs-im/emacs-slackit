@@ -31,6 +31,7 @@
 (declare-function slackit-compose-apply-settlement "slackit-compose" (event))
 (declare-function slackit-compose-cancel-context "slackit-compose" ())
 (declare-function slackit-compose-setup "slackit-compose" ())
+(declare-function slackit-compose-attach "slackit-compose" ())
 (declare-function slackit-compose-attach-file "slackit-compose" (file))
 (declare-function slackit-compose-remove-attachment "slackit-compose"
                   (&optional attachment))
@@ -120,7 +121,8 @@
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "C-c C-c") #'slackit-compose-submit)
-    (define-key map (kbd "C-c C-a") #'slackit-compose-attach-file)
+    (define-key map (kbd "C-c C-a") #'slackit-compose-attach)
+    (define-key map (kbd "C-c C-f") #'slackit-compose-attach-file)
     (define-key map (kbd "C-c C-d") #'slackit-compose-remove-attachment)
     (define-key map (kbd "C-c C-k") #'slackit-compose-cancel-dwim)
     (define-key map (kbd "C-c C-o") #'slackit-room-load-older)

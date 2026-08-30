@@ -695,7 +695,8 @@
                  (push arguments calls)
                  :request)))
       (slackit-api-get-upload-url
-       :app "fixture.png" 3 :owner :view)
+       :app "fixture.png" 3
+       :snippet-type "python" :alt-text "fixture diagram" :owner :view)
       (slackit-api-complete-upload
        :app '(((id . "F1") (title . "fixture.png")))
        "D1" :thread-ts "1.000001" :initial-comment "caption"
@@ -705,8 +706,12 @@
                  (files-json (alist-get 'files complete-params)))
       (should (equal (cadr negotiate) "files.getUploadURLExternal"))
       (should (equal 'post (plist-get (cddr negotiate) :method)))
-      (should (equal '((filename . "fixture.png") (length . 3))
-                     (plist-get (cddr negotiate) :parameters)))
+      (should
+       (equal '((filename . "fixture.png")
+                (length . 3)
+                (snippet_type . "python")
+                (alt_txt . "fixture diagram"))
+              (plist-get (cddr negotiate) :parameters)))
       (should (equal (cadr complete) "files.completeUploadExternal"))
       (should (equal "D1" (alist-get 'channel_id complete-params)))
       (should (equal "1.000001" (alist-get 'thread_ts complete-params)))
@@ -718,6 +723,234 @@
                (car
                 (json-parse-string
                  files-json :object-type 'alist :array-type 'list))))))))
+
+(ert-deftest slackit-contract-code-api-serializes-language-aware-blocks ()
+  (let* ((blocks
+          (list
+           '((type . "rich_text")
+             (elements
+              . [((type . "rich_text_preformatted")
+                  (elements . [((type . "text") (text . "(+ 1 2)"))])
+                  (border . 0)
+                  (language . "lisp"))]))))
+         calls)
+    (cl-letf (((symbol-function 'slackit-api-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 :request)))
+      (slackit-api-post-message
+       :app "D1" "fallback" :thread-ts "1.000001" :blocks blocks)
+      (slackit-api-update-message
+       :app "D1" "2.000001" "fallback" :blocks blocks))
+    (pcase-let* ((`(,update ,post) calls)
+                 (post-params (plist-get (cddr post) :parameters))
+                 (update-params (plist-get (cddr update) :parameters))
+                 (post-blocks
+                  (json-parse-string
+                   (alist-get 'blocks post-params)
+                   :object-type 'alist :array-type 'list))
+                 (preformatted
+                  (car (alist-get 'elements (car post-blocks)))))
+      (should (equal "chat.postMessage" (cadr post)))
+      (should (equal "1.000001" (alist-get 'thread_ts post-params)))
+      (should (equal "fallback" (alist-get 'text post-params)))
+      (should (equal "lisp" (alist-get 'language preformatted)))
+      (should (equal "chat.update" (cadr update)))
+      (should (stringp (alist-get 'blocks update-params))))))
+
+(ert-deftest slackit-contract-attach-dispatches-like-telega ()
+  (let ((slackit-compose-attach-commands
+         '(("code block" nil slackit-test--chosen-attach)
+           ("hidden" slackit-test--attach-unavailable
+            slackit-test--chosen-attach)))
+        chosen
+        offered)
+    (cl-letf
+        (((symbol-function 'slackit-test--chosen-attach)
+          (lambda () (interactive) (setq chosen t)))
+         ((symbol-function 'slackit-test--attach-unavailable)
+          (lambda () nil))
+         ((symbol-function 'completing-read)
+          (lambda (_prompt collection &rest _)
+            (setq offered (mapcar #'car collection))
+            "code block")))
+      (slackit-compose-attach))
+    (should chosen)
+    (should (equal '("code block") offered))
+    (should (eq #'slackit-compose-attach
+                (lookup-key slackit-room-mode-map (kbd "C-c C-a"))))
+    (should (eq #'slackit-compose-attach-file
+                (lookup-key slackit-room-mode-map (kbd "C-c C-f"))))))
+
+(ert-deftest slackit-contract-code-block-uses-owner-bound-native-editor ()
+  (slackit-test-with-app (app "composer-code-block")
+    (let ((state (slackit-runtime-state app))
+          view
+          editor-call)
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-conversation
+       state '((id . "D1") (is_im . t) (user . "U1")))
+      (cl-letf (((symbol-function 'slackit-history-load-latest)
+                 (lambda (&rest _) nil)))
+        (setq view (slackit-room-open app "D1" nil)))
+      (with-current-buffer (appkit-view-buffer view)
+        (appkit-chatbuf-input-set-text "context")
+        (cl-letf
+            (((symbol-function 'appkit-compose-edit-buffer)
+              (lambda (owner initial &rest options)
+                (setq editor-call (list owner initial options))
+                "(message \"hello\")")))
+          (slackit-compose-insert-code-block "emacs-lisp"))
+        (should (eq view (car editor-call)))
+        (should (string-empty-p (cadr editor-call)))
+        (should
+         (eq #'emacs-lisp-mode
+             (plist-get (caddr editor-call) :mode)))
+        (let* ((start (+ (appkit-chatbuf-input-start-position)
+                         (length "context\n")))
+               (object
+                (get-text-property
+                 start appkit-chatbuf-input-object-property))
+               (id (plist-get object :id)))
+          (should (slackit-compose--code-block-object-p object))
+          (should (equal "emacs-lisp" (plist-get object :language)))
+          (should
+           (equal "context\n```\n(message \"hello\")\n``` "
+                  (slackit-compose-serialize
+                   (appkit-chatbuf-input-state))))
+          (let* ((blocks
+                  (slackit-compose-blocks
+                   (appkit-chatbuf-input-state)))
+                 (section (car blocks))
+                 (rich (cadr blocks))
+                 (preformatted (aref (alist-get 'elements rich) 0))
+                 (code-element
+                  (aref (alist-get 'elements preformatted) 0)))
+            (should (= 2 (length blocks)))
+            (should (equal "section" (alist-get 'type section)))
+            (should
+             (equal "context\n"
+                    (alist-get 'text (alist-get 'text section))))
+            (should (equal "rich_text" (alist-get 'type rich)))
+            (should
+             (equal "rich_text_preformatted"
+                    (alist-get 'type preformatted)))
+            (should
+             (equal "emacs-lisp" (alist-get 'language preformatted)))
+            (should
+             (equal "(message \"hello\")"
+                    (alist-get 'text code-element))))
+          (goto-char start)
+          (cl-letf
+              (((symbol-function 'appkit-compose-edit-buffer)
+                (lambda (_owner initial &rest _)
+                  (should (equal "(message \"hello\")" initial))
+                  "(message \"updated\")")))
+            (slackit-compose-insert-code-block "emacs-lisp"))
+          (let ((updated
+                 (get-text-property
+                  start appkit-chatbuf-input-object-property)))
+            (should (equal id (plist-get updated :id)))
+            (should (equal "(message \"updated\")"
+                           (plist-get updated :code)))))
+          (goto-char (point-max))
+          (appkit-chatbuf-input-backward-delete 1)
+          (should (equal "context\n" (appkit-chatbuf-input-state)))
+        (should-not (slackit-compose-attachments))))))
+
+(ert-deftest slackit-contract-canceling-code-editor-preserves-draft ()
+  (slackit-test-with-app (app "composer-code-cancel")
+    (let ((state (slackit-runtime-state app))
+          view)
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-conversation
+       state '((id . "D1") (is_im . t) (user . "U1")))
+      (cl-letf (((symbol-function 'slackit-history-load-latest)
+                 (lambda (&rest _) nil)))
+        (setq view (slackit-room-open app "D1" nil)))
+      (with-current-buffer (appkit-view-buffer view)
+        (appkit-chatbuf-input-set-text "unchanged")
+        (let ((revision (appkit-chatbuf-composer-revision)))
+          (cl-letf (((symbol-function 'appkit-compose-edit-buffer)
+                     (lambda (&rest _) nil)))
+            (slackit-compose-insert-code-block "text"))
+          (should (equal "unchanged" (appkit-chatbuf-input-state)))
+          (should (= revision (appkit-chatbuf-composer-revision))))))))
+
+(ert-deftest slackit-contract-code-block-send-settles-unchanged-card ()
+  (slackit-test-with-app (app "composer-code-send")
+    (let ((state (slackit-runtime-state app))
+          view
+          success
+          posted)
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-conversation
+       state '((id . "D1") (is_im . t) (user . "U1")))
+      (cl-letf (((symbol-function 'slackit-history-load-latest)
+                 (lambda (&rest _) nil)))
+        (setq view (slackit-room-open app "D1" nil)))
+      (with-current-buffer (appkit-view-buffer view)
+        (cl-letf (((symbol-function 'appkit-compose-edit-buffer)
+                   (lambda (&rest _) "(message \"send\")")))
+          (slackit-compose-insert-code-block "emacs-lisp"))
+        (let ((revision (appkit-chatbuf-composer-revision)))
+          (cl-letf
+              (((symbol-function 'slackit-api-post-message)
+                (lambda (_app _conversation text &rest options)
+                  (setq success (plist-get options :on-success)
+                        posted
+                        (list text (plist-get options :blocks)))
+                  :request)))
+            (slackit-compose-submit))
+          (should
+           (equal "```\n(message \"send\")\n``` " (car posted)))
+          (let* ((blocks (cadr posted))
+                 (preformatted
+                  (aref (alist-get 'elements (car blocks)) 0)))
+            (should (= 1 (length blocks)))
+            (should
+             (equal "emacs-lisp" (alist-get 'language preformatted))))
+          (appkit-request-sync view :part 'frame)
+          (should (= revision (appkit-chatbuf-composer-revision)))
+          (funcall
+           success
+           '((ok . t)
+             (channel . "D1")
+             (ts . "10.000001")
+             (message
+              (ts . "10.000001")
+              (text . "``` code ```"))))
+          (appkit-sync-invalidations view)
+          (should (string-empty-p (appkit-chatbuf-input-state))))))))
+
+(ert-deftest slackit-contract-clipboard-image-is-private-and-view-owned ()
+  (slackit-test-with-app (app "composer-clipboard")
+    (let ((state (slackit-runtime-state app))
+          view path directory)
+      (slackit-state-put-team-self
+       state '((id . "T1")) '((id . "U1") (name . "self")))
+      (slackit-state-put-conversation
+       state '((id . "D1") (is_im . t) (user . "U1")))
+      (cl-letf (((symbol-function 'slackit-history-load-latest)
+                 (lambda (&rest _) nil)))
+        (setq view (slackit-room-open app "D1" nil)))
+      (with-current-buffer (appkit-view-buffer view)
+        (cl-letf (((symbol-function 'gui-get-selection)
+                   (lambda (&rest _) "private-image-bytes")))
+          (slackit-compose-attach-clipboard-image "diagram"))
+        (let ((attachment (car (slackit-compose-attachments))))
+          (setq path (plist-get attachment :path)
+                directory (file-name-directory path))
+          (should (eq 'image (plist-get attachment :kind)))
+          (should (equal "diagram" (plist-get attachment :alt-text)))
+          (should (= #o600 (file-modes path)))
+          (should (= #o700 (file-modes (directory-file-name directory))))
+          (slackit-compose-remove-attachment attachment)))
+      (should-not (file-exists-p path))
+      (should-not (file-directory-p directory)))))
 
 (ert-deftest slackit-contract-composer-upload-is-one-appkit-owned-share ()
   (slackit-test-with-app (app "composer-upload")
@@ -740,7 +973,7 @@
             (with-current-buffer (appkit-view-buffer view)
               (appkit-chatbuf-input-set-text "caption")
               (goto-char (point-max))
-              (slackit-compose-attach-file file)
+              (slackit-compose-attach-image file "fixture diagram")
               (should (= 1 (length (slackit-compose-attachments))))
               (should
                (equal "caption"
@@ -749,7 +982,10 @@
               (cl-letf
                   (((symbol-function 'slackit-api-get-upload-url)
                     (lambda (_app filename length &rest options)
-                      (setq negotiated (list filename length))
+                      (setq negotiated
+                            (list filename length
+                                  (plist-get options :snippet-type)
+                                  (plist-get options :alt-text)))
                       (funcall
                        (plist-get options :on-success)
                        '((ok . t)
@@ -773,8 +1009,11 @@
                       (funcall (plist-get options :on-success) '((ok . t)))
                       :complete)))
                 (slackit-compose-submit))
-              (should (equal (list (file-name-nondirectory file) 3)
-                             negotiated))
+              (should
+               (equal
+                (list (file-name-nondirectory file)
+                      3 nil "fixture diagram")
+                negotiated))
               (should (eq view (car streamed)))
               (should
                (equal "https://files.slack.com/upload/v1/TEST"
