@@ -366,20 +366,146 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
      :help-echo-function
      (apply-partially #'slackit-render--reaction-help self-id))))
 
+(defun slackit-render--sequence (value)
+  "Return protocol sequence VALUE as a list."
+  (cond
+   ((vectorp value) (append value nil))
+   ((listp value) value)
+   (t nil)))
+
+(defun slackit-render--rich-code-message-p (message)
+  "Return non-nil when MESSAGE owns a rich preformatted code element."
+  (cl-some
+   (lambda (block)
+     (and
+      (equal "rich_text" (slackit-normalize-get block 'type))
+      (cl-some
+       (lambda (element)
+         (equal "rich_text_preformatted"
+                (slackit-normalize-get element 'type)))
+       (slackit-render--sequence
+        (slackit-normalize-get block 'elements)))))
+   (slackit-render--sequence
+    (slackit-normalize-get message 'blocks))))
+
+(defun slackit-render--rich-preformatted-text (element)
+  "Return exact source text owned by preformatted rich ELEMENT."
+  (mapconcat
+   (lambda (part)
+     (pcase (slackit-normalize-get part 'type)
+       ("text" (or (slackit-normalize-get part 'text) ""))
+       ("link" (or (slackit-normalize-get part 'text)
+                   (slackit-normalize-get part 'url)
+                   ""))
+       (_ "")))
+   (slackit-render--sequence
+    (slackit-normalize-get element 'elements))
+   ""))
+
+(defun slackit-render--insert-rich-inline (app state element)
+  "Insert one supported rich-text inline ELEMENT for APP through STATE."
+  (pcase (slackit-normalize-get element 'type)
+    ("text"
+     (insert
+      (slackit-emoji-substitute
+       app (or (slackit-normalize-get element 'text) "")))
+     t)
+    ("user"
+     (when-let* ((id (slackit-normalize-get element 'user_id)))
+       (slackit-render--insert-reference app state (concat "@" id))
+       t))
+    ("channel"
+     (when-let* ((id (slackit-normalize-get element 'channel_id)))
+       (slackit-render--insert-reference app state (concat "#" id))
+       t))
+    ("link"
+     (let ((url (slackit-normalize-get element 'url))
+           (label (or (slackit-normalize-get element 'text)
+                      (slackit-normalize-get element 'url)
+                      "")))
+       (slackit-render--insert-link label url)
+       t))
+    ("emoji"
+     (when-let* ((name (slackit-normalize-get element 'name)))
+       (insert (or (slackit-emoji-display-string app name)
+                   (format ":%s:" name)))
+       t))
+    (_ nil)))
+
+(defun slackit-render--insert-code-rich-blocks (app state message)
+  "Insert code-rich canonical MESSAGE blocks for APP through STATE."
+  (let ((inserted-p nil)
+        (first-p t))
+    (cl-labels
+        ((start-block
+          ()
+          (unless first-p
+            (unless (bolp) (insert "\n")))
+          (setq first-p nil))
+         (insert-section-elements
+          (elements)
+          (start-block)
+          (dolist (element (slackit-render--sequence elements))
+            (setq inserted-p
+                  (or (slackit-render--insert-rich-inline
+                       app state element)
+                      inserted-p))))
+         (insert-preformatted
+          (element)
+          (start-block)
+          (let ((code
+                 (slackit-render--rich-preformatted-text element))
+                (language
+                 (slackit-normalize-get element 'language)))
+            (insert (slackit-code-block-string app code language))
+            (setq inserted-p t))))
+      (dolist
+          (block
+           (slackit-render--sequence
+            (slackit-normalize-get message 'blocks)))
+        (pcase (slackit-normalize-get block 'type)
+          ("section"
+           (when-let* ((text-object
+                        (slackit-normalize-get block 'text))
+                       (text (slackit-normalize-get text-object 'text)))
+             (start-block)
+             (if (equal "mrkdwn"
+                        (slackit-normalize-get text-object 'type))
+                 (slackit-render-insert-text app state text)
+               (insert text))
+             (setq inserted-p t)))
+          ("rich_text"
+           (dolist
+               (element
+                (slackit-render--sequence
+                 (slackit-normalize-get block 'elements)))
+             (pcase (slackit-normalize-get element 'type)
+               ("rich_text_section"
+                (insert-section-elements
+                 (slackit-normalize-get element 'elements)))
+               ("rich_text_preformatted"
+                (insert-preformatted element))))))))
+    inserted-p))
+
 (defun slackit-render--insert-primary-content (app state message)
-  "Insert MESSAGE subtype marker and primary content for APP from STATE."
+  "Insert MESSAGE subtype marker and canonical primary content."
   (let ((text (or (slackit-normalize-get message 'text) ""))
-        (subtype (slackit-normalize-get message 'subtype)))
+        (subtype (slackit-normalize-get message 'subtype))
+        (code-rich-p (slackit-render--rich-code-message-p message)))
     (when (and subtype
                (not (member subtype '("thread_broadcast" "me_message"))))
       (insert (propertize (format "[%s] " subtype) 'face 'slackit-status)))
-    (if (string-empty-p text)
-        (when (and (slackit-normalize-get message 'blocks)
-                   (not (slackit-media-message-media-only-p message)))
-          (insert (propertize "[Unsupported Block Kit content]"
-                              'face 'slackit-status)))
-      (when (equal subtype "me_message") (insert "* "))
-      (slackit-render-insert-text app state text message))))
+    (when (equal subtype "me_message") (insert "* "))
+    (cond
+     (code-rich-p
+      (unless (slackit-render--insert-code-rich-blocks app state message)
+        (slackit-render-insert-text app state text message)))
+     ((not (string-empty-p text))
+      (slackit-render-insert-text app state text message))
+     ((and (slackit-normalize-get message 'blocks)
+           (not (slackit-media-message-media-only-p message)))
+      (insert (propertize "[Unsupported Block Kit content]"
+                          'face 'slackit-status))))))
 
 (defun slackit-render--insert-heading
     (app state message sender timestamp header-prefix body-rest-prefix)

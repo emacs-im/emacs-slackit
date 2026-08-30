@@ -302,10 +302,15 @@ Slack =:emoji:= tokens from stable protocol identities.  Message bodies and
 actionable reaction chips share the same display resolver while canonical text
 and reaction names remain unchanged for copy and wire operations.
 
-Inline code is fixed-pitch.  Fenced code additionally uses native Font Lock
-when Slack supplies an exact language for a matching Block Kit
-=rich_text_preformatted= element or a language-tagged Markdown fence.
-=slackit-code.el= resolves that protocol language through the public
+Inline code is fixed-pitch.  A message containing canonical
+=rich_text_preformatted= elements renders its ordered Block Kit source directly:
+rich-text sections retain block order and each preformatted element preserves
+its exact multiline text and explicit language.  Top-level =text= is not
+rendered over that canonical structure; it remains a transport/accessibility
+fallback.  Older fenced fallback text continues through exact ordered
+descriptor matching.
+
+=slackit-code.el= resolves a protocol language through the public
 =org-src-get-lang-mode-if-bound= API, so installed modes and Emacs major-mode
 remapping remain authoritative.  It never infers a language from code content
 or conversation names; missing and unsupported languages stay fixed-pitch.

@@ -2502,9 +2502,54 @@
         (should (slackit-code-cache-p right-cache))
         (should-not (eq left-cache right-cache))
         (slackit-runtime-stop-account left)
+
         (should-not (gethash left slackit-code--app-caches))
         (should (eq right-cache
                     (gethash right slackit-code--app-caches)))))))
+(ert-deftest slackit-contract-rich-code-renders-canonical-multiline-block ()
+  (slackit-test-with-app (app "rich-code-render")
+    (let* ((state (slackit-runtime-state app))
+           (fallback "fallback must not be rendered")
+           (code "(message \"one\")\n(message \"two\")")
+           (before
+            '((type . "rich_text_section")
+              (elements . (((type . "text") (text . "before"))))))
+           (preformatted
+            (list
+             (cons 'type "rich_text_preformatted")
+             (cons 'language "emacs-lisp")
+             (cons 'border 0)
+             (cons
+              'elements
+              (list (list (cons 'type "text") (cons 'text code))))))
+           (after
+            '((type . "rich_text_section")
+              (elements . (((type . "text") (text . "after"))))))
+           (rich
+            (list (cons 'type "rich_text")
+                  (cons 'elements (list before preformatted after))))
+           (message
+            (list (cons 'text fallback)
+                  (cons 'blocks (list rich)))))
+      (with-temp-buffer
+        (slackit-render--insert-primary-content app state message)
+        (should
+         (equal
+          (concat "before\n" code "\nafter")
+          (substring-no-properties (buffer-string))))
+        (should-not (string-match-p "fallback" (buffer-string)))
+        (goto-char (point-min))
+        (should (search-forward "(message \"one\")" nil t))
+        (let ((position (match-beginning 0)))
+          (should (eq 'block
+                      (get-text-property position 'slackit-code-kind)))
+          (should
+           (equal "emacs-lisp"
+                  (get-text-property position 'slackit-code-language)))
+          (should
+           (eq 'emacs-lisp-mode
+               (get-text-property position 'slackit-code-mode)))))
+      (should (equal fallback (slackit-normalize-get message 'text))))))
 (ert-deftest slackit-contract-code-mode-resolution-is-emacs-owned ()
   (should (eq 'emacs-lisp-mode
               (slackit-code-mode-for-language "elisp")))
