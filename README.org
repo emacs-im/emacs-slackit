@@ -7,8 +7,9 @@ includes multi-account roots, room/thread history, exact user profiles and
 direct-message entry, realtime updates, semantic =RET=/mouse action spans,
 structured mentions, circular avatars, standard and workspace emoji,
 protocol-led native code highlighting, reaction chips, account-isolated
-image/video/audio/document media, send/edit/delete, explicit read marking,
-optional Evil integration, and context-safe Transient menus.
+image/video/audio/document media, Appkit-owned composer file uploads,
+send/edit/delete, explicit read marking, optional Evil integration, and
+context-safe Transient menus.
 
 Slackit requires Emacs 29.1, =browser-session=, =transient=, and the
 =browser-session= helper executable.  Configure optional stable IDs in

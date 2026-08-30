@@ -414,14 +414,31 @@ the same exact view scope.
 
 The composer serializes ordinary text plus structured =@user= and =#channel=
 objects to exact Slack ID forms.  Candidate labels are account-local and
-collision-safe; display text is never the wire identity.  The same composer
-auxiliary state supports a plain room send, a thread reply, and editing one
-owned message.  It does not implement rich WYSIWYG or Block Kit authoring.
+collision-safe; display text is never the wire identity.  Local files use the
+same Appkit atomic input-object boundary as Telega-style attachments: the safe
+name/type/size label is editable composer presentation, while the local path
+remains Slackit-owned object data and never becomes message text.  The same
+composer auxiliary state supports a plain room send, a thread reply, and
+editing one owned message.  Attachments are accepted for room sends and thread
+replies, not message edits.  It does not implement rich WYSIWYG or Block Kit
+authoring.
 
-Each operation freezes its semantic input and Appkit composer revision while
-the account-owned request is in flight.  Success clears or exits the operation
-only if that same revision is still current; failure leaves the draft editable
-and displays the real Slack error.
+Text writes freeze their semantic input and Appkit composer revision while the
+account-owned request is in flight.  File sends additionally use one
+=appkit-compose= operation for generation fencing, status/progress rendering,
+and cancellation.  Slackit then runs the protocol-owned sequence
+=files.getUploadURLExternal= → credential-free multipart capability upload →
+=files.completeUploadExternal=.  Capability URLs must be exact HTTPS
+=files.slack.com/upload/v1/= values; the streaming curl process receives no
+bearer or cookie, never redirects or retries, and keeps the URL/path out of its
+argv.  Several files upload in order and complete as one channel/thread share
+with the captured text as =initial_comment=.  Cancellation retains the atomic
+draft.  A completion failure is treated as an unknown remote outcome and is
+never replayed automatically.
+
+Success clears or exits the operation only if that same chatbuf revision is
+still current; failure leaves the draft editable and displays a redacted Slack
+error.
 
 The HTTP response and matching realtime event may arrive in either order.  Send
 and edit converge through the server =(conversation-id . ts)= reducer; delete
@@ -463,7 +480,8 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-root.el= | Appkit directory projection and account root commands |
 | =slackit-room.el= | Room view assembly, invalidation sync, timeline projection |
 | =slackit-history.el= | Initial/older paging and exact Appkit history-window transitions |
-| =slackit-compose.el= | Draft/aux capture, structured serialization, send/edit settlement |
+| =slackit-compose.el= | Draft/aux capture, atomic file objects, Appkit upload operation, send/edit settlement |
+| =slackit-upload.el= | Exact Slack capability validation, credential-free streaming multipart upload, progress/cancel |
 | =slackit-completion.el= | Account-local user/channel candidates and structured insertion |
 | =slackit-avatar.el= | Credential-free profile image acquisition, private disk cache, resource invalidation |
 | =slackit-emoji.el= | Standard/workspace shortnames, aliases, completion, custom-image resources |

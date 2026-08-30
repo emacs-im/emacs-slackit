@@ -272,6 +272,15 @@ GET requests explicitly marked IDEMPOTENT-P may retry a 429 response."
          (signal (car error-data) (cdr error-data)))))
     request))
 
+(defun slackit-http-cancel (request)
+  "Cancel live Slack HTTP REQUEST without publishing a transport outcome."
+  (when (and (slackit-http-request-p request)
+             (slackit-http-request-active-p request))
+    (if-let* ((handle (slackit-http-request-handle request)))
+        (appkit-cancel-handle handle)
+      (slackit-http--cancel-request request))
+    t))
+
 (provide 'slackit-http)
 
 ;;; slackit-http.el ends here

@@ -11,6 +11,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'subr-x)
 (require 'slackit-http)
 (require 'slackit-normalize)
@@ -165,6 +166,38 @@ OWNER, when non-nil, owns cancellation of this non-retried write."
    :parameters `((channel . ,conversation-id)
                  (text . ,text)
                  ,@(and thread-ts `((thread_ts . ,thread-ts))))
+   :on-success on-success
+   :on-error on-error))
+
+(cl-defun slackit-api-get-upload-url
+    (app filename length &key owner on-success on-error)
+  "Negotiate one external Slack upload for FILENAME containing LENGTH bytes."
+  (slackit-api-request
+   app "files.getUploadURLExternal"
+   :method 'post
+   :parameters `((filename . ,filename) (length . ,length))
+   :owner (or owner app)
+   :on-success on-success
+   :on-error on-error))
+
+(cl-defun slackit-api-complete-upload
+    (app files conversation-id
+         &key thread-ts initial-comment owner on-success on-error)
+  "Finalize uploaded FILES and share them into CONVERSATION-ID.
+
+FILES is an ordered list of alists carrying Slack file `id' and optional
+`title'.  INITIAL-COMMENT may be empty for an attachment-only message."
+  (slackit-api-request
+   app "files.completeUploadExternal"
+   :method 'post
+   :parameters
+   `((files . ,(json-serialize (vconcat files)))
+     (channel_id . ,conversation-id)
+     ,@(and thread-ts `((thread_ts . ,thread-ts)))
+     ,@(and (stringp initial-comment)
+            (not (string-empty-p initial-comment))
+            `((initial_comment . ,initial-comment))))
+   :owner (or owner app)
    :on-success on-success
    :on-error on-error))
 

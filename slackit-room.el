@@ -30,6 +30,12 @@
 (declare-function slackit-compose-submit "slackit-compose" ())
 (declare-function slackit-compose-apply-settlement "slackit-compose" (event))
 (declare-function slackit-compose-cancel-context "slackit-compose" ())
+(declare-function slackit-compose-setup "slackit-compose" ())
+(declare-function slackit-compose-attach-file "slackit-compose" (file))
+(declare-function slackit-compose-remove-attachment "slackit-compose"
+                  (&optional attachment))
+(declare-function slackit-compose-cancel-dwim "slackit-compose" ())
+(declare-function slackit-compose-upload-card "slackit-compose" ())
 (declare-function slackit-completion-user "slackit-completion" ())
 (declare-function slackit-completion-channel "slackit-completion" ())
 (declare-function slackit-completion-setup "slackit-completion" ())
@@ -114,6 +120,9 @@
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "C-c C-c") #'slackit-compose-submit)
+    (define-key map (kbd "C-c C-a") #'slackit-compose-attach-file)
+    (define-key map (kbd "C-c C-d") #'slackit-compose-remove-attachment)
+    (define-key map (kbd "C-c C-k") #'slackit-compose-cancel-dwim)
     (define-key map (kbd "C-c C-o") #'slackit-room-load-older)
     (define-key map (kbd "C-c C-u") #'slackit-completion-user)
     (define-key map (kbd "C-c #") #'slackit-completion-channel)
@@ -128,6 +137,7 @@
   "Writable Slackit room with an Appkit timeline and composer."
   (slackit-history-init)
   (slackit-completion-setup)
+  (slackit-compose-setup)
   (setq-local appkit-chatbuf-input-sync-function
               #'appkit-chatbuf-input-state-sync)
   (appkit-chatbuf-use-timeline-mode #'slackit-room-timeline-mode))
@@ -142,6 +152,7 @@
 (defun slackit-room--footer ()
   "Return exact history status footer for the current room."
   (concat
+   (slackit-compose-upload-card)
    (when (appkit-chatbuf-aux-active-p)
      (appkit-chatbuf-aux-render
       :title (or (plist-get (appkit-chatbuf-aux-state) :title)

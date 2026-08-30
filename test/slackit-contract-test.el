@@ -663,6 +663,180 @@
     (should (equal "hello <@U111> and <#C222> &lt;&amp;&gt;"
                    (slackit-compose-serialize input)))))
 
+(ert-deftest slackit-contract-upload-capability-is-exact-and-credential-free ()
+  (let* ((file (make-temp-file "slackit-upload-contract-" nil ".png"))
+         (url "https://files.slack.com/upload/v1/SAFE-CAPABILITY")
+         config)
+    (unwind-protect
+        (progn
+          (write-region "png" nil file nil 'silent)
+          (should (slackit-upload-url-p url))
+          (dolist (rejected
+                   '("http://files.slack.com/upload/v1/x"
+                     "https://files.slack.com.evil.invalid/upload/v1/x"
+                     "https://files.slack.com/files-pri/x"
+                     "https://user@files.slack.com/upload/v1/x"
+                     "https://files.slack.com/upload/v1/x#fragment"))
+            (should-not (slackit-upload-url-p rejected)))
+          (setq config (slackit-upload--curl-config url file))
+          (should (string-match-p (regexp-quote url) config))
+          (should (string-match-p (regexp-quote file) config))
+          (should-not (string-match-p "Authorization\\|Cookie\\|xox" config))
+          (should (member "--max-redirs" slackit-upload--curl-args))
+          (should (member "--retry" slackit-upload--curl-args))
+          (should-not (member url slackit-upload--curl-args))
+          (should-not (member file slackit-upload--curl-args)))
+      (when (file-exists-p file) (delete-file file)))))
+
+(ert-deftest slackit-contract-upload-api-encodes-one-threaded-file-share ()
+  (let (calls)
+    (cl-letf (((symbol-function 'slackit-api-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 :request)))
+      (slackit-api-get-upload-url
+       :app "fixture.png" 3 :owner :view)
+      (slackit-api-complete-upload
+       :app '(((id . "F1") (title . "fixture.png")))
+       "D1" :thread-ts "1.000001" :initial-comment "caption"
+       :owner :view))
+    (pcase-let* ((`(,complete ,negotiate) calls)
+                 (complete-params (plist-get (cddr complete) :parameters))
+                 (files-json (alist-get 'files complete-params)))
+      (should (equal (cadr negotiate) "files.getUploadURLExternal"))
+      (should (equal 'post (plist-get (cddr negotiate) :method)))
+      (should (equal '((filename . "fixture.png") (length . 3))
+                     (plist-get (cddr negotiate) :parameters)))
+      (should (equal (cadr complete) "files.completeUploadExternal"))
+      (should (equal "D1" (alist-get 'channel_id complete-params)))
+      (should (equal "1.000001" (alist-get 'thread_ts complete-params)))
+      (should (equal "caption" (alist-get 'initial_comment complete-params)))
+      (should
+       (equal "F1"
+              (alist-get
+               'id
+               (car
+                (json-parse-string
+                 files-json :object-type 'alist :array-type 'list))))))))
+
+(ert-deftest slackit-contract-composer-upload-is-one-appkit-owned-share ()
+  (slackit-test-with-app (app "composer-upload")
+    (let* ((state (slackit-runtime-state app))
+           (file (make-temp-file "slackit-composer-contract-" nil ".png"))
+           view
+           negotiated
+           streamed
+           completed)
+      (unwind-protect
+          (progn
+            (write-region "png" nil file nil 'silent)
+            (slackit-state-put-team-self
+             state '((id . "T1")) '((id . "U1") (name . "self")))
+            (slackit-state-put-conversation
+             state '((id . "D1") (is_im . t) (user . "U1")))
+            (cl-letf (((symbol-function 'slackit-history-load-latest)
+                       (lambda (&rest _) nil)))
+              (setq view (slackit-room-open app "D1" nil)))
+            (with-current-buffer (appkit-view-buffer view)
+              (appkit-chatbuf-input-set-text "caption")
+              (goto-char (point-max))
+              (slackit-compose-attach-file file)
+              (should (= 1 (length (slackit-compose-attachments))))
+              (should
+               (equal "caption"
+                      (slackit-compose-serialize
+                       (appkit-chatbuf-input-state))))
+              (cl-letf
+                  (((symbol-function 'slackit-api-get-upload-url)
+                    (lambda (_app filename length &rest options)
+                      (setq negotiated (list filename length))
+                      (funcall
+                       (plist-get options :on-success)
+                       '((ok . t)
+                         (upload_url
+                          . "https://files.slack.com/upload/v1/TEST")
+                         (file_id . "F1")))
+                      :negotiate))
+                   ((symbol-function 'slackit-upload-file)
+                    (lambda (_app owner url path &rest options)
+                      (setq streamed (list owner url path))
+                      (funcall (plist-get options :on-progress) :transfer 0.5)
+                      (funcall (plist-get options :on-success) :transfer)
+                      :transfer))
+                   ((symbol-function 'slackit-api-complete-upload)
+                    (lambda (_app files conversation-id &rest options)
+                      (setq completed
+                            (list files conversation-id
+                                  (plist-get options :thread-ts)
+                                  (plist-get options :initial-comment)
+                                  (plist-get options :owner)))
+                      (funcall (plist-get options :on-success) '((ok . t)))
+                      :complete)))
+                (slackit-compose-submit))
+              (should (equal (list (file-name-nondirectory file) 3)
+                             negotiated))
+              (should (eq view (car streamed)))
+              (should
+               (equal "https://files.slack.com/upload/v1/TEST"
+                      (cadr streamed)))
+              (should (equal file (caddr streamed)))
+              (should
+               (equal
+                (list
+                 (list
+                  (list (cons 'id "F1")
+                        (cons 'title (file-name-nondirectory file))))
+                 "D1" nil "caption" view)
+                completed))
+              (should-not (appkit-compose-operation-active-p))
+              (let ((event
+                     (car (appkit-view-pending-events-snapshot view))))
+                (should (eq 'compose-success (plist-get event :kind)))
+                (slackit-compose-apply-settlement event))
+              (should (string-empty-p (appkit-chatbuf-input-state)))
+              (should-not (slackit-compose-attachments))))
+        (when (file-exists-p file) (delete-file file))))))
+
+(ert-deftest slackit-contract-canceling-upload-retains-atomic-draft ()
+  (slackit-test-with-app (app "composer-upload-cancel")
+    (let* ((state (slackit-runtime-state app))
+           (file (make-temp-file "slackit-composer-cancel-" nil ".png"))
+           view
+           request
+           canceled)
+      (unwind-protect
+          (progn
+            (write-region "png" nil file nil 'silent)
+            (slackit-state-put-team-self
+             state '((id . "T1")) '((id . "U1") (name . "self")))
+            (slackit-state-put-conversation
+             state '((id . "D1") (is_im . t) (user . "U1")))
+            (cl-letf (((symbol-function 'slackit-history-load-latest)
+                       (lambda (&rest _) nil)))
+              (setq view (slackit-room-open app "D1" nil)))
+            (with-current-buffer (appkit-view-buffer view)
+              (goto-char (point-max))
+              (slackit-compose-attach-file file)
+              (cl-letf
+                  (((symbol-function 'slackit-api-get-upload-url)
+                    (lambda (&rest _)
+                      (setq request :negotiating)
+                      request))
+                   ((symbol-function 'slackit-http-cancel)
+                    (lambda (current)
+                      (setq canceled current)
+                      t)))
+                (slackit-compose-submit)
+                (should (slackit-compose-upload-active-p))
+                (should (string-match-p
+                         "Preparing"
+                         (slackit-compose-upload-card)))
+                (slackit-compose-cancel-upload))
+              (should (eq :negotiating canceled))
+              (should-not (appkit-compose-operation-active-p))
+              (should (= 1 (length (slackit-compose-attachments))))))
+        (when (file-exists-p file) (delete-file file))))))
+
 (ert-deftest slackit-contract-reaction-intent-is-serialized-and-event-owned ()
   (slackit-test-with-app (app "reaction")
     (let* ((state (slackit-runtime-state app))

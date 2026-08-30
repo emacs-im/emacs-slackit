@@ -268,12 +268,13 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
         (not (eq (car-safe (slackit-transient-scope-view-id scope)) 'room)))))
 
 (defun slackit-transient--room-cancel-inapt-p ()
-  "Return non-nil when the captured composer has no edit/reply context."
+  "Return non-nil when the captured composer has nothing to cancel."
   (let ((scope (slackit-transient--prefix-scope 'slackit-room-transient)))
     (or (not (slackit-transient--room-view-valid-p scope))
         (with-current-buffer
             (appkit-view-buffer (slackit-transient-scope-view scope))
-          (not (appkit-chatbuf-aux-active-p))))))
+          (and (not (slackit-compose-upload-active-p))
+               (not (appkit-chatbuf-aux-active-p)))))))
 
 (defun slackit-transient--actions-message-inapt-p ()
   "Return non-nil when the actions prefix has lost its message."
@@ -491,11 +492,25 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (interactive (list (slackit-transient--room-scope)))
   (slackit-transient--call-in-view scope #'slackit-compose-submit))
 
+(transient-define-suffix slackit-transient-room-attach-file (scope)
+  "Attach one local file to the exact captured view's composer."
+  :inapt-if #'slackit-transient--room-inapt-p
+  (interactive (list (slackit-transient--room-scope)))
+  (slackit-transient--call-in-view
+   scope (lambda () (call-interactively #'slackit-compose-attach-file))))
+
+(transient-define-suffix slackit-transient-room-remove-attachment (scope)
+  "Remove one attachment from the exact captured view's composer."
+  :inapt-if #'slackit-transient--room-inapt-p
+  (interactive (list (slackit-transient--room-scope)))
+  (slackit-transient--call-in-view
+   scope #'slackit-compose-remove-attachment))
+
 (transient-define-suffix slackit-transient-room-cancel-context (scope)
-  "Clear the exact captured view's reply or edit context."
+  "Cancel the captured view's upload or reply/edit context."
   :inapt-if #'slackit-transient--room-cancel-inapt-p
   (interactive (list (slackit-transient--room-scope)))
-  (slackit-transient--call-in-view scope #'slackit-compose-cancel-context))
+  (slackit-transient--call-in-view scope #'slackit-compose-cancel-dwim))
 
 (transient-define-suffix slackit-transient-room-quit-window (scope)
   "Quit the exact room view window."
@@ -725,7 +740,9 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     ("o" "Load older" slackit-transient-room-load-older)]
    ["Composer"
     ("c" "Send" slackit-transient-room-submit)
-    ("k" "Clear edit/reply context" slackit-transient-room-cancel-context)]
+    ("a" "Attach file" slackit-transient-room-attach-file)
+    ("d" "Remove attachment" slackit-transient-room-remove-attachment)
+    ("k" "Cancel upload/context" slackit-transient-room-cancel-context)]
    ["View"
     ("q" "Quit window" slackit-transient-room-quit-window)
     ("?" "Describe mode" slackit-transient-room-describe-mode)]]

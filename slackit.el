@@ -29,6 +29,7 @@
 (require 'slackit-realtime)
 (require 'slackit-history)
 (require 'slackit-emoji)
+(require 'slackit-upload)
 (require 'slackit-media)
 (require 'slackit-code)
 (require 'slackit-render)
