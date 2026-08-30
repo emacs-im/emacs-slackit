@@ -12,7 +12,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
-(require 'slackit-normalize)
+(require 'slackit-decode)
 
 (cl-defstruct (slackit-account-state
                (:constructor slackit-state--create))
@@ -101,18 +101,18 @@
 
 (defun slackit-state-put-team-self (state team self)
   "Store normalized TEAM and SELF facts in STATE."
-  (setf (slackit-account-state-team state) (slackit-normalize-object team)
-        (slackit-account-state-self state) (slackit-normalize-user self))
+  (setf (slackit-account-state-team state) (copy-tree team)
+        (slackit-account-state-self state) (slackit-decode-user self))
   (slackit-state--touch state))
 
 (defun slackit-state-self-id (state)
   "Return the current user's Slack ID in STATE."
-  (slackit-normalize-get (slackit-account-state-self state) 'id))
+  (alist-get 'id (slackit-account-state-self state)))
 
 (defun slackit-state-put-user (state user)
   "Upsert normalized Slack USER into STATE and return its ID."
-  (let* ((normalized (slackit-normalize-user user))
-         (id (slackit-normalize-get normalized 'id)))
+  (let* ((normalized (slackit-decode-user user))
+         (id (alist-get 'id normalized)))
     (when (and id (not (string-empty-p id)))
       (puthash id normalized (slackit-account-state-users state))
       (slackit-state--touch state)
@@ -151,13 +151,13 @@
 (defun slackit-state-user-name (state user-id)
   "Return a stable display name for USER-ID in STATE."
   (let* ((user (slackit-state-user state user-id))
-         (profile (slackit-normalize-get user 'profile)))
+         (profile (alist-get 'profile user)))
     (or (cl-loop
          for value in
-         (list (slackit-normalize-get profile 'display_name)
-               (slackit-normalize-get profile 'real_name)
-               (slackit-normalize-get user 'real_name)
-               (slackit-normalize-get user 'name)
+         (list (alist-get 'display_name profile)
+               (alist-get 'real_name profile)
+               (alist-get 'real_name user)
+               (alist-get 'name user)
                user-id)
          when (and (stringp value) (not (string-blank-p value)))
          return value)
@@ -172,8 +172,8 @@
 
 (defun slackit-state-put-conversation (state conversation)
   "Upsert Slack CONVERSATION into STATE and return its ID."
-  (let* ((normalized (slackit-normalize-conversation conversation))
-         (id (slackit-normalize-get normalized 'id))
+  (let* ((normalized (slackit-decode-conversation conversation))
+         (id (alist-get 'id normalized))
          (old (and id (gethash id (slackit-account-state-conversations state)))))
     (when (and id (not (string-empty-p id)))
       (puthash id (if old
@@ -184,7 +184,7 @@
         (setf (slackit-account-state-conversation-order state)
               (append (slackit-account-state-conversation-order state)
                       (list id))))
-      (when-let* ((last-read (slackit-normalize-get normalized 'last_read)))
+      (when-let* ((last-read (alist-get 'last_read normalized)))
         (slackit-state-mark-read state id (format "%s" last-read)))
       (slackit-state--touch state)
       id)))
@@ -207,20 +207,20 @@
    (lambda (conversation-id)
      (let ((conversation
             (slackit-state-conversation state conversation-id)))
-       (and (slackit-normalize-get conversation 'is_im)
-            (not (slackit-normalize-get conversation 'is_archived))
+       (and (alist-get 'is_im conversation)
+            (not (alist-get 'is_archived conversation))
             (equal user-id
-                   (slackit-normalize-get conversation 'user)))))
+                   (alist-get 'user conversation)))))
    (slackit-account-state-conversation-order state)))
 
 
 (defun slackit-state-conversation-name (state conversation-id)
   "Return display name for CONVERSATION-ID in STATE."
   (let* ((conversation (slackit-state-conversation state conversation-id))
-         (user-id (slackit-normalize-get conversation 'user)))
+         (user-id (alist-get 'user conversation)))
     (cond
-     ((slackit-normalize-get conversation 'name)
-      (slackit-normalize-get conversation 'name))
+     ((alist-get 'name conversation)
+      (alist-get 'name conversation))
      (user-id (slackit-state-user-name state (format "%s" user-id)))
      (conversation-id conversation-id)
      (t "unknown"))))
@@ -230,8 +230,8 @@
   (let ((conversation
          (slackit-state-conversation state conversation-id))
         (name (slackit-state-conversation-name state conversation-id)))
-    (if (or (slackit-normalize-get conversation 'is_im)
-            (slackit-normalize-get conversation 'is_mpim))
+    (if (or (alist-get 'is_im conversation)
+            (alist-get 'is_mpim conversation))
         name
       (concat "#" name))))
 
@@ -241,8 +241,8 @@
    (lambda (id)
      (let ((conversation (slackit-state-conversation state id)))
        (and conversation
-            (not (slackit-normalize-get conversation 'is_archived))
-            (not (eq (slackit-normalize-get conversation 'is_member :missing)
+            (not (alist-get 'is_archived conversation))
+            (not (eq (alist-get 'is_member conversation :missing)
                      nil)))))
    (slackit-account-state-conversation-order state)))
 
@@ -286,7 +286,7 @@
   "Remove OLD message TS from all STATE indexes."
   (slackit-state--index-remove
    (slackit-account-state-top-level state) conversation-id ts)
-  (when-let* ((root-ts (slackit-normalize-get old 'thread_ts)))
+  (when-let* ((root-ts (alist-get 'thread_ts old)))
     (slackit-state--index-remove
      (slackit-account-state-replies state)
      (cons conversation-id root-ts)
@@ -294,8 +294,8 @@
 
 (defun slackit-state--add-message-indexes (state conversation-id ts message)
   "Add MESSAGE TS to its STATE projection indexes."
-  (let* ((thread-ts (slackit-normalize-get message 'thread_ts))
-         (subtype (slackit-normalize-get message 'subtype))
+  (let* ((thread-ts (alist-get 'thread_ts message))
+         (subtype (alist-get 'subtype message))
          (reply-p (and thread-ts (not (equal thread-ts ts))))
          (top-level-p (or (not reply-p) (equal subtype "thread_broadcast"))))
     (when top-level-p
@@ -318,7 +318,7 @@
 
 REVISION, when non-nil, is the page settlement revision applied to the
 message; ordinary realtime and write results allocate a new revision."
-  (let ((ts (slackit-normalize-get normalized 'ts)))
+  (let ((ts (alist-get 'ts normalized)))
     (when (and conversation-id ts)
       (let* ((table (slackit-state--message-table state conversation-id t))
              (old (gethash ts table))
@@ -347,7 +347,7 @@ Return a canonical change descriptor.  REVISION, when non-nil, is the page
 settlement revision; ordinary realtime and write results allocate one."
   (slackit-state--upsert-normalized-message
    state conversation-id
-   (slackit-normalize-message message conversation-id)
+   (slackit-decode-message message conversation-id)
    revision))
 
 (defun slackit-state-message-revision (state conversation-id ts)
@@ -363,8 +363,8 @@ settlement revision; ordinary realtime and write results allocate one."
 CAPTURED-REVISION is the target message revision observed when an edit began.
 For a newly posted message it is nil, so an RTM echo that arrived first remains
 authoritative.  No HTTP write response may clear an observed tombstone."
-  (let* ((normalized (slackit-normalize-message message conversation-id))
-         (ts (slackit-normalize-get normalized 'ts))
+  (let* ((normalized (slackit-decode-message message conversation-id))
+         (ts (alist-get 'ts normalized))
          (key (and ts (slackit-state--message-key conversation-id ts)))
          (current-revision
           (and key
@@ -399,15 +399,15 @@ authoritative.  No HTTP write response may clear an observed tombstone."
       (list :kind 'message-delete
             :conversation-id conversation-id
             :ts ts
-            :root-ts (and old (slackit-normalize-get old 'thread_ts))))))
+            :root-ts (and old (alist-get 'thread_ts old))))))
 
 (defun slackit-state-merge-message-page (state conversation-id messages captured-revision)
   "Merge history MESSAGES without crossing CAPTURED-REVISION mutations."
   (let ((page-revision (slackit-state--touch state))
         changes)
     (dolist (message messages (nreverse changes))
-      (let* ((normalized (slackit-normalize-message message conversation-id))
-             (ts (slackit-normalize-get normalized 'ts))
+      (let* ((normalized (slackit-decode-message message conversation-id))
+             (ts (alist-get 'ts normalized))
              (key (slackit-state--message-key conversation-id ts))
              (message-revision
               (gethash key
@@ -442,15 +442,15 @@ authoritative.  No HTTP write response may clear an observed tombstone."
   (cl-position name reactions
                :test #'equal
                :key (lambda (reaction)
-                      (slackit-normalize-get reaction 'name))))
+                      (alist-get 'name reaction))))
 
 (defun slackit-state-apply-reaction (state conversation-id ts name user-id add-p)
   "Apply idempotent reaction event to message TS and return descriptor."
   (when-let* ((message (slackit-state-message state conversation-id ts)))
-    (let* ((reactions (copy-tree (or (slackit-normalize-get message 'reactions) nil)))
+    (let* ((reactions (copy-tree (or (alist-get 'reactions message) nil)))
            (index (slackit-state--reaction-index reactions name))
            (reaction (and index (nth index reactions)))
-           (users (copy-sequence (or (slackit-normalize-get reaction 'users) nil)))
+           (users (copy-sequence (or (alist-get 'users reaction) nil)))
            (present-p (member user-id users))
            (changed-p (if add-p (not present-p) present-p)))
       (when changed-p
@@ -459,9 +459,9 @@ authoritative.  No HTTP write response may clear an observed tombstone."
                 (progn
                   (setcdr (assq 'users reaction) (cons user-id users))
                   (setcdr (assq 'count reaction)
-                           (1+ (or (slackit-normalize-get reaction 'count) 0))))
+                           (1+ (or (alist-get 'count reaction) 0))))
               (push `((name . ,name) (count . 1) (users . (,user-id))) reactions))
-          (let ((count (max 0 (1- (or (slackit-normalize-get reaction 'count) 0)))))
+          (let ((count (max 0 (1- (or (alist-get 'count reaction) 0)))))
             (setcdr (assq 'users reaction) (delete user-id users))
             (setcdr (assq 'count reaction) count)
             (when (zerop count)

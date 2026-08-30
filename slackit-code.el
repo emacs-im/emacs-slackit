@@ -14,7 +14,6 @@
 (require 'org-src)
 (require 'subr-x)
 (require 'appkit-core)
-(require 'slackit-normalize)
 
 (defgroup slackit-code nil
   "Display-only syntax highlighting for Slack code."
@@ -82,10 +81,10 @@
 
 (defun slackit-code--element-text (element)
   "Return display text contributed by one preformatted ELEMENT."
-  (pcase (slackit-normalize-get element 'type)
-    ("text" (or (slackit-normalize-get element 'text) ""))
-    ("link" (or (slackit-normalize-get element 'text)
-                (slackit-normalize-get element 'url)
+  (pcase (alist-get 'type element)
+    ("text" (or (alist-get 'text element) ""))
+    ("link" (or (alist-get 'text element)
+                (alist-get 'url element)
                 ""))
     (_ "")))
 
@@ -93,13 +92,13 @@
   "Return a code descriptor for rich-text preformatted ELEMENT."
   (slackit-code-descriptor-create
    :text (mapconcat #'slackit-code--element-text
-                    (or (slackit-normalize-get element 'elements) nil)
+                    (or (alist-get 'elements element) nil)
                     "")
    :language
    (slackit-code--normalize-language
-    (slackit-normalize-get element 'language))
+    (alist-get 'language element))
    :source-kind 'rich-text-preformatted
-   :border (slackit-normalize-get element 'border)))
+   :border (alist-get 'border element)))
 
 (defun slackit-code--markdown-descriptors (text)
   "Return language-tagged fenced code descriptors parsed from Markdown TEXT."
@@ -134,16 +133,16 @@
       ((collect (value)
          (cond
           ((and (listp value) (assq 'type value))
-           (pcase (slackit-normalize-get value 'type)
+           (pcase (alist-get 'type value)
              ("rich_text_preformatted"
               (list (slackit-code--preformatted-descriptor value)))
              ("markdown"
               (slackit-code--markdown-descriptors
-               (slackit-normalize-get value 'text)))
-             (_ (collect (slackit-normalize-get value 'elements)))))
+               (alist-get 'text value)))
+             (_ (collect (alist-get 'elements value)))))
           ((listp value) (mapcan #'collect value))
           (t nil))))
-    (collect (slackit-normalize-get message 'blocks))))
+    (collect (alist-get 'blocks message))))
 
 (defun slackit-code-consume-descriptor (descriptors text)
   "Match exact TEXT in DESCRIPTORS.

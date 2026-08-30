@@ -189,14 +189,14 @@ Unknown tokens are preserved byte-for-byte, and TEXT itself is never modified."
 
 (defun slackit-emoji--message-names (message)
   "Return deduplicated Slack emoji names referenced by MESSAGE."
-  (let ((text (or (slackit-normalize-get message 'text) ""))
+  (let ((text (or (alist-get 'text message) ""))
         names
         (position 0))
     (while (string-match slackit-emoji--token-regexp text position)
       (push (substring (match-string 0 text) 1 -1) names)
       (setq position (match-end 0)))
-    (dolist (reaction (slackit-normalize-get message 'reactions))
-      (when-let* ((name (slackit-normalize-get reaction 'name)))
+    (dolist (reaction (alist-get 'reactions message))
+      (when-let* ((name (alist-get 'name reaction)))
         (push name names)))
     (delete-dups names)))
 
@@ -222,7 +222,7 @@ Unknown tokens are preserved byte-for-byte, and TEXT itself is never modified."
   (when (slackit-runtime-operation-current-p app operation)
     (slackit-state-set-emojis
      (slackit-runtime-state app)
-     (or (slackit-normalize-get body 'emoji) nil))
+     (or (alist-get 'emoji body) nil))
     (slackit-runtime-operation-end app operation)
     (slackit-runtime-publish-resource
      app (slackit-emoji-resource-key app))))

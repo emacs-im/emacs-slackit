@@ -22,7 +22,7 @@
 (require 'slackit-api)
 (require 'slackit-avatar)
 (require 'slackit-emoji)
-(require 'slackit-normalize)
+(require 'slackit-decode)
 (require 'slackit-render)
 (require 'slackit-room)
 (require 'slackit-runtime)
@@ -82,22 +82,22 @@
 
 (defun slackit-user--display-name (user)
   "Return USER's best stable display name."
-  (let ((profile (slackit-normalize-get user 'profile)))
+  (let ((profile (alist-get 'profile user)))
     (or (slackit-user--present-string
-         (slackit-normalize-get profile 'display_name))
+         (alist-get 'display_name profile))
         (slackit-user--present-string
-         (slackit-normalize-get profile 'real_name))
+         (alist-get 'real_name profile))
         (slackit-user--present-string
-         (slackit-normalize-get user 'real_name))
+         (alist-get 'real_name user))
         (slackit-user--present-string
-         (slackit-normalize-get user 'name))
+         (alist-get 'name user))
         slackit-user--user-id
         "Slack user")))
 
 (defun slackit-user--username (user)
   "Return USER's @username label, or nil."
   (when-let* ((name (slackit-user--present-string
-                     (slackit-normalize-get user 'name))))
+                     (alist-get 'name user))))
     (concat "@" name)))
 
 (defun slackit-user--avatar-placeholder (user)
@@ -112,9 +112,9 @@
 (defun slackit-user--status-string (app profile)
   "Return PROFILE's display-only Slack status string for APP."
   (let* ((emoji (slackit-user--present-string
-                 (slackit-normalize-get profile 'status_emoji)))
+                 (alist-get 'status_emoji profile)))
          (text (slackit-user--present-string
-                (slackit-normalize-get profile 'status_text)))
+                (alist-get 'status_text profile)))
          (rendered-emoji
           (and emoji (slackit-emoji-substitute app emoji))))
     (string-join (delq nil (list rendered-emoji
@@ -125,8 +125,8 @@
 (defun slackit-user--timezone-label (user)
   "Return USER's timezone label with a stable UTC offset."
   (let ((label (slackit-user--present-string
-                (slackit-normalize-get user 'tz_label)))
-        (offset (slackit-normalize-get user 'tz_offset)))
+                (alist-get 'tz_label user)))
+        (offset (alist-get 'tz_offset user)))
     (string-join
      (delq nil
            (list label
@@ -149,7 +149,7 @@
                     (is_bot . "Bot")
                     (is_app_user . "App user")
                     (deleted . "Deactivated")))
-      (when (eq t (slackit-normalize-get user (car spec)))
+      (when (eq t (alist-get (car spec) user))
         (push (cdr spec) roles)))
     (string-join (nreverse roles) " · ")))
 
@@ -167,12 +167,12 @@
 (defun slackit-user--insert-custom-fields (app profile)
   "Insert non-empty custom PROFILE fields for APP."
   (let (fields)
-    (dolist (entry (slackit-normalize-get profile 'fields))
+    (dolist (entry (alist-get 'fields profile))
       (let* ((field (cdr-safe entry))
              (label (slackit-user--present-string
-                     (slackit-normalize-get field 'label)))
+                     (alist-get 'label field)))
              (value (slackit-user--present-string
-                     (slackit-normalize-get field 'value))))
+                     (alist-get 'value field))))
         (when (and label value)
           (push (cons label (slackit-emoji-substitute app value)) fields))))
     (dolist (field (sort fields (lambda (left right)
@@ -210,7 +210,7 @@
   (let* ((view (slackit-user--current-view))
          (app (appkit-view-app view))
          (user (slackit-user--state-user view))
-         (profile (and user (slackit-normalize-get user 'profile))))
+         (profile (and user (alist-get 'profile user))))
     (appkit-position-render-preserving
      (lambda ()
        (let ((inhibit-read-only t))
@@ -265,29 +265,29 @@
            (insert "\n")
            (appkit-view-insert-heading-line "Profile" :face 'bold)
            (slackit-user--insert-field
-            "Display name" (slackit-normalize-get profile 'display_name))
+            "Display name" (alist-get 'display_name profile))
            (slackit-user--insert-field
             "Full name"
-            (or (slackit-normalize-get profile 'real_name)
-                (slackit-normalize-get user 'real_name)))
+            (or (alist-get 'real_name profile)
+                (alist-get 'real_name user)))
            (slackit-user--insert-field "Username" (slackit-user--username user))
            (slackit-user--insert-field
-            "Title" (slackit-normalize-get profile 'title))
+            "Title" (alist-get 'title profile))
            (slackit-user--insert-field
-            "Pronouns" (slackit-normalize-get profile 'pronouns))
+            "Pronouns" (alist-get 'pronouns profile))
            (slackit-user--insert-field
             "Time zone" (slackit-user--timezone-label user))
            (slackit-user--insert-custom-fields app profile)
            (when (or (slackit-user--present-string
-                      (slackit-normalize-get profile 'email))
+                      (alist-get 'email profile))
                      (slackit-user--present-string
-                      (slackit-normalize-get profile 'phone)))
+                      (alist-get 'phone profile)))
              (insert "\n")
              (appkit-view-insert-heading-line "Contact" :face 'bold)
              (slackit-user--insert-field
-              "Email" (slackit-normalize-get profile 'email))
+              "Email" (alist-get 'email profile))
              (slackit-user--insert-field
-              "Phone" (slackit-normalize-get profile 'phone)))
+              "Phone" (alist-get 'phone profile)))
            (let ((roles (slackit-user--role-label user)))
              (when (or (not (string-empty-p roles))
                        slackit-user--user-id)
@@ -343,9 +343,7 @@
         (slackit-avatar-ensure (appkit-view-app view) user)
         (when-let* ((status-emoji
                      (slackit-user--present-string
-                      (slackit-normalize-get
-                       (slackit-normalize-get user 'profile)
-                       'status_emoji))))
+                      (alist-get 'status_emoji (alist-get 'profile user)))))
           (slackit-emoji-ensure-message
            (appkit-view-app view) `((text . ,status-emoji)))))
       (when (appkit-invalidations-any-p invalidations)
@@ -396,9 +394,9 @@
            (view (slackit-operation-view operation)))
       (if (not (slackit-user--view-current-p view user-id))
           (slackit-runtime-operation-end app operation)
-        (let* ((channel (slackit-normalize-get body 'channel))
-               (channel-id (slackit-normalize-get channel 'id))
-               (returned-user (slackit-normalize-get channel 'user)))
+        (let* ((channel (alist-get 'channel body))
+               (channel-id (alist-get 'id channel))
+               (returned-user (alist-get 'user channel)))
           (if (and (stringp channel-id)
                    (not (string-empty-p channel-id))
                    (or (null returned-user)
@@ -409,7 +407,7 @@
                       (dolist (key '(id user is_im is_member))
                         (setq rest (assq-delete-all key rest))))
                      (normalized
-                      (slackit-normalize-conversation
+                      (slackit-decode-conversation
                        (append `((id . ,channel-id)
                                  (user . ,user-id)
                                  (is_im . t)

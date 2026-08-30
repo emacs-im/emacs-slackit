@@ -52,7 +52,7 @@
          (root (slackit-state-message state conversation-id root-ts))
          (sender (and root
                       (slackit-state-user-name
-                       state (slackit-normalize-get root 'user)))))
+                       state (alist-get 'user root)))))
     (propertize
      (format "%s thread %s%s   [%s]\n\n"
              room-label root-ts
@@ -71,7 +71,7 @@
   "Project thread MESSAGES into stable Appkit rows owned by APP."
   (appkit-chat-timeline-project
    messages
-   (lambda (message) (slackit-normalize-get message 'ts))
+   (lambda (message) (alist-get 'ts message))
    :context-function
    (lambda (previous message)
      (slackit-room--message-context previous message))

@@ -20,7 +20,6 @@
 (require 'appkit-media)
 (require 'appkit-ui)
 (require 'slackit-customize)
-(require 'slackit-normalize)
 (require 'slackit-runtime)
 
 (defcustom slackit-media-cache-directory
@@ -38,7 +37,6 @@
   "Maximum number of media image failures retained in memory."
   :type 'integer
   :group 'slackit)
-
 
 (cl-defstruct (slackit-media-fetch
                (:constructor slackit-media-fetch-create))
@@ -218,32 +216,31 @@ media source."
                   (not (slackit-media--slack-private-media-url-p parsed))))
          (error nil))))
 
-
 (defun slackit-media--text-object-string (value)
   "Return display text from normalized Slack text object VALUE."
   (or (slackit-media--non-empty-string value)
       (and (listp value)
            (slackit-media--non-empty-string
-            (slackit-normalize-get value 'text)))))
+            (alist-get 'text value)))))
 
 (defun slackit-media--block-title (block fallback)
   "Return BLOCK title, using FALLBACK when its title is absent."
   (or (slackit-media--text-object-string
-       (slackit-normalize-get block 'title))
+       (alist-get 'title block))
       (slackit-media--non-empty-string
-       (slackit-normalize-get block 'alt_text))
+       (alist-get 'alt_text block))
       fallback))
 
 (defun slackit-media--block-item (app block path)
   "Return one supported media item for APP BLOCK at PATH, or nil."
-  (pcase (slackit-normalize-get block 'type)
+  (pcase (alist-get 'type block)
     ("image"
-     (let* ((source (slackit-normalize-get block 'image_url))
+     (let* ((source (alist-get 'image_url block))
             (title (slackit-media--block-title block "Image"))
             (identity
              (list 'block path
-                   (slackit-normalize-get block 'block_id)
-                   (slackit-normalize-get block 'alt_text)))
+                   (alist-get 'block_id block)
+                   (alist-get 'alt_text block)))
             (public-source
              (and (slackit-media--public-source-p source) source))
             (content-key
@@ -257,16 +254,16 @@ media source."
              :source public-source
              :title title
              :meta (slackit-media--non-empty-string
-                    (slackit-normalize-get block 'alt_text)))))
+                    (alist-get 'alt_text block)))))
     ("video"
      (let* ((preview-source
-             (slackit-normalize-get block 'thumbnail_url))
+             (alist-get 'thumbnail_url block))
             (content-source
-             (slackit-normalize-get block 'video_url))
+             (alist-get 'video_url block))
             (title (slackit-media--block-title block "Video"))
             (identity
              (list 'block path
-                   (slackit-normalize-get block 'block_id)
+                   (alist-get 'block_id block)
                    title))
             (content-key
              (slackit-media--register-content-spec
@@ -282,19 +279,19 @@ media source."
              :title title
              :meta
              (or (slackit-media--text-object-string
-                  (slackit-normalize-get block 'description))
+                  (alist-get 'description block))
                  (slackit-media--non-empty-string
-                  (slackit-normalize-get block 'provider_name))
+                  (alist-get 'provider_name block))
                  (slackit-media--non-empty-string
-                  (slackit-normalize-get block 'author_name))))))))
+                  (alist-get 'author_name block))))))))
 
 (defun slackit-media--collect-block-items (app node path)
   "Collect supported media items recursively from APP NODE at PATH."
   (when (listp node)
     (if-let* ((item (slackit-media--block-item app node path)))
         (list item)
-      (let* ((accessory (slackit-normalize-get node 'accessory))
-             (elements (slackit-normalize-get node 'elements))
+      (let* ((accessory (alist-get 'accessory node))
+             (elements (alist-get 'elements node))
              (sequence
               (cond
                ((vectorp elements) (append elements nil))
@@ -312,7 +309,7 @@ media source."
 
 (defun slackit-media--block-items (app message)
   "Return deterministic image and video item plists from MESSAGE for APP."
-  (let* ((blocks (slackit-normalize-get message 'blocks))
+  (let* ((blocks (alist-get 'blocks message))
          (sequence
           (cond
            ((vectorp blocks) (append blocks nil))
@@ -326,8 +323,8 @@ media source."
 
 (defun slackit-media--file-kind (file)
   "Return typed Appkit card kind for normalized Slack FILE metadata."
-  (let ((mime (downcase (or (slackit-normalize-get file 'mimetype) "")))
-        (type (downcase (or (slackit-normalize-get file 'filetype) ""))))
+  (let ((mime (downcase (or (alist-get 'mimetype file) "")))
+        (type (downcase (or (alist-get 'filetype file) ""))))
     (cond
      ((or (string-prefix-p "image/" mime)
           (member type '("png" "jpg" "jpeg" "gif" "webp" "bmp" "svg")))
@@ -343,9 +340,9 @@ media source."
 (defun slackit-media--file-title (file)
   "Return a useful title for normalized Slack FILE metadata."
   (or (slackit-media--non-empty-string
-       (slackit-normalize-get file 'title))
+       (alist-get 'title file))
       (slackit-media--non-empty-string
-       (slackit-normalize-get file 'name))
+       (alist-get 'name file))
       "Slack file"))
 
 
@@ -360,32 +357,32 @@ media source."
     (or
      (and (eq kind 'video)
           (slackit-media--non-empty-string
-           (slackit-normalize-get file 'thumb_video)))
+           (alist-get 'thumb_video file)))
      (cl-loop for field in slackit-media--file-preview-fields
-              for value = (slackit-normalize-get file field)
+              for value = (alist-get field file)
               when (slackit-media--non-empty-string value)
               return value)
      (and (eq kind 'photo)
           (slackit-media--non-empty-string
-           (slackit-normalize-get file 'url_private))))))
+           (alist-get 'url_private file))))))
 
 (defun slackit-media--file-open-source (file _kind)
   "Return FILE's original content source."
   (or (slackit-media--non-empty-string
-       (slackit-normalize-get file 'url_private_download))
+       (alist-get 'url_private_download file))
       (slackit-media--non-empty-string
-       (slackit-normalize-get file 'url_private))))
+       (alist-get 'url_private file))))
 
 (defun slackit-media--file-meta (file)
   "Return safe compact metadata strings for normalized Slack FILE."
   (let ((type (or (slackit-media--non-empty-string
-                   (slackit-normalize-get file 'pretty_type))
+                   (alist-get 'pretty_type file))
                   (slackit-media--non-empty-string
-                   (slackit-normalize-get file 'mimetype))
+                   (alist-get 'mimetype file))
                   (slackit-media--non-empty-string
-                   (slackit-normalize-get file 'filetype))))
-        (size (slackit-normalize-get file 'size))
-        (duration-ms (slackit-normalize-get file 'duration_ms)))
+                   (alist-get 'filetype file))))
+        (size (alist-get 'size file))
+        (duration-ms (alist-get 'duration_ms file)))
     (delq nil
           (list type
                 (and (numberp size)
@@ -397,17 +394,17 @@ media source."
 (defun slackit-media--file-items (app message)
   "Return deterministic rich file metadata item plists from MESSAGE for APP."
   (cl-loop
-   for file in (or (slackit-normalize-get message 'files) nil)
+   for file in (or (alist-get 'files message) nil)
    for index from 0
    when (listp file)
    collect
-   (let* ((id (slackit-normalize-get file 'id))
+   (let* ((id (alist-get 'id file))
           (kind (slackit-media--file-kind file))
           (source (slackit-media--file-preview-source file kind))
           (content-source (slackit-media--file-open-source file kind))
-          (name (slackit-normalize-get file 'name))
-          (mime-type (slackit-normalize-get file 'mimetype))
-          (size (slackit-normalize-get file 'size))
+          (name (alist-get 'name file))
+          (mime-type (alist-get 'mimetype file))
+          (size (alist-get 'size file))
           (identity
            (if (slackit-media--non-empty-string id)
                (list 'id id)
@@ -417,7 +414,7 @@ media source."
            (slackit-media--register-content-spec
             app (list 'file identity) kind content-source
             name mime-type size
-            (slackit-normalize-get file 'duration_ms))))
+            (alist-get 'duration_ms file))))
      (list :class 'file
            :kind kind
            :resource-key (slackit-media--resource-key app 'preview identity)
@@ -429,7 +426,7 @@ media source."
            :cache-name name
            :title (slackit-media--file-title file)
            :meta (slackit-media--file-meta file)
-           :duration-ms (slackit-normalize-get file 'duration_ms)))))
+           :duration-ms (alist-get 'duration_ms file)))))
 
 (defun slackit-media--message-items (app message)
   "Return deterministic media card item plists for APP and MESSAGE."
@@ -439,12 +436,12 @@ media source."
 
 (defun slackit-media-message-media-only-p (message)
   "Return non-nil when MESSAGE blocks are entirely supported media blocks."
-  (let ((blocks (slackit-normalize-get message 'blocks)))
+  (let ((blocks (alist-get 'blocks message)))
     (and (listp blocks)
          blocks
          (cl-every
           (lambda (block)
-            (member (slackit-normalize-get block 'type)
+            (member (alist-get 'type block)
                     '("image" "video")))
           blocks))))
 

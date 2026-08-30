@@ -206,17 +206,13 @@
        (slackit-runtime-state right) "C1"
        '((ts . "1710000000.000001") (text . "right")))
       (should (equal "left"
-                     (slackit-normalize-get
-                      (slackit-state-message
-                       (slackit-runtime-state left)
-                       "C1" "1710000000.000001")
-                      'text)))
+                     (alist-get 'text (slackit-state-message
+                      (slackit-runtime-state left)
+                      "C1" "1710000000.000001"))))
       (should (equal "right"
-                     (slackit-normalize-get
-                      (slackit-state-message
-                       (slackit-runtime-state right)
-                       "C1" "1710000000.000001")
-                      'text)))
+                     (alist-get 'text (slackit-state-message
+                      (slackit-runtime-state right)
+                      "C1" "1710000000.000001"))))
       (should-not (eq (appkit-app-state left) (appkit-app-state right))))))
 
 (ert-deftest slackit-contract-realtime-reconnect-preserves-account-work ()
@@ -616,9 +612,7 @@
      '(((ts . "1710000000.000001") (text . "stale page")))
      captured)
     (should (equal "live edit"
-                   (slackit-normalize-get
-                    (slackit-state-message state "C1" "1710000000.000001")
-                    'text)))
+                   (alist-get 'text (slackit-state-message state "C1" "1710000000.000001"))))
     (setq captured (slackit-account-state-revision state))
     (slackit-state-delete-message state "C1" "1710000000.000001")
     (slackit-state-merge-message-page
@@ -631,7 +625,7 @@
   (let ((state (slackit-state-create)))
     (slackit-state-apply-event
      state
-     (slackit-normalize-event
+     (slackit-decode-event
       '((type . "message") (channel . "C1")
         (ts . "1710000000.000002") (thread_ts . "1710000000.000001")
         (text . "reply"))))
@@ -642,7 +636,7 @@
                      state "C1" "1710000000.000001")))
     (slackit-state-apply-event
      state
-     (slackit-normalize-event
+     (slackit-decode-event
       '((type . "message") (subtype . "thread_broadcast")
         (channel . "C1") (ts . "1710000000.000003")
         (thread_ts . "1710000000.000001") (text . "broadcast"))))
@@ -1101,9 +1095,7 @@
         (funcall add-success '((ok . t)))
         (should (= 1 remove-count))
         (funcall remove-success '((ok . t)))
-        (should-not (slackit-normalize-get
-                     (slackit-state-message state "C1" "1.000001")
-                     'reactions))))))
+        (should-not (alist-get 'reactions (slackit-state-message state "C1" "1.000001")))))))
 
 (ert-deftest slackit-contract-read-marks-coalesce-without-fabrication ()
   (slackit-test-with-app (app "read")
@@ -1224,7 +1216,7 @@
                              toggled)))))
         (should (equal
                  "please :pray: :laughing: :slightly_smiling_face: :+1::skin-tone-3: :unknown:"
-                 (slackit-normalize-get message 'text)))))))
+                 (alist-get 'text message)))))))
 
 (ert-deftest slackit-contract-avatar-prefers-circular-derived-image ()
   (let ((file (make-temp-file "slackit-round-avatar-" nil ".png")))
@@ -1292,12 +1284,10 @@
             (clrhash slackit-media--fetches)
             (clrhash slackit-media--failures)
             (clrhash slackit-media--image-cache)
-            (setq message (slackit-normalize-message message "C1"))
+            (setq message (slackit-decode-message message "C1"))
             (should
              (equal thumbnail-url
-                    (slackit-normalize-get
-                     (car (slackit-normalize-get message 'files))
-                     'thumb_1024)))
+                    (alist-get 'thumb_1024 (car (alist-get 'files message)))))
             (cl-letf
                 (((symbol-function
                    'appkit-media-inline-image-rendering-available-p)
@@ -1414,7 +1404,7 @@
            (poster-url
             "https://files.slack.com/files-tmb/T1-FV/poster.jpeg")
            (message
-            (slackit-normalize-message
+            (slackit-decode-message
              `((channel . "C1")
                (ts . "1.000002")
                (files
@@ -1568,7 +1558,7 @@
             (clrhash slackit-media--failures)
             (clrhash slackit-media--image-cache)
             (clrhash slackit-media--open-specs)
-            (setq message (slackit-normalize-message message "C1"))
+            (setq message (slackit-decode-message message "C1"))
             (cl-letf
                 (((symbol-function 'plz)
                   (lambda (method url &rest arguments)
@@ -1671,7 +1661,7 @@
             (expand-file-name "media/" root))
            (url "https://files.slack.com/files-pri/T1-F6/archive.zip")
            (message
-            (slackit-normalize-message
+            (slackit-decode-message
              `((channel . "C1") (ts . "3.000001")
                (files
                 . (((id . "F6") (name . "archive.zip")
@@ -1806,8 +1796,7 @@
         captured))
       (should
        (equal "newer realtime edit"
-              (slackit-normalize-get
-               (slackit-state-message state "C1" "1.000001") 'text))))
+              (alist-get 'text (slackit-state-message state "C1" "1.000001")))))
     (slackit-state-delete-message state "C1" "1.000001")
     (should-not
      (slackit-state-merge-write-snapshot
@@ -1975,7 +1964,7 @@
    (equal '(:kind conversation-mark
             :conversation-id "G1"
             :ts "2.000001")
-          (slackit-normalize-event
+          (slackit-decode-event
            '((type . "mpim_marked")
              (channel . "G1")
              (ts . "2.000001"))))))
@@ -2192,8 +2181,7 @@
                       (profile . ((display_name . "After")))))))
           (should
            (equal "before"
-                  (slackit-normalize-get
-                   (slackit-state-user state "U1") 'name))))))))
+                  (alist-get 'name (slackit-state-user state "U1")))))))))
 
 (ert-deftest slackit-contract-user-message-reuses-or-creates-owned-im ()
   (slackit-test-with-app (app "user-dm")
@@ -2235,9 +2223,9 @@
           (should (equal "D2"
                          (slackit-state-im-conversation-id state "U2")))
           (let ((conversation (slackit-state-conversation state "D2")))
-            (should (eq t (slackit-normalize-get conversation 'is_im)))
+            (should (eq t (alist-get 'is_im conversation)))
             (should (equal "U2"
-                           (slackit-normalize-get conversation 'user)))))))))
+                           (alist-get 'user conversation)))))))))
 
 (ert-deftest slackit-contract-stale-user-dm-cannot-publish-or-jump ()
   (slackit-test-with-app (app "stale-user-dm")
@@ -2467,7 +2455,7 @@
                        (match-beginning 0) 'slackit-code-mode)))
           (should (search-forward ":wave:" nil t))
           (should (search-forward "<@U1>" nil t))))
-      (should (equal wire (slackit-normalize-get message 'text))))))
+      (should (equal wire (alist-get 'text message))))))
 
 (ert-deftest slackit-contract-code-language-requires-exact-block-match ()
   (slackit-test-with-app (app "code-exact")
@@ -2513,7 +2501,7 @@
            (code "(message \"one\")\n(message \"two\")")
            (before
             '((type . "rich_text_section")
-              (elements . (((type . "text") (text . "before"))))))
+              (elements . [((type . "text") (text . "before"))])))
            (preformatted
             (list
              (cons 'type "rich_text_preformatted")
@@ -2521,16 +2509,29 @@
              (cons 'border 0)
              (cons
               'elements
-              (list (list (cons 'type "text") (cons 'text code))))))
+              (vector (list (cons 'type "text") (cons 'text code))))))
            (after
             '((type . "rich_text_section")
-              (elements . (((type . "text") (text . "after"))))))
+              (elements . [((type . "text") (text . "after"))])))
            (rich
             (list (cons 'type "rich_text")
-                  (cons 'elements (list before preformatted after))))
+                  (cons 'elements (vector before preformatted after))))
+           (wire-json
+            (json-serialize
+             (list (cons 'text fallback)
+                   (cons 'blocks (vector rich)))))
            (message
-            (list (cons 'text fallback)
-                  (cons 'blocks (list rich)))))
+            (slackit-decode-message
+             (slackit-decode-json wire-json)
+             "C1")))
+      (let* ((blocks (alist-get 'blocks message))
+             (elements
+              (alist-get 'elements (car blocks)))
+             (code-elements
+              (alist-get 'elements (nth 1 elements))))
+        (should (proper-list-p blocks))
+        (should (proper-list-p elements))
+        (should (proper-list-p code-elements)))
       (with-temp-buffer
         (slackit-render--insert-primary-content app state message)
         (should
@@ -2549,7 +2550,7 @@
           (should
            (eq 'emacs-lisp-mode
                (get-text-property position 'slackit-code-mode)))))
-      (should (equal fallback (slackit-normalize-get message 'text))))))
+      (should (equal fallback (alist-get 'text message))))))
 (ert-deftest slackit-contract-code-mode-resolution-is-emacs-owned ()
   (should (eq 'emacs-lisp-mode
               (slackit-code-mode-for-language "elisp")))

@@ -15,7 +15,6 @@
 (require 'appkit-invalidation)
 (require 'appkit-chat-history)
 (require 'slackit-api)
-(require 'slackit-normalize)
 (require 'slackit-runtime)
 (require 'slackit-state)
 
@@ -34,15 +33,15 @@
 (defun slackit-history--ordered-messages (body)
   "Return BODY messages ordered by Slack timestamp."
   (sort (copy-sequence
-         (or (slackit-normalize-get body 'messages) nil))
+         (or (alist-get 'messages body) nil))
         (lambda (left right)
-          (string< (slackit-normalize-get left 'ts)
-                   (slackit-normalize-get right 'ts)))))
+          (string< (alist-get 'ts left)
+                   (alist-get 'ts right)))))
 
 (defun slackit-history--next-cursor (body)
   "Return next cursor from Slack history BODY, or nil."
-  (let* ((metadata (slackit-normalize-get body 'response_metadata))
-         (cursor (slackit-normalize-get metadata 'next_cursor)))
+  (let* ((metadata (alist-get 'response_metadata body))
+         (cursor (alist-get 'next_cursor metadata)))
     (and (stringp cursor) (not (string-empty-p cursor)) cursor)))
 
 (defun slackit-history--relevant-keys (state conversation-id root-ts)
@@ -93,7 +92,7 @@ ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
                             (delq nil
                                   (mapcar
                                    (lambda (message)
-                                     (slackit-normalize-get message 'ts))
+                                     (alist-get 'ts message))
                                    messages)))
                            (next-cursor
                             (slackit-history--next-cursor body))
@@ -183,7 +182,7 @@ ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
   (let ((result
          (appkit-chat-history-window-slice
           messages (lambda (message)
-                     (slackit-normalize-get message 'ts)))))
+                     (alist-get 'ts message)))))
     (and (plist-get result :valid-p)
          (plist-get result :entries))))
 

@@ -18,7 +18,7 @@
 (require 'websocket)
 (require 'appkit-core)
 (require 'slackit-customize)
-(require 'slackit-normalize)
+(require 'slackit-decode)
 (require 'slackit-runtime)
 (require 'slackit-state)
 
@@ -275,7 +275,7 @@
 
 (defun slackit-realtime--handle-event (app payload)
   "Handle one decoded Slack realtime PAYLOAD for APP."
-  (let* ((event (slackit-normalize-event payload))
+  (let* ((event (slackit-decode-event payload))
          (kind (plist-get event :kind))
          (transport (slackit-runtime-transport app)))
     (pcase kind
@@ -356,7 +356,7 @@
                        (condition-case nil
                            (when-let* ((text (slackit-realtime--frame-text frame)))
                              (slackit-realtime--handle-event
-                              app (slackit-normalize-json text)))
+                              app (slackit-decode-json text)))
                          (error
                           (slackit-realtime--disconnect-current app)
                           (slackit-realtime--publish-connection app 'protocol-error)

@@ -103,7 +103,7 @@
     (let* ((app (appkit-view-app (slackit-transient-scope-view scope)))
            (state (slackit-runtime-state app))
            (self-id (slackit-state-self-id state))
-           (author-id (slackit-normalize-get message 'user)))
+           (author-id (alist-get 'user message)))
       (and (stringp self-id)
            (not (string-empty-p self-id))
            (equal self-id author-id)))))
@@ -534,7 +534,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
          (conversation-id
           (slackit-transient-scope-conversation-id scope))
          (ts (slackit-transient-scope-message-ts scope))
-         (root-ts (or (slackit-normalize-get message 'thread_ts) ts)))
+         (root-ts (or (alist-get 'thread_ts message) ts)))
     (slackit-thread-open app conversation-id root-ts t)))
 
 (defun slackit-transient--require-owned-message (scope)
@@ -561,10 +561,10 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
        (list :aux-type 'edit
              :message-id ts
              :title "Edit message"
-             :preview (slackit-normalize-get message 'text)))
+             :preview (alist-get 'text message)))
       (appkit-chatbuf-input-set-text
        (slackit-completion-decode-wire
-        state (or (slackit-normalize-get message 'text) "")))
+        state (or (alist-get 'text message) "")))
       (appkit-chatbuf-focus-input))))
 
 (transient-define-suffix slackit-transient-actions-delete (scope)
@@ -637,7 +637,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   :inapt-if #'slackit-transient--actions-message-inapt-p
   (interactive (list (slackit-transient--actions-scope)))
   (let* ((message (slackit-transient--require-message scope))
-         (text (or (slackit-normalize-get message 'text) "")))
+         (text (or (alist-get 'text message) "")))
     (kill-new text)
     (message "slackit: message text copied")))
 

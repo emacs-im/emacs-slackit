@@ -17,7 +17,6 @@
 (require 'appkit-core)
 (require 'appkit-media)
 (require 'slackit-customize)
-(require 'slackit-normalize)
 (require 'slackit-runtime)
 
 (cl-defstruct (slackit-avatar-fetch
@@ -46,10 +45,10 @@
 
 (defun slackit-avatar--profile-url (user)
   "Return USER's preferred Slack profile image URL, or nil."
-  (let ((profile (slackit-normalize-get user 'profile)))
+  (let ((profile (alist-get 'profile user)))
     (seq-some
      (lambda (key)
-       (let ((value (slackit-normalize-get profile key)))
+       (let ((value (alist-get key profile)))
          (and (stringp value) (not (string-empty-p value)) value)))
      '(image_72 image_48 image_32 image_24))))
 
@@ -69,7 +68,7 @@
 
 (defun slackit-avatar-resource-key (app user)
   "Return opaque profile image resource identity for USER owned by APP."
-  (let ((user-id (slackit-normalize-get user 'id))
+  (let ((user-id (alist-get 'id user))
         (url (slackit-avatar--profile-url user)))
     (when (and (appkit-app-p app)
                (stringp user-id)

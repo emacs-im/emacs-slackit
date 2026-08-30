@@ -52,7 +52,7 @@ message row."
 (defun slackit-actions--require-owned (state message)
   "Reject MESSAGE unless it belongs to current user in STATE."
   (unless (equal (slackit-state-self-id state)
-                 (slackit-normalize-get message 'user))
+                 (alist-get 'user message))
     (user-error "slackit: this action requires your own message")))
 
 (defun slackit-actions-open-thread ()
@@ -60,7 +60,7 @@ message row."
   (interactive)
   (pcase-let* ((`(,app ,conversation-id ,ts ,message)
                  (slackit-actions--context))
-                (root-ts (or (slackit-normalize-get message 'thread_ts) ts)))
+                (root-ts (or (alist-get 'thread_ts message) ts)))
     (slackit-thread-open app conversation-id root-ts t)))
 
 (defun slackit-actions-edit ()
@@ -76,10 +76,10 @@ message row."
      (list :aux-type 'edit
            :message-id ts
            :title "Edit message"
-           :preview (slackit-normalize-get message 'text)))
+           :preview (alist-get 'text message)))
     (appkit-chatbuf-input-set-text
      (slackit-completion-decode-wire
-      state (or (slackit-normalize-get message 'text) "")))
+      state (or (alist-get 'text message) "")))
     (appkit-chatbuf-focus-input)))
 
 (defun slackit-actions--delete-success
@@ -133,7 +133,7 @@ message row."
   (interactive)
   (pcase-let ((`(,_app ,_conversation-id ,_ts ,message)
                (slackit-actions--context)))
-    (let ((text (or (slackit-normalize-get message 'text) "")))
+    (let ((text (or (alist-get 'text message) "")))
       (kill-new text)
       (message "slackit: message text copied"))))
 

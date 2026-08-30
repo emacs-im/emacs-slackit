@@ -15,7 +15,7 @@
 (require 'url-util)
 (require 'appkit-core)
 (require 'slackit-customize)
-(require 'slackit-normalize)
+(require 'slackit-decode)
 (require 'slackit-runtime)
 
 (defconst slackit-http-api-origin "https://slack.com/api/"
@@ -131,7 +131,7 @@
   "Decode Slack response TEXT, returning nil for invalid JSON."
   (condition-case nil
       (and (stringp text) (not (string-empty-p text))
-           (slackit-normalize-json text))
+           (slackit-decode-json text))
     (error nil)))
 
 (defun slackit-http--response-header (response name)
@@ -193,7 +193,7 @@
            (body (and response
                       (slackit-http--decode-body
                        (plz-response-body response))))
-           (code (and body (slackit-normalize-get body 'error)))
+           (code (and body (alist-get 'error body)))
            (retry-after (and response (slackit-http--retry-after response))))
       (if (and (= status 429)
                retry-after

@@ -31,10 +31,9 @@
         candidates)
     (maphash
      (lambda (id user)
-       (unless (slackit-normalize-get user 'deleted)
+       (unless (alist-get 'deleted user)
          (let* ((name (slackit-state-user-name state id))
-                (real-name (slackit-normalize-get
-                            (slackit-normalize-get user 'profile) 'real_name)))
+                (real-name (alist-get 'real_name (alist-get 'profile user))))
            (push
             (appkit-chat-completion-candidate-create
              :label (format "@%s  [%s]" name id)
@@ -56,8 +55,8 @@
         candidates)
     (dolist (id (slackit-state-joined-conversation-ids state))
       (let ((conversation (slackit-state-conversation state id)))
-        (unless (or (slackit-normalize-get conversation 'is_im)
-                    (slackit-normalize-get conversation 'is_mpim))
+        (unless (or (alist-get 'is_im conversation)
+                    (alist-get 'is_mpim conversation))
           (let ((name (slackit-state-conversation-name state id)))
             (push
              (appkit-chat-completion-candidate-create

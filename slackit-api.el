@@ -14,15 +14,14 @@
 (require 'json)
 (require 'subr-x)
 (require 'slackit-http)
-(require 'slackit-normalize)
 
 (defun slackit-api--ok-p (body)
   "Return non-nil when Slack response BODY is successful."
-  (eq (slackit-normalize-get body 'ok) t))
+  (eq (alist-get 'ok body) t))
 
 (defun slackit-api--error-code (body)
   "Return stable Slack error code from BODY."
-  (let ((code (slackit-normalize-get body 'error)))
+  (let ((code (alist-get 'error body)))
     (if code (format "%s" code) "invalid_response")))
 
 (cl-defun slackit-api-request
@@ -47,8 +46,8 @@
 
 (defun slackit-api--next-cursor (body)
   "Return normalized next cursor from Slack BODY, or nil."
-  (let* ((metadata (slackit-normalize-get body 'response_metadata))
-         (cursor (slackit-normalize-get metadata 'next_cursor)))
+  (let* ((metadata (alist-get 'response_metadata body))
+         (cursor (alist-get 'next_cursor metadata)))
     (and (stringp cursor) (not (string-empty-p cursor)) cursor)))
 
 (cl-defun slackit-api--paginate
@@ -65,7 +64,7 @@
           :owner (or owner app)
           :on-success
           (lambda (body)
-            (let ((items (or (slackit-normalize-get body item-key) nil))
+            (let ((items (or (alist-get item-key body) nil))
                   (next (slackit-api--next-cursor body)))
               (when on-page (funcall on-page items))
               (if next

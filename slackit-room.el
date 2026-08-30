@@ -212,7 +212,7 @@
 
 (defun slackit-room--message-resources (app state message)
   "Return and ensure opaque Appkit resources for APP MESSAGE from STATE."
-  (let* ((user-id (slackit-normalize-get message 'user))
+  (let* ((user-id (alist-get 'user message))
          (subject (slackit-render-avatar-subject state message))
          (resources
           (delete-dups
@@ -223,7 +223,7 @@
                    (and subject
                         (slackit-avatar-resource-key app subject)))
                   (slackit-render-reference-dependencies
-                   (slackit-normalize-get message 'text))
+                   (alist-get 'text message))
                   (slackit-media-message-resource-keys app message)
                   (slackit-emoji-message-resource-keys app message))))))
     (when user-id
@@ -238,7 +238,7 @@
 
 (defun slackit-room--message-epoch (message)
   "Return numeric presentation time for MESSAGE's opaque Slack timestamp."
-  (let ((timestamp (slackit-normalize-get message 'ts)))
+  (let ((timestamp (alist-get 'ts message)))
     (when (and (stringp timestamp)
                (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" timestamp))
       (string-to-number timestamp))))
@@ -255,9 +255,9 @@
 
 (defun slackit-room--message-sender-key (message)
   "Return stable sender key for MESSAGE."
-  (or (slackit-normalize-get message 'user)
-      (slackit-normalize-get message 'bot_id)
-      (slackit-normalize-get message 'username)))
+  (or (alist-get 'user message)
+      (alist-get 'bot_id message)
+      (alist-get 'username message)))
 
 (defun slackit-room--messages-compact-group-p (previous message)
   "Return non-nil when MESSAGE may visually continue PREVIOUS."
@@ -296,10 +296,10 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
         first-unread-seen)
     (appkit-chat-timeline-project
      messages
-     (lambda (message) (slackit-normalize-get message 'ts))
+     (lambda (message) (alist-get 'ts message))
      :context-function
      (lambda (previous message)
-       (let* ((timestamp (slackit-normalize-get message 'ts))
+       (let* ((timestamp (alist-get 'ts message))
               (first-unread
                (and (not first-unread-seen)
                     read-ts

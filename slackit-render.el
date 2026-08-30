@@ -24,7 +24,6 @@
 (require 'slackit-avatar)
 (require 'slackit-emoji)
 (require 'slackit-media)
-(require 'slackit-normalize)
 (require 'slackit-state)
 
 (declare-function slackit-reaction-toggle
@@ -201,33 +200,32 @@ language metadata for matching fenced spans."
 
 (defun slackit-render--sender-id (message)
   "Return stable sender identity from MESSAGE, or nil."
-  (or (slackit-normalize-get message 'user)
-      (slackit-normalize-get message 'bot_id)))
+  (or (alist-get 'user message)
+      (alist-get 'bot_id message)))
 
 (defun slackit-render--sender-name (state message)
   "Return sender display name for MESSAGE in STATE."
-  (or (when-let* ((user (slackit-normalize-get message 'user)))
+  (or (when-let* ((user (alist-get 'user message)))
         (slackit-state-user-name state user))
-      (slackit-normalize-get
-       (slackit-normalize-get message 'bot_profile) 'name)
-      (slackit-normalize-get message 'username)
-      (slackit-normalize-get message 'bot_id)
+      (alist-get 'name (alist-get 'bot_profile message))
+      (alist-get 'username message)
+      (alist-get 'bot_id message)
       "unknown"))
 
 (defun slackit-render-avatar-subject (state message)
   "Return canonical avatar subject for MESSAGE from STATE, or nil."
-  (or (when-let* ((user-id (slackit-normalize-get message 'user)))
+  (or (when-let* ((user-id (alist-get 'user message)))
         (slackit-state-user state user-id))
-      (let* ((bot-profile (slackit-normalize-get message 'bot_profile))
-             (icons (slackit-normalize-get bot-profile 'icons))
-             (bot-id (or (slackit-normalize-get message 'bot_id)
-                         (slackit-normalize-get bot-profile 'id))))
+      (let* ((bot-profile (alist-get 'bot_profile message))
+             (icons (alist-get 'icons bot-profile))
+             (bot-id (or (alist-get 'bot_id message)
+                         (alist-get 'id bot-profile))))
         (when (and bot-id icons)
           `((id . ,bot-id)
             (profile
-             . ((image_72 . ,(slackit-normalize-get icons 'image_72))
-                (image_48 . ,(slackit-normalize-get icons 'image_48))
-                (image_32 . ,(slackit-normalize-get icons 'image_32)))))))))
+             . ((image_72 . ,(alist-get 'image_72 icons))
+                (image_48 . ,(alist-get 'image_48 icons))
+                (image_32 . ,(alist-get 'image_32 icons)))))))))
 
 (defun slackit-render--sender-face (state message)
   "Return deterministic highlighted sender face for MESSAGE in STATE."
@@ -279,7 +277,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
 (defun slackit-render--avatar-prefixes (app state message)
   "Return two-line circular avatar prefixes for APP MESSAGE in STATE."
   (let* ((subject (slackit-render-avatar-subject state message))
-         (user-id (slackit-normalize-get message 'user))
+         (user-id (alist-get 'user message))
          (name (slackit-render--sender-name state message))
          (pixel-size (appkit-chat-avatar-two-line-pixel-size))
          (image
@@ -316,19 +314,19 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
 
 (defun slackit-render--reaction-label (app reaction)
   "Return one display label for APP normalized REACTION."
-  (let* ((name (or (slackit-normalize-get reaction 'name) "?"))
+  (let* ((name (or (alist-get 'name reaction) "?"))
          (emoji (slackit-emoji-display-string app name))
-         (count (or (slackit-normalize-get reaction 'count) 0)))
+         (count (or (alist-get 'count reaction) 0)))
     (format "%s %s" (or emoji (format ":%s:" name)) count)))
 
 (defun slackit-render--reaction-selected-p (self-id reaction)
   "Return non-nil when SELF-ID selected normalized REACTION."
   (and self-id
-       (member self-id (slackit-normalize-get reaction 'users))))
+       (member self-id (alist-get 'users reaction))))
 
 (defun slackit-render--reaction-help (self-id reaction)
   "Return action help for SELF-ID and normalized REACTION."
-  (let ((name (or (slackit-normalize-get reaction 'name) "?")))
+  (let ((name (or (alist-get 'name reaction) "?")))
     (format "%s :%s:"
             (if (slackit-render--reaction-selected-p self-id reaction)
                 "Remove reaction"
@@ -338,7 +336,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
 (defun slackit-render--toggle-reaction
     (app conversation-id ts reaction)
   "Toggle normalized REACTION on exact APP CONVERSATION-ID and TS."
-  (when-let* ((name (slackit-normalize-get reaction 'name)))
+  (when-let* ((name (alist-get 'name reaction)))
     (slackit-reaction-toggle app conversation-id ts name)))
 (defun slackit-render--open-thread (app conversation-id root-ts)
   "Open APP's exact CONVERSATION-ID thread rooted at ROOT-TS."
@@ -347,10 +345,10 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
 
 (defun slackit-render--insert-reactions (app state message)
   "Insert actionable emoji reaction chips for APP MESSAGE using STATE."
-  (let ((reactions (slackit-normalize-get message 'reactions))
+  (let ((reactions (alist-get 'reactions message))
         (self-id (slackit-state-self-id state))
-        (conversation-id (slackit-normalize-get message 'channel))
-        (ts (slackit-normalize-get message 'ts)))
+        (conversation-id (alist-get 'channel message))
+        (ts (alist-get 'ts message)))
     (appkit-chat-ins-insert-reaction-line
      reactions
      :prefix "  "
@@ -366,67 +364,58 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
      :help-echo-function
      (apply-partially #'slackit-render--reaction-help self-id))))
 
-(defun slackit-render--sequence (value)
-  "Return protocol sequence VALUE as a list."
-  (cond
-   ((vectorp value) (append value nil))
-   ((listp value) value)
-   (t nil)))
 
 (defun slackit-render--rich-code-message-p (message)
   "Return non-nil when MESSAGE owns a rich preformatted code element."
   (cl-some
    (lambda (block)
      (and
-      (equal "rich_text" (slackit-normalize-get block 'type))
+      (equal "rich_text" (alist-get 'type block))
       (cl-some
        (lambda (element)
          (equal "rich_text_preformatted"
-                (slackit-normalize-get element 'type)))
-       (slackit-render--sequence
-        (slackit-normalize-get block 'elements)))))
-   (slackit-render--sequence
-    (slackit-normalize-get message 'blocks))))
+                (alist-get 'type element)))
+       (alist-get 'elements block))))
+   (alist-get 'blocks message)))
 
 (defun slackit-render--rich-preformatted-text (element)
   "Return exact source text owned by preformatted rich ELEMENT."
   (mapconcat
    (lambda (part)
-     (pcase (slackit-normalize-get part 'type)
-       ("text" (or (slackit-normalize-get part 'text) ""))
-       ("link" (or (slackit-normalize-get part 'text)
-                   (slackit-normalize-get part 'url)
+     (pcase (alist-get 'type part)
+       ("text" (or (alist-get 'text part) ""))
+       ("link" (or (alist-get 'text part)
+                   (alist-get 'url part)
                    ""))
        (_ "")))
-   (slackit-render--sequence
-    (slackit-normalize-get element 'elements))
+   (alist-get 'elements element)
    ""))
 
 (defun slackit-render--insert-rich-inline (app state element)
   "Insert one supported rich-text inline ELEMENT for APP through STATE."
-  (pcase (slackit-normalize-get element 'type)
+  (pcase (alist-get 'type element)
     ("text"
      (insert
       (slackit-emoji-substitute
-       app (or (slackit-normalize-get element 'text) "")))
+       app (or (alist-get 'text element) "")))
      t)
     ("user"
-     (when-let* ((id (slackit-normalize-get element 'user_id)))
+     (when-let* ((id (alist-get 'user_id element)))
        (slackit-render--insert-reference app state (concat "@" id))
        t))
     ("channel"
-     (when-let* ((id (slackit-normalize-get element 'channel_id)))
+     (when-let* ((id (alist-get 'channel_id element)))
        (slackit-render--insert-reference app state (concat "#" id))
        t))
     ("link"
-     (let ((url (slackit-normalize-get element 'url))
-           (label (or (slackit-normalize-get element 'text)
-                      (slackit-normalize-get element 'url)
+     (let ((url (alist-get 'url element))
+           (label (or (alist-get 'text element)
+                      (alist-get 'url element)
                       "")))
        (slackit-render--insert-link label url)
        t))
     ("emoji"
-     (when-let* ((name (slackit-normalize-get element 'name)))
+     (when-let* ((name (alist-get 'name element)))
        (insert (or (slackit-emoji-display-string app name)
                    (format ":%s:" name)))
        t))
@@ -445,7 +434,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
          (insert-section-elements
           (elements)
           (start-block)
-          (dolist (element (slackit-render--sequence elements))
+          (dolist (element elements)
             (setq inserted-p
                   (or (slackit-render--insert-rich-inline
                        app state element)
@@ -456,41 +445,37 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
           (let ((code
                  (slackit-render--rich-preformatted-text element))
                 (language
-                 (slackit-normalize-get element 'language)))
+                 (alist-get 'language element)))
             (insert (slackit-code-block-string app code language))
             (setq inserted-p t))))
       (dolist
-          (block
-           (slackit-render--sequence
-            (slackit-normalize-get message 'blocks)))
-        (pcase (slackit-normalize-get block 'type)
+          (block (alist-get 'blocks message))
+        (pcase (alist-get 'type block)
           ("section"
            (when-let* ((text-object
-                        (slackit-normalize-get block 'text))
-                       (text (slackit-normalize-get text-object 'text)))
+                        (alist-get 'text block))
+                       (text (alist-get 'text text-object)))
              (start-block)
              (if (equal "mrkdwn"
-                        (slackit-normalize-get text-object 'type))
+                        (alist-get 'type text-object))
                  (slackit-render-insert-text app state text)
                (insert text))
              (setq inserted-p t)))
           ("rich_text"
            (dolist
-               (element
-                (slackit-render--sequence
-                 (slackit-normalize-get block 'elements)))
-             (pcase (slackit-normalize-get element 'type)
+               (element (alist-get 'elements block))
+             (pcase (alist-get 'type element)
                ("rich_text_section"
                 (insert-section-elements
-                 (slackit-normalize-get element 'elements)))
+                 (alist-get 'elements element)))
                ("rich_text_preformatted"
                 (insert-preformatted element))))))))
     inserted-p))
 
 (defun slackit-render--insert-primary-content (app state message)
   "Insert MESSAGE subtype marker and canonical primary content."
-  (let ((text (or (slackit-normalize-get message 'text) ""))
-        (subtype (slackit-normalize-get message 'subtype))
+  (let ((text (or (alist-get 'text message) ""))
+        (subtype (alist-get 'subtype message))
         (code-rich-p (slackit-render--rich-code-message-p message)))
     (when (and subtype
                (not (member subtype '("thread_broadcast" "me_message"))))
@@ -502,7 +487,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
         (slackit-render-insert-text app state text message)))
      ((not (string-empty-p text))
       (slackit-render-insert-text app state text message))
-     ((and (slackit-normalize-get message 'blocks)
+     ((and (alist-get 'blocks message)
            (not (slackit-media-message-media-only-p message)))
       (insert (propertize "[Unsupported Block Kit content]"
                           'face 'slackit-status))))))
@@ -511,7 +496,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
     (app state message sender timestamp header-prefix body-rest-prefix)
   "Insert MESSAGE heading for SENDER and TIMESTAMP in STATE owned by APP."
   (let* ((start (point))
-         (user-id (slackit-normalize-get message 'user))
+         (user-id (alist-get 'user message))
          (sender-start (point)))
     (insert sender)
     (add-text-properties
@@ -543,7 +528,7 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
   (when (plist-get context :unread-divider)
     (slackit-render--insert-divider
      "Unread messages" 'slackit-unread-divider))
-  (let* ((timestamp (slackit-normalize-get message 'ts))
+  (let* ((timestamp (alist-get 'ts message))
          (sender (slackit-render--sender-name state message))
          (compact (eq (plist-get context :compact) t))
          (avatar-prefixes
@@ -583,13 +568,13 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
            (appkit-ui-prefix-string body-prefix-state nil "  ")))
       (slackit-media-insert-message-cards app message))
     (let ((details-start (point)))
-      (when-let* ((count (slackit-normalize-get message 'reply_count)))
+      (when-let* ((count (alist-get 'reply_count message)))
         (when (> (or count 0) 0)
           (let* ((conversation-id
-                  (slackit-normalize-get message 'channel))
+                  (alist-get 'channel message))
                  (root-ts
-                  (or (slackit-normalize-get message 'thread_ts)
-                      (slackit-normalize-get message 'ts)))
+                  (or (alist-get 'thread_ts message)
+                      (alist-get 'ts message)))
                  (label-start (point)))
             (insert (format "  [%d replies]" count))
             (when (and conversation-id root-ts)

@@ -194,11 +194,14 @@ message/composer identity remain current.
 - a monotonic mutation revision and per-message revisions/tombstones;
 - the latest raw protocol facts required to normalize later events.
 
-JSON payloads are normalized into plain alists at the API/event boundary.
-Unknown fields may be preserved there; views never depend directly on raw HTTP
-or WebSocket envelopes.  Nested =message_changed=, =message_deleted=,
-=message_replied=, ordinary reply, and =thread_broadcast= envelopes are
-classified before reduction.  An ordinary reply never becomes an accidental
+=slackit-decode-json= establishes the sole wire-shape boundary: JSON objects
+become symbol-key alists and every JSON array becomes a proper list.  Entity
+decoders and views consume that invariant directly; they do not accept or adapt
+alternate sequence representations.  Unknown fields may be preserved there;
+views never depend directly on raw HTTP or WebSocket envelopes.  Nested
+=message_changed=, =message_deleted=, =message_replied=, ordinary reply, and
+=thread_broadcast= envelopes are classified before reduction.  An ordinary
+reply never becomes an accidental
 top-level row; a broadcast reply appears once in the room and once in its
 thread projection.
 
@@ -518,7 +521,7 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit-auth.el= | Browser capture ownership, Slack mapping, private auth persistence, credential loading |
 | =slackit-runtime.el= | Account registry, Appkit apps, operation ownership, view invalidation dispatch |
 | =slackit-state.el= | Canonical account store, revisions, tombstones, idempotent reducers, queries |
-| =slackit-normalize.el= | JSON normalization, safe file/reaction summaries, message/event classification |
+| =slackit-decode.el= | Inbound JSON shape, safe file/reaction summaries, message/event decoding |
 | =slackit-http.el= | Origin-bound =plz= requests, credential routing, redaction, cancellation, read retry |
 | =slackit-api.el= | Slack endpoint parameters, cursor adaptation, typed results |
 | =slackit-realtime.el= | Web/Desktop gateway ownership, hello/readiness, heartbeat/reconnect, event dispatch |

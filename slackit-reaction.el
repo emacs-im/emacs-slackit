@@ -12,7 +12,6 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'slackit-api)
-(require 'slackit-normalize)
 (require 'slackit-runtime)
 (require 'slackit-state)
 
@@ -23,10 +22,10 @@
          (reaction
           (seq-find
            (lambda (item)
-             (equal name (slackit-normalize-get item 'name)))
-           (or (slackit-normalize-get message 'reactions) nil))))
+             (equal name (alist-get 'name item)))
+           (or (alist-get 'reactions message) nil))))
     (and reaction
-         (member self-id (slackit-normalize-get reaction 'users)))))
+         (member self-id (alist-get 'users reaction)))))
 
 (defun slackit-reaction--dispatch (app operation)
   "Dispatch current desired state for reaction OPERATION in APP."

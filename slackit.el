@@ -21,7 +21,6 @@
 (require 'subr-x)
 (require 'slackit-customize)
 (require 'slackit-auth)
-(require 'slackit-normalize)
 (require 'slackit-state)
 (require 'slackit-runtime)
 (require 'slackit-http)
@@ -71,17 +70,17 @@
 After binding the authenticated identity, call IDENTITY-READY-FUNCTION with
 APP when it is non-nil."
   (when (slackit-runtime-operation-current-p app operation)
-    (let ((team-id (slackit-normalize-get body 'team_id))
-          (user-id (slackit-normalize-get body 'user_id)))
+    (let ((team-id (alist-get 'team_id body))
+          (user-id (alist-get 'user_id body)))
       (if (not (slackit-runtime-bind-credential-identity
                 app team-id user-id))
           (slackit--bootstrap-failure
            app operation '(:code "identity_mismatch"))
         (let* ((state (slackit-runtime-state app))
                (team `((id . ,team-id)
-                       (name . ,(slackit-normalize-get body 'team))))
+                       (name . ,(alist-get 'team body))))
                (self `((id . ,user-id)
-                       (name . ,(slackit-normalize-get body 'user)))))
+                       (name . ,(alist-get 'user body)))))
           (slackit-state-put-team-self state team self)
           (slackit-state-put-user state self)
           (slackit-state-set-bootstrap-complete state 'identity)

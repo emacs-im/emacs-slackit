@@ -22,7 +22,7 @@
 (require 'slackit-api)
 (require 'slackit-customize)
 (require 'slackit-code)
-(require 'slackit-normalize)
+(require 'slackit-decode)
 (require 'slackit-runtime)
 (require 'slackit-upload)
 (require 'slackit-state)
@@ -598,14 +598,14 @@ Interactively prefer the attachment at point, otherwise select by safe name."
 (defun slackit-compose--response-message
     (state conversation-id wire-text thread-ts body old-message)
   "Return canonical message from write BODY and captured semantic facts."
-  (let* ((nested (slackit-normalize-get body 'message))
-         (ts (or (and nested (slackit-normalize-get nested 'ts))
-                 (slackit-normalize-get body 'ts)
-                 (and old-message (slackit-normalize-get old-message 'ts))))
+  (let* ((nested (alist-get 'message body))
+         (ts (or (and nested (alist-get 'ts nested))
+                 (alist-get 'ts body)
+                 (and old-message (alist-get 'ts old-message))))
          (base (copy-tree (or nested old-message nil))))
     (dolist (key '(channel ts thread_ts text user))
       (setq base (assq-delete-all key base)))
-    (slackit-normalize-message
+    (slackit-decode-message
      (append `((channel . ,conversation-id)
                (ts . ,ts)
                (thread_ts . ,thread-ts)
@@ -815,9 +815,9 @@ Interactively prefer the attachment at point, otherwise select by safe name."
                        current-http nil)
                  (when (current-p)
                    (let ((upload-url
-                          (slackit-normalize-get body 'upload_url))
+                          (alist-get 'upload_url body))
                          (file-id
-                          (slackit-normalize-get body 'file_id)))
+                          (alist-get 'file_id body)))
                      (if (and (slackit-upload-url-p upload-url)
                               (stringp file-id)
                               (not (string-empty-p file-id)))
@@ -979,7 +979,7 @@ with the captured text as one completion write."
                (lambda (body)
                  (slackit-compose--settle-success
                   app operation view revision input aux conversation-id
-                  wire-text (slackit-normalize-get old-message 'thread_ts)
+                  wire-text (alist-get 'thread_ts old-message)
                   old-message captured-message-revision body))
                :on-error
                (lambda (error-data)

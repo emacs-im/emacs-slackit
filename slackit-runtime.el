@@ -343,8 +343,8 @@ browser-session identity."
         (slackit-runtime-operation-end app operation)
       (let* ((state (slackit-runtime-state app))
              (requested-id (slackit-operation-payload operation))
-             (user (slackit-normalize-get body 'user))
-             (returned-id (slackit-normalize-get user 'id)))
+             (user (alist-get 'user body))
+             (returned-id (alist-get 'id user)))
         (if (and user (equal requested-id returned-id))
             (progn
               (slackit-runtime-operation-end app operation)

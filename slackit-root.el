@@ -54,8 +54,8 @@
 (defun slackit-root--section-kind (conversation)
   "Return directory section kind for CONVERSATION."
   (cond
-   ((slackit-normalize-get conversation 'is_im) 'direct)
-   ((slackit-normalize-get conversation 'is_mpim) 'group-direct)
+   ((alist-get 'is_im conversation) 'direct)
+   ((alist-get 'is_mpim conversation) 'group-direct)
    (t 'channel)))
 
 (defun slackit-root--conversation-unread-p (state conversation-id)
@@ -89,7 +89,7 @@
   (dolist (conversation-id (slackit-state-joined-conversation-ids state))
     (when-let* ((conversation
                  (slackit-state-conversation state conversation-id))
-                (user-id (slackit-normalize-get conversation 'user)))
+                (user-id (alist-get 'user conversation)))
       (slackit-runtime-ensure-user app (format "%s" user-id)))))
 
 (defun slackit-root--entries (state)
