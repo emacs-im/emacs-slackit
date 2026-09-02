@@ -14,6 +14,7 @@
 (require 'appkit-core)
 (require 'appkit-directory)
 (require 'appkit-invalidation)
+(require 'appkit-projection)
 (require 'slackit-customize)
 (require 'slackit-runtime)
 (require 'slackit-state)
@@ -141,18 +142,22 @@
               (conversation-id (appkit-directory-entry-payload entry)))
     (slackit-room-open (appkit-view-app view) conversation-id t)))
 
-(defun slackit-root--sync (view invalidations)
-  "Synchronize root VIEW from coalesced INVALIDATIONS."
-  (let ((events (appkit-view-pending-events-snapshot view)))
-    (appkit-view-acknowledge-events view (length events))
-    (let* ((app (appkit-view-app view))
-           (surface (appkit-directory-surface))
-           (state (slackit-runtime-state app)))
-      (slackit-root--ensure-visible-users app state)
-      (appkit-directory-reconcile
-       surface (slackit-root--entries state)
-       :force-keys (appkit-invalidations-entry-keys invalidations)
-       :preserve-position-p t))))
+(defun slackit-root--sync (view invalidations events)
+  "Synchronize root VIEW from INVALIDATIONS and EVENTS."
+  (let ((diff
+         (appkit-projection-diff-derive
+          invalidations
+          :reconcile-parts '(status entries)
+          :reconcile (not (null events)))))
+    (when (appkit-projection-diff-reconcile-p diff)
+      (let* ((app (appkit-view-app view))
+             (surface (appkit-directory-surface))
+             (state (slackit-runtime-state app)))
+        (slackit-root--ensure-visible-users app state)
+        (appkit-directory-reconcile
+         surface (slackit-root--entries state)
+         :force-keys (appkit-projection-diff-force-keys diff)
+         :preserve-position-p t)))))
 
 (defun slackit-root--setup (_view)
   "Configure the current root directory adapter."

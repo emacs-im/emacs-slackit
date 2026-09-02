@@ -319,26 +319,24 @@
                 " · loading"
               ""))))
 
-(defun slackit-user--accept-events (view)
-  "Consume presentation events owned by user profile VIEW."
-  (let ((events (appkit-view-pending-events-snapshot view)))
-    (dolist (event events)
-      (when (equal (plist-get event :user-id) slackit-user--user-id)
-        (pcase (plist-get event :kind)
-          ('user (setq slackit-user--profile-error-code nil))
-          ('user-profile-error
-           (setq slackit-user--profile-error-code
-                 (or (plist-get event :code) "request_failed")))
-          ('user-dm-error
-           (setq slackit-user--dm-error-code
-                 (or (plist-get event :code) "request_failed"))))))
-    (appkit-view-acknowledge-events view (length events))))
+(defun slackit-user--accept-events (events)
+  "Apply presentation EVENTS owned by the current user profile."
+  (dolist (event events)
+    (when (equal (plist-get event :user-id) slackit-user--user-id)
+      (pcase (plist-get event :kind)
+        ('user (setq slackit-user--profile-error-code nil))
+        ('user-profile-error
+         (setq slackit-user--profile-error-code
+               (or (plist-get event :code) "request_failed")))
+        ('user-dm-error
+         (setq slackit-user--dm-error-code
+               (or (plist-get event :code) "request_failed")))))))
 
-(defun slackit-user--sync (view invalidations)
-  "Synchronize exact user VIEW from canonical state and INVALIDATIONS."
+(defun slackit-user--sync (view invalidations events)
+  "Synchronize exact user VIEW from INVALIDATIONS and EVENTS."
   (when (slackit-user--view-current-p view (cadr (appkit-view-id view)))
     (with-current-buffer (appkit-view-buffer view)
-      (slackit-user--accept-events view)
+      (slackit-user--accept-events events)
       (when-let* ((user (slackit-user--state-user view)))
         (slackit-avatar-ensure (appkit-view-app view) user)
         (when-let* ((status-emoji

@@ -156,14 +156,15 @@
       ((or 'compose-success 'compose-failure)
        (slackit-compose-apply-settlement change)))))
 
-(defun slackit-thread--sync (view invalidations)
-  "Synchronize thread VIEW from coalesced INVALIDATIONS."
-  (let ((events (appkit-view-pending-events-snapshot view)))
-    (dolist (event events) (slackit-thread--apply-event view event))
-    (appkit-view-acknowledge-events view (length events))
-    (slackit-thread--render
-     (slackit-room--invalidation-force-keys invalidations)
-     (appkit-invalidations-resource-keys invalidations))))
+(defun slackit-thread--sync (view invalidations events)
+  "Synchronize thread VIEW from INVALIDATIONS and EVENTS."
+  (dolist (event events)
+    (slackit-thread--apply-event view event))
+  (let ((diff (slackit-room--derive-projection-diff invalidations events)))
+    (when (appkit-projection-diff-reconcile-p diff)
+      (slackit-thread--render
+       (appkit-projection-diff-force-keys diff)
+       (appkit-projection-diff-changed-dependencies diff)))))
 
 (defun slackit-thread--setup (_app conversation-id root-ts _view)
   "Initialize one newly attached thread view."

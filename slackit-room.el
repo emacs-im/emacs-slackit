@@ -14,6 +14,7 @@
 (require 'subr-x)
 (require 'appkit-core)
 (require 'appkit-invalidation)
+(require 'appkit-projection)
 (require 'appkit-chatbuf)
 (require 'appkit-chat-completion)
 (require 'appkit-chat-history)
@@ -372,29 +373,35 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
   (appkit-view-enable-responsive-geometry view)
   view)
 
-(defun slackit-room--invalidation-force-keys (invalidations)
-  "Return row keys requiring redraw for coalesced INVALIDATIONS."
-  (let ((entries (appkit-invalidations-entry-keys invalidations)))
-    (if (memq 'geometry (appkit-invalidations-parts invalidations))
-        (progn
-          (when-let* ((width
-                       (appkit-view-responsive-width
-                        slackit-room-auto-fill-margin-columns)))
-            (setq-local fill-column width))
-          (delete-dups
-           (append entries
-                   (and (appkit-chat-timeline-live-p)
-                        (appkit-chat-timeline-keys)))))
-      entries)))
+(defun slackit-room--derive-projection-diff (invalidations events)
+  "Apply chat geometry and derive a projection diff for INVALIDATIONS and EVENTS."
+  (let* ((parts (appkit-invalidations-parts invalidations))
+         (resources (appkit-invalidations-resource-keys invalidations))
+         (geometry-p (memq 'geometry parts))
+         (all-resources-p (memq 'all resources)))
+    (when geometry-p
+      (when-let* ((width
+                   (appkit-view-responsive-width
+                    slackit-room-auto-fill-margin-columns)))
+        (setq-local fill-column width)))
+    (appkit-projection-diff-derive
+     invalidations
+     :existing-keys
+     (and (or geometry-p all-resources-p)
+          (appkit-chat-timeline-live-p)
+          (appkit-chat-timeline-keys))
+     :reconcile-parts '(frame timeline composer)
+     :reconcile (not (null events)))))
 
-(defun slackit-room--sync (view invalidations)
-  "Synchronize room VIEW from coalesced INVALIDATIONS."
-  (let ((events (appkit-view-pending-events-snapshot view)))
-    (dolist (event events) (slackit-room--apply-event view event))
-    (appkit-view-acknowledge-events view (length events))
-    (slackit-room--render
-     (slackit-room--invalidation-force-keys invalidations)
-     (appkit-invalidations-resource-keys invalidations))))
+(defun slackit-room--sync (view invalidations events)
+  "Synchronize room VIEW from INVALIDATIONS and EVENTS."
+  (dolist (event events)
+    (slackit-room--apply-event view event))
+  (let ((diff (slackit-room--derive-projection-diff invalidations events)))
+    (when (appkit-projection-diff-reconcile-p diff)
+      (slackit-room--render
+       (appkit-projection-diff-force-keys diff)
+       (appkit-projection-diff-changed-dependencies diff)))))
 
 (defun slackit-room--setup (conversation-id _app _view)
   "Initialize a newly attached room for CONVERSATION-ID."
