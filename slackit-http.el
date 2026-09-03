@@ -38,10 +38,6 @@
   on-error
   active-p)
 
-(defun slackit-http--owner-live-p (owner)
-  "Return non-nil when Appkit OWNER is live."
-  (or (appkit-app-live-p owner) (appkit-view-live-p owner)))
-
 (defun slackit-http--endpoint-url (endpoint)
   "Return fixed Web API URL for validated ENDPOINT."
   (unless (and (stringp endpoint)
@@ -103,7 +99,7 @@
        (slackit-runtime-current-p
         (slackit-http-request-app request)
         (slackit-http-request-generation request))
-       (slackit-http--owner-live-p (slackit-http-request-owner request))
+       (appkit-owner-live-p (slackit-http-request-owner request))
        (let ((handle (slackit-http-request-handle request)))
          (and (appkit-handle-p handle) (appkit-handle-alive-p handle)))))
 

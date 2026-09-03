@@ -1185,6 +1185,33 @@
             (should (string-match-p "reply" (buffer-string)))
             (should (appkit-chatbuf-prompt-button-live-p))))))))
 
+(ert-deftest slackit-contract-history-operation-owns-transport ()
+  "Replacing history should cancel transport through its Appkit operation."
+  (slackit-test-with-app (app "history-owner")
+    (let ((state (slackit-runtime-state app))
+          view first second)
+      (slackit-state-put-conversation
+       state '((id . "C1") (name . "general")
+               (is_channel . t) (is_member . t)))
+      (cl-letf (((symbol-function 'slackit-history-load-latest) #'ignore))
+        (setq view (slackit-room-open app "C1" nil)))
+      (cl-letf (((symbol-function 'plz)
+                 (lambda (&rest _arguments) nil)))
+        (setq first (slackit-history-load-latest view "C1")
+              second (slackit-history-load-latest view "C1")))
+      (let ((first-owner (slackit-http-request-owner first))
+            (second-owner (slackit-http-request-owner second)))
+        (should (appkit-view-operation-p first-owner))
+        (should (appkit-view-operation-p second-owner))
+        (should (eq view (appkit-view-operation-view second-owner)))
+        (should-not (slackit-http-request-active-p first))
+        (should (slackit-http-request-active-p second))
+        (should-not (appkit-view-operation-current-p first-owner))
+        (should (appkit-view-operation-current-p second-owner))
+        (with-current-buffer (appkit-view-buffer view)
+          (should
+           (appkit-chat-history-request-current-p second-owner)))))))
+
 (ert-deftest slackit-contract-emoji-renders-body-and-actionable-reactions ()
   (slackit-test-with-app (app "emoji")
     (let* ((state (slackit-runtime-state app))

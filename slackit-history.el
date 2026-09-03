@@ -79,13 +79,13 @@ ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
                (slackit-history--relevant-keys
                 state conversation-id root-ts)))
              (request-owner
-              (appkit-chat-history-request-begin
-               (if latest-p 'latest 'older)))
+              (appkit-chat-history-request-start
+               view (if latest-p 'latest 'older)))
              (cursor (and (not latest-p) slackit-history--cursor))
              (success
               (lambda (body)
                 (appkit-with-live-view view
-                  (when (appkit-chat-history-request-current-p request-owner)
+                  (when (appkit-chat-history-request-end request-owner)
                     (let* ((messages
                             (slackit-history--ordered-messages body))
                            (response-keys
@@ -140,28 +140,26 @@ ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
                          (car retained-keys) old-last)))
                       (appkit-chat-history-older-loaded-set
                        (null slackit-history--cursor))
-                      (appkit-chat-history-request-end request-owner)
                       (appkit-request-sync
                        view :structure t :position t))))))
              (failure
               (lambda (error-data)
                 (appkit-with-live-view view
-                  (when (appkit-chat-history-request-current-p request-owner)
+                  (when (appkit-chat-history-request-end request-owner)
                     (setq slackit-history--error
                           (or (plist-get error-data :code) "request_failed"))
-                    (appkit-chat-history-request-end request-owner)
                     (appkit-request-sync view :part 'frame))))))
         (if root-ts
             (slackit-api-conversation-replies
              app conversation-id root-ts
              :cursor cursor
-             :owner view
+             :owner request-owner
              :on-success success
              :on-error failure)
           (slackit-api-conversation-history
            app conversation-id
            :cursor cursor
-           :owner view
+           :owner request-owner
            :on-success success
            :on-error failure))))))
 
