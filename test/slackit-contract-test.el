@@ -2137,6 +2137,32 @@
            (eq #'slackit-actions-open-thread
                (lookup-key slackit-room-timeline-mode-map (kbd "T")))))))))
 
+(ert-deftest slackit-contract-user-frame-only-applies-events-without-hydration ()
+  (slackit-test-with-app (app "user-frame-only")
+    (slackit-state-put-user
+     (slackit-runtime-state app)
+     '((id . "U1") (name . "alice")
+       (profile . ((display_name . "Alice")))))
+    (cl-letf (((symbol-function 'slackit-api-user-info)
+               (lambda (&rest _arguments) 'synthetic-request)))
+      (let ((view (slackit-user-open app "U1" nil)))
+        (with-current-buffer (appkit-view-buffer view)
+          (let ((invalidations (appkit-invalidations-create))
+                accepted-events)
+            (setf (appkit-invalidations-parts invalidations) '(frame))
+            (cl-letf (((symbol-function 'slackit-user--accept-events)
+                       (lambda (events) (setq accepted-events events)))
+                      ((symbol-function 'slackit-user--state-user)
+                       (lambda (&rest _arguments)
+                         (ert-fail
+                          "frame-only sync hydrated user resources")))
+                      ((symbol-function 'slackit-user-render)
+                       (lambda ()
+                         (ert-fail
+                          "frame-only sync rendered user profile"))))
+              (slackit-user--sync view invalidations '(profile-event)))
+            (should (equal accepted-events '(profile-event)))))))))
+
 (ert-deftest slackit-contract-user-views-own-exact-account-identities ()
   (slackit-test-with-app (app "user-views")
     (let ((state (slackit-runtime-state app))

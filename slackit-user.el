@@ -337,14 +337,14 @@
   (when (slackit-user--view-current-p view (cadr (appkit-view-id view)))
     (with-current-buffer (appkit-view-buffer view)
       (slackit-user--accept-events events)
-      (when-let* ((user (slackit-user--state-user view)))
-        (slackit-avatar-ensure (appkit-view-app view) user)
-        (when-let* ((status-emoji
-                     (slackit-user--present-string
-                      (alist-get 'status_emoji (alist-get 'profile user)))))
-          (slackit-emoji-ensure-message
-           (appkit-view-app view) `((text . ,status-emoji)))))
-      (when (appkit-invalidations-any-p invalidations)
+      (when (appkit-invalidations-affect-p invalidations '(profile))
+        (when-let* ((user (slackit-user--state-user view)))
+          (slackit-avatar-ensure (appkit-view-app view) user)
+          (when-let* ((status-emoji
+                       (slackit-user--present-string
+                        (alist-get 'status_emoji (alist-get 'profile user)))))
+            (slackit-emoji-ensure-message
+             (appkit-view-app view) `((text . ,status-emoji)))))
         (appkit-with-content-update view
           (slackit-user-render))))))
 
