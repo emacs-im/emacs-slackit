@@ -19,7 +19,7 @@
 (require 'appkit-chat-completion)
 (require 'appkit-chat-history)
 (require 'appkit-chat-timeline)
-(require 'appkit-view)
+(require 'appkit-presentation)
 (require 'slackit-customize)
 (require 'slackit-history)
 (require 'slackit-runtime)

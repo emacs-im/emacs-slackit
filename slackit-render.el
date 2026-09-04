@@ -19,7 +19,7 @@
 (require 'appkit-chat-ins)
 (require 'appkit-name-color)
 (require 'appkit-ui)
-(require 'appkit-view)
+(require 'appkit-presentation)
 (require 'slackit-code)
 (require 'slackit-avatar)
 (require 'slackit-emoji)

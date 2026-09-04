@@ -15,7 +15,7 @@
 (require 'appkit-invalidation)
 (require 'appkit-chat-history)
 (require 'appkit-chat-timeline)
-(require 'appkit-view)
+(require 'appkit-presentation)
 (require 'slackit-compose)
 (require 'slackit-history)
 (require 'slackit-render)

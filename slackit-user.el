@@ -18,7 +18,7 @@
 (require 'appkit-invalidation)
 (require 'appkit-position)
 (require 'appkit-ui)
-(require 'appkit-view)
+(require 'appkit-presentation)
 (require 'slackit-api)
 (require 'slackit-avatar)
 (require 'slackit-emoji)
@@ -219,8 +219,8 @@
                      '(:eval (slackit-user--header-line)))
          (if (null user)
              (if (slackit-runtime-user-pending-p app slackit-user--user-id)
-                 (appkit-view-insert-note-line "Loading user profile…")
-               (appkit-view-insert-note-line
+                 (appkit-presentation-insert-note-line "Loading user profile…")
+               (appkit-presentation-insert-note-line
                 "User profile is unavailable; press g to retry."
                 :face (and slackit-user--profile-error-code 'error)))
            (let* ((pixel-size (appkit-chat-avatar-two-line-pixel-size))
@@ -247,23 +247,23 @@
              (insert "\n\n"))
            (slackit-user--insert-action-buttons)
            (when (slackit-runtime-user-pending-p app slackit-user--user-id)
-             (appkit-view-insert-note-line
+             (appkit-presentation-insert-note-line
               "Refreshing user profile…" :face 'shadow))
            (when slackit-user--profile-error-code
-             (appkit-view-insert-note-line
+             (appkit-presentation-insert-note-line
               (format "Profile refresh failed: %s"
                       slackit-user--profile-error-code)
               :face 'error))
            (when slackit-user--dm-error-code
-             (appkit-view-insert-note-line
+             (appkit-presentation-insert-note-line
               (format "Unable to open direct message: %s"
                       slackit-user--dm-error-code)
               :face 'error))
-           (appkit-view-insert-note-line
+           (appkit-presentation-insert-note-line
             "g refresh · m message · a avatar · w copy mention · Y copy ID · q quit"
             :face 'shadow)
            (insert "\n")
-           (appkit-view-insert-heading-line "Profile" :face 'bold)
+           (appkit-presentation-insert-heading-line "Profile" :face 'bold)
            (slackit-user--insert-field
             "Display name" (alist-get 'display_name profile))
            (slackit-user--insert-field
@@ -283,7 +283,7 @@
                      (slackit-user--present-string
                       (alist-get 'phone profile)))
              (insert "\n")
-             (appkit-view-insert-heading-line "Contact" :face 'bold)
+             (appkit-presentation-insert-heading-line "Contact" :face 'bold)
              (slackit-user--insert-field
               "Email" (alist-get 'email profile))
              (slackit-user--insert-field
@@ -292,7 +292,7 @@
              (when (or (not (string-empty-p roles))
                        slackit-user--user-id)
                (insert "\n")
-               (appkit-view-insert-heading-line "Workspace" :face 'bold)
+               (appkit-presentation-insert-heading-line "Workspace" :face 'bold)
                (slackit-user--insert-field "Member ID" slackit-user--user-id)
                (slackit-user--insert-field "Role" roles)))
            (insert "\n")))
