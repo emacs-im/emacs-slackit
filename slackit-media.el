@@ -491,10 +491,7 @@ media source."
   "Open local image FILE through Appkit's browser-free media runtime."
   (unless (appkit-media-file-present-p file)
     (user-error "slackit: cached image is unavailable"))
-  (appkit-media-open-resource
-   (appkit-media-resource-create :file file)
-   :kind 'image
-   :client-label "slackit"))
+  (appkit-media-open-file file))
 
 (defun slackit-media--open-cached-image (resource-key)
   "Open RESOURCE-KEY's cached image locally inside Emacs."

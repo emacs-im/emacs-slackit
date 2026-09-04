@@ -286,11 +286,7 @@ an existing private disk entry or start its account-owned acquisition."
   (let ((file (slackit-avatar-cached-file app user)))
     (unless file
       (user-error "slackit: avatar is not available locally"))
-    (appkit-media-open-resource
-     (appkit-media-resource-create :file file)
-     :kind 'image
-     :client-label "slackit")))
-
+    (appkit-media-open-file file)))
 
 (defun slackit-avatar-ensure (app user)
   "Ensure APP USER's avatar source is ready or being acquired.
