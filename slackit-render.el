@@ -427,27 +427,27 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
         (first-p t))
     (cl-labels
         ((start-block
-          ()
-          (unless first-p
-            (unless (bolp) (insert "\n")))
-          (setq first-p nil))
+           ()
+           (unless first-p
+             (unless (bolp) (insert "\n")))
+           (setq first-p nil))
          (insert-section-elements
-          (elements)
-          (start-block)
-          (dolist (element elements)
-            (setq inserted-p
-                  (or (slackit-render--insert-rich-inline
-                       app state element)
-                      inserted-p))))
+           (elements)
+           (start-block)
+           (dolist (element elements)
+             (setq inserted-p
+                   (or (slackit-render--insert-rich-inline
+                        app state element)
+                       inserted-p))))
          (insert-preformatted
-          (element)
-          (start-block)
-          (let ((code
-                 (slackit-render--rich-preformatted-text element))
-                (language
-                 (alist-get 'language element)))
-            (insert (slackit-code-block-string app code language))
-            (setq inserted-p t))))
+           (element)
+           (start-block)
+           (let ((code
+                  (slackit-render--rich-preformatted-text element))
+                 (language
+                  (alist-get 'language element)))
+             (insert (slackit-code-block-string app code language))
+             (setq inserted-p t))))
       (dolist
           (block (alist-get 'blocks message))
         (pcase (alist-get 'type block)
