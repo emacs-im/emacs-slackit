@@ -13,7 +13,7 @@
 (require 'subr-x)
 (require 'appkit-core)
 (require 'appkit-directory)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'appkit-projection)
 (require 'slackit-customize)
 (require 'slackit-runtime)
@@ -85,14 +85,6 @@
      :payload conversation-id
      :stamp (list name unread-p conversation))))
 
-(defun slackit-root--ensure-visible-users (app state)
-  "Request unknown direct-message users visible in APP directory STATE."
-  (dolist (conversation-id (slackit-state-joined-conversation-ids state))
-    (when-let* ((conversation
-                 (slackit-state-conversation state conversation-id))
-                (user-id (alist-get 'user conversation)))
-      (slackit-runtime-ensure-user app (format "%s" user-id)))))
-
 (defun slackit-root--entries (state)
   "Project STATE into a flat Appkit directory entry sequence."
   (let ((buckets (list (cons 'direct nil)
@@ -138,26 +130,9 @@
 
 (defun slackit-root--activate (_surface entry)
   "Open the exact conversation carried by directory ENTRY."
-  (when-let* ((view (appkit-current-view))
+  (when-let* ((view (appkit-current-surface))
               (conversation-id (appkit-directory-entry-payload entry)))
-    (slackit-room-open (appkit-view-app view) conversation-id t)))
-
-(defun slackit-root--sync (view invalidations events)
-  "Synchronize root VIEW from INVALIDATIONS and EVENTS."
-  (let ((diff
-         (appkit-projection-diff-derive
-          invalidations
-          :reconcile-parts '(status entries)
-          :reconcile (not (null events)))))
-    (when (appkit-projection-diff-reconcile-p diff)
-      (let* ((app (appkit-view-app view))
-             (surface (appkit-directory-surface))
-             (state (slackit-runtime-state app)))
-        (slackit-root--ensure-visible-users app state)
-        (appkit-directory-reconcile
-         surface (slackit-root--entries state)
-         :force-keys (appkit-projection-diff-force-keys diff)
-         :preserve-position-p t)))))
+    (slackit-room-open (appkit-surface-app view) conversation-id t)))
 
 (defun slackit-root--setup (_view)
   "Configure the current root directory adapter."
@@ -166,31 +141,28 @@
    :activate-function #'slackit-root--activate))
 
 (defun slackit-root-open (app &optional select)
-  "Open APP's stable account root and optionally SELECT it."
-  (let* ((existing (appkit-view-for-id app '(root)))
-         (view (appkit-open-view
-                :app app
-                :id '(root)
-                :mode 'slackit-root-mode
-                :buffer-name (format "*Slackit:%s*" (appkit-app-id app))
-                :state (appkit-app-id app)
-                :sync-function #'slackit-root--sync
-                :parts '(status entries)
-                :setup #'slackit-root--setup
-                :select select)))
-    (unless existing
-      (appkit-invalidate view :structure t)
-      (appkit-sync-invalidations view))
-    view))
+  "Open APP's account directory Surface."
+  (let* ((id '(root))
+         (surface (or (appkit-app-surface app id)
+                      (appkit-open-generated-surface
+                       (slackit-runtime--surface-type 'root #'slackit-root-mode)
+                       :app app :identity id :input id
+                       :buffer (slackit-runtime--host-buffer app id 'slackit-root-mode)
+                       :buffer-name (format "*Slackit:%s*" (appkit-app-identity app))))))
+    (slackit-runtime--remember-host surface)
+    (with-current-buffer (appkit-surface-buffer surface)
+      (slackit-runtime-render surface))
+    (when select (pop-to-buffer (appkit-surface-buffer surface)))
+    surface))
 
 (defun slackit-root-refresh ()
   "Restart cursor-complete bootstrap for the current root account."
   (interactive)
-  (let* ((view (appkit-current-view))
-         (app (and (appkit-view-p view) (appkit-view-app view))))
-    (unless (and (appkit-view-live-p view)
-                 (eq (appkit-app-kind app) 'slackit-account)
-                 (equal (appkit-view-id view) '(root)))
+  (let* ((view (appkit-current-surface))
+         (app (and (appkit-surface-p view) (appkit-surface-app view))))
+    (unless (and (appkit-surface-live-p view)
+                 (slackit-runtime-account-p app)
+                 (equal (appkit-surface-identity view) '(root)))
       (user-error "slackit: this command requires a live Slackit root view"))
     (slackit-bootstrap-account app)))
 

@@ -16,7 +16,7 @@
 (require 'appkit-compose)
 (require 'appkit-compose-edit)
 (require 'appkit-core)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'appkit-chatbuf)
 (require 'appkit-ui)
 (require 'slackit-api)
@@ -36,7 +36,6 @@
 
 (defconst slackit-compose--snippet-size-limit (* 1024 1024)
   "Slack's documented external-upload limit for code snippets.")
-
 
 (defun slackit-compose--escape (text)
   "Escape ordinary composer TEXT for Slack mrkdwn transport."
@@ -176,11 +175,11 @@ code spans become language-declared `rich_text_preformatted' elements."
         code-seen-p)
     (cl-labels
         ((flush-ordinary
-          ()
-          (let ((text (apply #'concat (nreverse ordinary))))
-            (setq ordinary nil)
-            (when (string-match-p "\\S-" text)
-              (push (slackit-compose--rich-section-block text) blocks)))))
+           ()
+           (let ((text (apply #'concat (nreverse ordinary))))
+             (setq ordinary nil)
+             (when (string-match-p "\\S-" text)
+               (push (slackit-compose--rich-section-block text) blocks)))))
       (while (< position finish)
         (let* ((object
                 (get-text-property
@@ -410,11 +409,11 @@ object atomically.  Cancellation leaves the exact room/thread draft unchanged."
            :display-action slackit-compose-code-edit-display-buffer-action
            :validation-function #'slackit-compose--validate-code-block)))
     (when code
-      (unless (and (appkit-view-live-p view)
+      (unless (and (appkit-surface-live-p view)
                    (buffer-live-p composer-buffer))
         (user-error "slackit: the originating composer is no longer live"))
       (with-current-buffer composer-buffer
-        (unless (eq view (appkit-current-view))
+        (unless (eq view (appkit-current-surface))
           (user-error "slackit: the originating composer changed"))
         (slackit-compose--insert-code-block-object
          (list :type 'code-block
@@ -616,24 +615,24 @@ Interactively prefer the attachment at point, otherwise select by safe name."
 
 (defun slackit-compose--queue-settlement (view event)
   "Queue composer settlement EVENT for live VIEW."
-  (when (appkit-view-live-p view)
-    (appkit-view-enqueue-event view event)
-    (appkit-request-sync view :part 'composer)))
+  (when (appkit-surface-live-p view)
+    (slackit-runtime-deliver view event)
+    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))
 
 (defun slackit-compose--operation-key (view revision)
   "Return stable in-flight composer key for VIEW and REVISION."
-  (list 'compose (appkit-view-id view) revision))
+  (list 'compose (appkit-surface-identity view) revision))
 
 (defun slackit-compose--existing-operation-p (app key)
   "Return non-nil when APP already owns current operation KEY."
-  (when-let* ((operation (gethash key (appkit-app-request-table app))))
+  (when-let* ((operation (gethash key (slackit-runtime-operations app))))
     (slackit-runtime-operation-current-p app operation)))
 
 (defun slackit-compose--appkit-state-changed (_session)
   "Refresh generated composer status after Appkit compose state changes."
-  (when-let* ((view (appkit-current-view))
-              ((appkit-view-live-p view)))
-    (appkit-request-sync view :part 'frame)))
+  (when-let* ((view (appkit-current-surface))
+              ((appkit-surface-live-p view)))
+    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))
 
 (defun slackit-compose-setup ()
   "Attach Appkit compose ownership to the current Slack chatbuf."
@@ -704,7 +703,7 @@ Interactively prefer the attachment at point, otherwise select by safe name."
                   (appkit-compose-operation-current-p owner))))
          (current-p ()
            (and (not canceled)
-                (appkit-view-live-p view)
+                (appkit-surface-live-p view)
                 (owned-p)))
          (update (label progress)
            (when (current-p)
@@ -922,7 +921,7 @@ Interactively prefer the attachment at point, otherwise select by safe name."
 Local attachments run through Slack's external upload workflow and are shared
 with the captured text as one completion write."
   (interactive)
-  (let* ((view (or (appkit-current-view)
+  (let* ((view (or (appkit-current-surface)
                    (user-error "slackit: no live chat view")))
          (app (slackit-room-current-app))
          (conversation-id (slackit-room-current-conversation-id))
@@ -932,7 +931,7 @@ with the captured text as one completion write."
          (blocks (slackit-compose-blocks input))
          (revision (appkit-chatbuf-composer-revision))
          (aux (copy-tree (appkit-chatbuf-aux-state)))
-         (view-id (appkit-view-id view))
+         (view-id (appkit-surface-identity view))
          (view-kind (car-safe view-id))
          (root-ts (and (eq view-kind 'thread) (nth 2 view-id)))
          (edit-p (eq (plist-get aux :aux-type) 'edit))
@@ -1024,11 +1023,11 @@ with the captured text as one completion write."
 (defun slackit-compose-cancel-context ()
   "Cancel the current reply/edit context and clear its operation draft."
   (interactive)
-  (let* ((view (appkit-current-view))
-         (view-id (and (appkit-view-live-p view)
-                       (appkit-view-id view))))
+  (let* ((view (appkit-current-surface))
+         (view-id (and (appkit-surface-live-p view)
+                       (appkit-surface-identity view))))
     (unless (and view-id
-                 (eq (appkit-app-kind (appkit-view-app view))
+                 (eq (appkit-app-type-name (appkit-app-type (appkit-surface-app view)))
                      'slackit-account)
                  (memq (car-safe view-id) '(room thread)))
       (user-error "slackit: no live room or thread view"))

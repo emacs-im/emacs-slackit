@@ -30,6 +30,26 @@
                (:constructor slackit-realtime-timer-create))
   app generation kind token timer handle)
 
+(defun slackit-realtime--source-start (_context app emit _closed)
+  "Own APP's existing reconnecting transport as one cancellable Source."
+  (let ((transport (slackit-runtime-transport app)))
+    (setf (slackit-transport-source-emit transport) emit)
+    (slackit-realtime--start-transport app)
+    (appkit-source-cancellation-create
+     :kind 'transport
+     :cancel (lambda ()
+               (when (eq emit (slackit-transport-source-emit transport))
+                 (setf (slackit-transport-source-emit transport) nil)
+                 (slackit-realtime--disconnect-current app)
+                 (slackit-realtime--cancel-field-timer
+                  transport #'slackit-transport-reconnect-timer
+                  (lambda (value object)
+                    (setf (slackit-transport-reconnect-timer object) value))))))))
+
+(defun slackit-realtime-start (app)
+  "Commit demand for APP's authenticated live realtime Source."
+  (appkit-app-send app 'slackit-realtime-start))
+
 (defconst slackit-realtime--browser-start-args
   "?agent=client&org_wide_aware=true&agent_version=1785403654&eac_cache_ts=true&cache_ts=0&name_tagging=true&only_self_subteams=true&connect_only=true&ms_latest=true"
   "Captured Slack browser client arguments encoded into the WebSocket URL.")
@@ -66,14 +86,16 @@
       (error nil))))
 
 (defun slackit-realtime--publish-connection (app status)
-  "Set APP connection STATUS and invalidate dependent views."
-  (slackit-state-set-connection-status (slackit-runtime-state app) status)
-  (slackit-runtime-publish-changes app (list (list :kind 'connection))))
+  "Emit transport STATUS through APP's live Source."
+  (let ((event (list :kind 'connection-status :status status))
+        (emit (slackit-transport-source-emit (slackit-runtime-transport app))))
+    (if emit (funcall emit event)
+      (slackit-runtime-reduce-event app event))))
 
 (defun slackit-realtime--generation-current-p (app generation)
   "Return non-nil when APP owns realtime connection GENERATION."
   (and (appkit-app-live-p app)
-       (let ((transport (appkit-app-transport app)))
+       (let ((transport (slackit-runtime-transport app)))
          (and (slackit-transport-p transport)
               (not (slackit-transport-stopping-p transport))
               (= generation
@@ -167,7 +189,7 @@
 (defun slackit-realtime--connection-current-p (connection &optional websocket)
   "Return non-nil when CONNECTION and optional WEBSOCKET own publication."
   (let* ((app (slackit-realtime-connection-app connection))
-         (transport (and (appkit-app-p app) (appkit-app-transport app)))
+         (transport (and (appkit-app-p app) (slackit-runtime-transport app)))
          (owned (slackit-realtime-connection-websocket connection))
          (handle (slackit-realtime-connection-handle connection)))
     (and (slackit-realtime--generation-current-p
@@ -181,7 +203,7 @@
 (defun slackit-realtime--cancel-connection (connection)
   "Close WebSocket held by CONNECTION without publishing callbacks."
   (let* ((app (slackit-realtime-connection-app connection))
-         (transport (and (appkit-app-p app) (appkit-app-transport app)))
+         (transport (and (appkit-app-p app) (slackit-runtime-transport app)))
          (websocket (slackit-realtime-connection-websocket connection)))
     (when (and (slackit-transport-p transport)
                (eq connection (slackit-transport-connection transport)))
@@ -287,10 +309,12 @@
        (setf (slackit-transport-ready-p transport) t
              (slackit-transport-reconnect-attempt transport) 0)
        (slackit-realtime--start-heartbeat app)
-       (slackit-runtime-reduce-event app event))
+       (when-let* ((emit (slackit-transport-source-emit transport)))
+         (funcall emit event)))
       ('pong (slackit-realtime--handle-pong app event))
       ('ignored nil)
-      (_ (slackit-runtime-reduce-event app event)))))
+      (_ (when-let* ((emit (slackit-transport-source-emit transport)))
+           (funcall emit event))))))
 
 (defun slackit-realtime--frame-text (frame)
   "Return complete WebSocket FRAME payload text, or nil."
@@ -382,7 +406,6 @@
        (slackit-realtime--schedule-reconnect app)
        nil))))
 
-
 (defun slackit-realtime--open-gateway (app)
   "Open APP's authenticated Slack Web/Desktop realtime gateway."
   (if-let* ((url (slackit-realtime--gateway-url app)))
@@ -421,7 +444,7 @@
               (slackit-transport-reconnect-timer transport) owner)
         owner))))
 
-(defun slackit-realtime-start (app)
+(defun slackit-realtime--start-transport (app)
   "Start generation-fenced Slack Web/Desktop realtime for APP."
   (let ((transport (slackit-runtime-transport app)))
     (slackit-realtime--cancel-field-timer

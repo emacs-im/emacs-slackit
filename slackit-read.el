@@ -47,7 +47,7 @@
   (let* ((state (slackit-runtime-state app))
          (known (slackit-state-read-ts state conversation-id))
          (key (list 'mark conversation-id))
-         (existing (gethash key (appkit-app-request-table app))))
+         (existing (gethash key (slackit-runtime-operations app))))
     (cond
      ((or (null ts) (and known (not (string< known ts)))) nil)
      ((slackit-runtime-operation-current-p app existing)
@@ -69,16 +69,16 @@
 (defun slackit-read-mark-at-point ()
   "Mark the current room read through the exact row at point."
   (interactive)
-  (let* ((view (or (appkit-current-view)
+  (let* ((view (or (appkit-current-surface)
                    (user-error "slackit: no live room view")))
-         (view-id (appkit-view-id view)))
+         (view-id (appkit-surface-identity view)))
     (unless (eq (car-safe view-id) 'room)
       (user-error "slackit: thread read marking is outside this slice"))
     (let ((ts (slackit-room-message-ts-at-point)))
       (unless (and ts (member ts (appkit-chat-timeline-keys)))
         (user-error "slackit: point has not reached an exact message row"))
       (slackit-read-mark
-       (appkit-view-app view)
+       (appkit-surface-app view)
        (slackit-room-current-conversation-id)
        ts)
       (message "slackit: marking read through %s" ts))))

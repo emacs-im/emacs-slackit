@@ -5,7 +5,7 @@
 ;; Author: Slackit contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (appkit "0.2.19") (browser-session "0.1.0") (plz "0.8") (transient "0.7") (websocket "1.16"))
+;; Package-Requires: ((emacs "32.0") (appkit "0.3.0") (browser-session "0.1.0") (plz "0.8") (transient "0.7") (websocket "1.16"))
 ;; URL: https://github.com/emacs-slack/emacs-slackit
 
 ;;; Commentary:
@@ -43,105 +43,98 @@
 (require 'slackit-root)
 (require 'slackit-transient)
 
+(defun slackit--bootstrap-start (_context input observe resolve reject)
+  "Start the finite identity and cursor-complete bootstrap acquisition."
+  (pcase-let ((`(,app ,_ ,_) input))
+    (let ((remaining 2) (active t) identity-request pages)
+      (cl-labels
+          ((done () (when (and active (zerop (cl-decf remaining)))
+                      (setq active nil) (funcall resolve t)))
+           (failed (reason)
+             (when active
+               (setq active nil)
+               (when (slackit-http-request-p identity-request)
+                 (slackit-http-cancel identity-request))
+               (when (appkit-handle-p pages) (appkit-cancel-handle pages))
+               (funcall reject reason))))
+        (setq identity-request
+              (slackit-api-auth-test
+               app :on-success (lambda (body)
+                                 (when active (funcall observe 'identity body) (done)))
+               :on-error #'failed))
+        (when active
+          (setq pages
+                (slackit-api-conversations-list-all
+                 app :on-page (lambda (items)
+                                (when active (funcall observe 'conversations items)))
+                 :on-complete (lambda ()
+                                (when active (funcall observe 'conversations-complete nil) (done)))
+                 :on-error #'failed)))
+        (appkit-cancellation-create
+         :kind 'transport
+         :cancel (lambda ()
+                   (setq active nil)
+                   (when (slackit-http-request-p identity-request)
+                     (slackit-http-cancel identity-request))
+                   (when (appkit-handle-p pages) (appkit-cancel-handle pages))))))))
+
+(defun slackit-bootstrap-update (context model message)
+  "Commit bootstrap observations and return routing and acquisition commands."
+  (pcase-let ((`(slackit-bootstrap ,phase ,input . ,payload) message))
+    (pcase-let ((`(,app ,operation ,ready) input))
+      (let ((state (slackit-runtime-model-state model)) commands)
+        (when (slackit-runtime-operation-current-p app operation)
+          (pcase phase
+            ('begin
+             (push (appkit-command-start-effect
+                    (appkit-effect-create
+                     :key 'bootstrap :input input :start #'slackit--bootstrap-start
+                     :cancellation-requirement 'transport
+                     :observe (lambda (input kind value)
+                                (list 'slackit-bootstrap kind input value))
+                     :observation-policy 'lossless :observation-pending-limit 128
+                     :success (lambda (input &rest _) (list 'slackit-bootstrap 'complete input))
+                     :failure (lambda (input reason) (list 'slackit-bootstrap 'failed input reason))))
+                   commands))
+            ('identity
+             (let* ((body (car payload))
+                    (team (alist-get 'team_id body)) (user (alist-get 'user_id body)))
+               (if (not (slackit-runtime-bind-credential-identity app team user))
+                   (progn
+                     (slackit-state-set-bootstrap-error state "identity_mismatch")
+                     (slackit-runtime-operation-end app operation)
+                     (push (appkit-command-cancel-effect 'bootstrap) commands))
+                 (let ((self (list (cons 'id user) (cons 'name (alist-get 'user body)))))
+                   (slackit-state-put-team-self
+                    state (list (cons 'id team) (cons 'name (alist-get 'team body))) self)
+                   (slackit-state-put-user state self))
+                 (slackit-state-set-bootstrap-complete state 'identity)
+                 (when ready
+                   (setf (slackit-runtime-model-realtime-p model) t)
+                   (push (appkit-command-start-effect (slackit-emoji-catalog-effect app)) commands)))))
+            ('conversations (slackit-state-put-conversations state (car payload)))
+            ('conversations-complete (slackit-state-set-bootstrap-complete state 'conversations))
+            ('complete (slackit-runtime-operation-end app operation))
+            ('failed
+             (slackit-state-set-bootstrap-error state
+                                                (or (plist-get (car payload) :code) "request_failed"))
+             (slackit-runtime-operation-end app operation))))
+        (let ((next (slackit-runtime--app-update context model '(slackit-changes ((:kind bootstrap))))))
+          (appkit-next :model model :render appkit-render-none
+                       :commands (append (nreverse commands) (appkit-next-commands next))))))))
+
 (with-eval-after-load 'evil
   (require 'slackit-evil))
 
-(defun slackit--bootstrap-failure (app operation error-data)
-  "Settle APP bootstrap OPERATION with redacted ERROR-DATA."
-  (when (slackit-runtime-operation-current-p app operation)
-    (slackit-state-set-bootstrap-error
-     (slackit-runtime-state app)
-     (or (plist-get error-data :code) "request_failed"))
-    (slackit-runtime-operation-end app operation)
-    (slackit-runtime-publish-bootstrap app)))
-
-(defun slackit--bootstrap-maybe-complete (app operation)
-  "Retire APP bootstrap OPERATION when every collection is complete."
-  (when (and (slackit-runtime-operation-current-p app operation)
-             (slackit-state-bootstrap-ready-p
-              (slackit-runtime-state app)))
-    (slackit-runtime-operation-end app operation))
-  (slackit-runtime-publish-bootstrap app))
-
-(defun slackit--bootstrap-identity-success
-    (app operation body &optional identity-ready-function)
-  "Reduce auth.test BODY for current APP bootstrap OPERATION.
-
-After binding the authenticated identity, call IDENTITY-READY-FUNCTION with
-APP when it is non-nil."
-  (when (slackit-runtime-operation-current-p app operation)
-    (let ((team-id (alist-get 'team_id body))
-          (user-id (alist-get 'user_id body)))
-      (if (not (slackit-runtime-bind-credential-identity
-                app team-id user-id))
-          (slackit--bootstrap-failure
-           app operation '(:code "identity_mismatch"))
-        (let* ((state (slackit-runtime-state app))
-               (team `((id . ,team-id)
-                       (name . ,(alist-get 'team body))))
-               (self `((id . ,user-id)
-                       (name . ,(alist-get 'user body)))))
-          (slackit-state-put-team-self state team self)
-          (slackit-state-put-user state self)
-          (slackit-state-set-bootstrap-complete state 'identity)
-          (slackit--bootstrap-maybe-complete app operation)
-          (when identity-ready-function
-            (funcall identity-ready-function app)))))))
-
-
-(defun slackit--bootstrap-conversations-page (app operation conversations)
-  "Reduce one CONVERSATIONS page for current APP bootstrap OPERATION."
-  (when (slackit-runtime-operation-current-p app operation)
-    (let* ((state (slackit-runtime-state app))
-           (ids (slackit-state-put-conversations state conversations)))
-      (slackit-runtime-publish-changes
-       app (mapcar (lambda (id)
-                     (list :kind 'conversation :conversation-id id))
-                   ids)))))
-
-(defun slackit--bootstrap-collection-complete (app operation kind)
-  "Mark APP bootstrap collection KIND complete for OPERATION."
-  (when (slackit-runtime-operation-current-p app operation)
-    (slackit-state-set-bootstrap-complete
-     (slackit-runtime-state app) kind)
-    (slackit--bootstrap-maybe-complete app operation)))
-
-(defun slackit-bootstrap-account (app &optional identity-ready-function)
-  "Start identity and conversation bootstrap for APP.
-
-Call IDENTITY-READY-FUNCTION with APP after `auth.test' binds the credential's
-workspace identity.  The user cache is ready immediately and grows through
-exact `users.info' lookups requested by visible conversations and messages.
-Startup never scans the workspace-wide `users.list' collection."
-  (let* ((key '(bootstrap))
-         (operation (slackit-runtime-operation-begin app key))
-         (state (slackit-runtime-state app))
-         (failure (apply-partially
-                   #'slackit--bootstrap-failure app operation)))
+(defun slackit-bootstrap-account (app &optional start-services-p)
+  "Commit finite identity and cursor-complete bootstrap for APP."
+  (let* ((operation (slackit-runtime-operation-begin app '(bootstrap)))
+         (state (slackit-runtime-state app)))
     (slackit-state-bootstrap-reset state)
     (slackit-state-set-bootstrap-complete state 'users)
-    (slackit-runtime-publish-bootstrap app)
-    (slackit-api-auth-test
-     app
-     :on-success
-     (lambda (body)
-       (slackit--bootstrap-identity-success
-        app operation body identity-ready-function))
-     :on-error failure)
-    (slackit-api-conversations-list-all
-     app
-     :on-page (apply-partially
-               #'slackit--bootstrap-conversations-page app operation)
-     :on-complete (apply-partially
-                   #'slackit--bootstrap-collection-complete
-                   app operation 'conversations)
-     :on-error failure)
+    (appkit-app-send app (list 'slackit-bootstrap 'begin
+                               (list app operation start-services-p)))
     operation))
-
-(defun slackit--start-authenticated-services (app)
-  "Start realtime and custom emoji services for authenticated APP."
-  (slackit-realtime-start app)
-  (slackit-emoji-load-catalog app))
 
 (defun slackit-start-account (account-id &optional credential)
   "Start ACCOUNT-ID, authenticate it, start realtime, and open its root.
@@ -161,7 +154,7 @@ When CREDENTIAL is nil, resolve it through
     (slackit-root-open app t)
     (unless existing
       (slackit-bootstrap-account
-       app #'slackit--start-authenticated-services))
+       app t))
     app))
 
 (defun slackit--login-error (account-id error)
@@ -224,7 +217,7 @@ When CREDENTIAL is nil, resolve it through
   (interactive)
   (let* ((ids (delete-dups
                (append slackit-account-ids
-                       (mapcar (lambda (app) (format "%s" (appkit-app-id app)))
+                       (mapcar (lambda (app) (format "%s" (appkit-app-identity app)))
                                (slackit-runtime-accounts)))))
          (account-id
           (if ids
@@ -242,7 +235,7 @@ When CREDENTIAL is nil, resolve it through
   "Stop live Slackit ACCOUNT-ID and all of its owned resources."
   (interactive
    (list
-    (let ((ids (mapcar (lambda (app) (format "%s" (appkit-app-id app)))
+    (let ((ids (mapcar (lambda (app) (format "%s" (appkit-app-identity app)))
                        (slackit-runtime-accounts))))
       (unless ids (user-error "slackit: no live accounts"))
       (completing-read "Stop Slackit account: " ids nil t))))

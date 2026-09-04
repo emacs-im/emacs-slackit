@@ -6,28 +6,188 @@
 (require 'cl-lib)
 (require 'slackit)
 
+(ert-deftest slackit-contract-concurrent-media-cancellation-is-surface-local ()
+  (slackit-test-with-app (app "media-owners")
+    (let (first second transfers)
+      (cl-letf (((symbol-function 'slackit-history-load-latest) #'ignore))
+        (setq first (slackit-room-open app "C1")
+              second (slackit-room-open app "C2")))
+      (let ((key (slackit-media--register-content-spec
+                  app '(file "shared") 'document
+                  "https://files.slack.com/files-pri/T1-F1/shared.pdf"
+                  "shared.pdf" "application/pdf" 16)))
+        (cl-letf (((symbol-function 'plz)
+                   (lambda (_method _url &rest options)
+                     (let ((file (cadr (plist-get options :as))))
+                       (with-temp-file file (insert "synthetic content"))
+                       (push (cons file (plist-get options :then)) transfers))
+                     nil)))
+          (with-current-buffer (appkit-surface-buffer first) (slackit-media--download-content key))
+          (with-current-buffer (appkit-surface-buffer second) (slackit-media--download-content key))
+          (let ((second-transfer (car transfers)) (first-transfer (cadr transfers)))
+            (should-not (equal (car first-transfer) (car second-transfer)))
+            (with-current-buffer (appkit-surface-buffer first) (slackit-media--cancel-content key))
+            (should-not (file-exists-p (car first-transfer)))
+            (should (file-exists-p (car second-transfer)))
+            (funcall (cdr first-transfer) (car first-transfer))
+            (funcall (cdr second-transfer) (car second-transfer))
+            (slackit-test-drain)
+            (should (appkit-surface-live-p second))
+            (should (file-regular-p
+                     (slackit-media--content-cached-file key (slackit-media--content-spec-current key))))))))))
+
+(define-derived-mode slackit-test-compose-mode slackit-room-mode "Slackit-Test"
+  "Isolated derived composer mode for stopped-host lifecycle coverage.")
+
+(ert-deftest slackit-contract-stopped-host-reopens-with-derived-structured-draft ()
+  (slackit-test-with-app (app "reopen")
+    (slackit-state-put-conversation (slackit-runtime-state app)
+                                    '((id . "C1") (name . "general") (is_member . t)))
+    (cl-letf (((symbol-function 'slackit-history-load-latest) #'ignore))
+      (let* ((first (slackit-room-open app "C1"))
+             (buffer (appkit-surface-buffer first)) second replacement expected-wire)
+        (with-current-buffer buffer
+          (slackit-test-compose-mode)
+          (appkit-chatbuf-input-state-set
+           (concat (appkit-chatbuf-input-object-string
+                    "@User" '(:type user :id "U1" :label "User")) " draft"))
+          (setq expected-wire (slackit-compose-serialize (appkit-chatbuf-input-state)))
+          (appkit-chatbuf-aux-set
+           (list :aux-type 'reply :message-id "1.000001"
+                 :preview "Reply context")))
+        (setq second (slackit-room-open app "C1"))
+        (should-not (eq first second))
+        (should-not (appkit-surface-live-p first))
+        (should (eq buffer (appkit-surface-buffer second)))
+        (with-current-buffer buffer
+          (should (eq major-mode 'slackit-test-compose-mode))
+          (should (equal expected-wire (slackit-compose-serialize (appkit-chatbuf-input-state))))
+          (should (equal "1.000001" (appkit-chatbuf-aux-message-id))))
+        (slackit-runtime-stop-account app)
+        (setq replacement (slackit-runtime-start-account "reopen" '(:token "xoxp-REPLACEMENT")))
+        (unwind-protect
+            (let ((third (slackit-room-open replacement "C1")))
+              (should (eq buffer (appkit-surface-buffer third)))
+              (should-not (appkit-surface-live-p second))
+              (with-current-buffer buffer
+                (should (eq major-mode 'slackit-test-compose-mode))
+                (should (equal expected-wire (slackit-compose-serialize (appkit-chatbuf-input-state))))))
+          (slackit-runtime-stop-account replacement))))))
+
+(ert-deftest slackit-contract-user-acquisition-burst-settles-without-dropping-identities ()
+  "A directory larger than the Effect capacity eventually hydrates every user."
+  (slackit-test-with-app (app "user-burst")
+    (let ((callbacks (make-hash-table :test #'equal)) (calls 0))
+      (cl-letf (((symbol-function 'slackit-api-user-info)
+                 (lambda (owner id &rest options)
+                   (cl-incf calls)
+                   (puthash id (plist-get options :on-success) callbacks)
+                   (slackit-test-request owner (plist-get options :owner)))))
+        (dotimes (index 40)
+          (let ((id (format "U%d" index)))
+            (slackit-runtime-ensure-user app id)
+            (slackit-runtime-ensure-user app id)))
+        (dotimes (_ 40)
+          (let (id callback)
+            (maphash (lambda (key value) (unless id (setq id key callback value))) callbacks)
+            (should id)
+            (remhash id callbacks)
+            (funcall callback (list (cons 'user (list (cons 'id id) (cons 'name id)))))
+            (slackit-test-drain)))
+        (should (appkit-app-live-p app))
+        (should (= calls 40))
+        (dotimes (index 40)
+          (let ((id (format "U%d" index)))
+            (should (equal id (slackit-state-user-name (slackit-runtime-state app) id)))))))))
+
+(defvar slackit-test--apps nil)
+
+(defun slackit-test-drain ()
+  "Drain only the isolated fixtures' canonical loops."
+  (let ((remaining 64) pending)
+    (while (and (> remaining 0)
+                (progn
+                  (setq pending nil)
+                  (dolist (app slackit-test--apps)
+                    (when (appkit-app-live-p app)
+                      (when (> (appkit-loop-pending-count (appkit-app-loop app)) 0)
+                        (setq pending t)
+                        (appkit-loop-run-pass (appkit-app-loop app)))
+                      (maphash
+                       (lambda (_id entry)
+                         (let ((surface (cdr entry)))
+                           (when (and (appkit-surface-live-p surface)
+                                      (> (appkit-loop-pending-count (appkit-surface-loop surface)) 0))
+                             (setq pending t)
+                             (appkit-loop-run-pass (appkit-surface-loop surface)))))
+                       (appkit-app-surfaces app))))
+                  pending))
+      (setq remaining (1- remaining)))
+    (when (zerop remaining) (ert-fail "Fixture loops failed to settle"))))
+
+(defun slackit-test-request (app &optional owner)
+  "Return an actual request and handle over the fixture's synthetic transport."
+  (slackit-http-request app "test.fixture" :owner (or owner app)))
+
 (cl-defmacro slackit-test-with-app ((variable id) &rest body)
-  "Run BODY with fresh Slackit app VARIABLE named ID, then clean it up."
+  "Run BODY with an isolated canonical App and synthetic transport."
   (declare (indent 1))
-  `(let* ((,variable
-           (slackit-runtime-start-account
-            ,id (list :token "xoxp-CANARY-TOKEN" :cookie "xoxd-CANARY-COOKIE")))
-          (buffers nil))
+  `(let* ((fixture-root (make-temp-file "slackit-runtime-test-" t))
+          (slackit-avatar-cache-directory (expand-file-name "avatars/" fixture-root))
+          (slackit-media-cache-directory (expand-file-name "media/" fixture-root))
+          (slackit-show-avatars nil)
+          (slackit-runtime--hosts (make-hash-table :test #'equal))
+          (slackit-runtime--accounts (make-hash-table :test #'equal))
+          (slackit-avatar--image-cache (make-hash-table :test #'equal))
+          (slackit-avatar--sources (make-hash-table :test #'equal))
+          (slackit-avatar--fetches (make-hash-table :test #'equal))
+          (slackit-avatar--failures (make-hash-table :test #'equal))
+          (slackit-media--content-files (make-hash-table :test #'equal))
+          (slackit-media--image-cache (make-hash-table :test #'equal))
+          (slackit-media--fetches (make-hash-table :test #'equal))
+          (slackit-media--failures (make-hash-table :test #'equal))
+          (slackit-media--open-specs (make-hash-table :test #'equal))
+          (slackit-media--audio-sessions (make-hash-table :test #'equal))
+          (slackit-code--app-caches (make-hash-table :test #'equal))
+          (slackit-avatar--prepared-cache-directory nil)
+          (slackit-media--prepared-cache-directory nil)
+          (slackit-code--fontification-buffers (make-hash-table :test #'eq))
+          (,variable (slackit-runtime-start-account
+                      ,id (list :token "xoxp-CANARY-TOKEN" :cookie "xoxd-CANARY-COOKIE")))
+          (slackit-test--apps (cons ,variable slackit-test--apps))
+          (open-surface (symbol-function 'appkit-open-generated-surface))
+          buffers)
      (unwind-protect
-         (progn ,@body)
+         (cl-letf (((symbol-function 'appkit-open-generated-surface)
+                    (lambda (type &rest options)
+                      (let ((surface (apply open-surface type options)))
+                        (when (memq (appkit-surface-app surface) slackit-test--apps)
+                          (push (appkit-surface-buffer surface) buffers))
+                        surface)))
+                   ((symbol-function 'appkit-media-inline-image-rendering-available-p)
+                    (lambda () nil))
+                   ((symbol-function 'plz) (lambda (&rest _) nil))
+                   ((symbol-function 'websocket-open)
+                    (lambda (&rest _) (error "Unexpected test WebSocket"))))
+           ,@body)
        (when (appkit-app-p ,variable)
-         (maphash (lambda (_id view)
-                    (when (buffer-live-p (appkit-view-buffer view))
-                      (push (appkit-view-buffer view) buffers)))
-                  (appkit-app-view-registry ,variable))
+         (maphash (lambda (_id entry)
+                    (when (buffer-live-p (appkit-surface-buffer (cdr entry)))
+                      (push (appkit-surface-buffer (cdr entry)) buffers)))
+                  (appkit-app-surfaces ,variable))
          (slackit-runtime-stop-account ,variable))
+       (maphash (lambda (_mode buffer)
+                  (when (buffer-live-p buffer) (push buffer buffers)))
+                slackit-code--fontification-buffers)
        (dolist (buffer buffers)
-         (when (buffer-live-p buffer) (kill-buffer buffer))))))
+         (when (buffer-live-p buffer) (kill-buffer buffer)))
+       (when (file-directory-p fixture-root) (delete-directory fixture-root t)))))
 
 (cl-defmacro slackit-test-with-auth-directory ((root) &rest body)
   "Run BODY with isolated Slackit auth/profile storage under ROOT."
   (declare (indent 1))
   `(let* ((,root (make-temp-file "slackit-auth-test-" t))
+          (slackit-auth--captures (make-hash-table :test #'equal))
           (slackit-auth-directory (expand-file-name "accounts/" ,root))
           (slackit-browser-session-profile-root
            (expand-file-name "profiles/" ,root))
@@ -207,13 +367,13 @@
        '((ts . "1710000000.000001") (text . "right")))
       (should (equal "left"
                      (alist-get 'text (slackit-state-message
-                      (slackit-runtime-state left)
-                      "C1" "1710000000.000001"))))
+                                       (slackit-runtime-state left)
+                                       "C1" "1710000000.000001"))))
       (should (equal "right"
                      (alist-get 'text (slackit-state-message
-                      (slackit-runtime-state right)
-                      "C1" "1710000000.000001"))))
-      (should-not (eq (appkit-app-state left) (appkit-app-state right))))))
+                                       (slackit-runtime-state right)
+                                       "C1" "1710000000.000001"))))
+      (should-not (eq (slackit-runtime-state left) (slackit-runtime-state right))))))
 
 (ert-deftest slackit-contract-realtime-reconnect-preserves-account-work ()
   (slackit-test-with-app (app "generation")
@@ -242,11 +402,11 @@
 (ert-deftest slackit-contract-stale-http-response-retires-handle ()
   (slackit-test-with-app (app "stale-http")
     (let* ((request
-            (slackit-http-request-create
-             :app app
-             :owner app
-             :generation (slackit-runtime-generation app)
-             :active-p t))
+             (slackit-http-request-create
+              :app app
+              :owner app
+              :generation (slackit-runtime-generation app)
+              :active-p t))
            (handle
             (appkit-register-handle
              app 'slackit-http request #'slackit-http--cancel-request)))
@@ -298,32 +458,35 @@
                  "wss://wss-backup.slack.com/?token=capability"))))
 
 (ert-deftest slackit-contract-pagination-consumes-every-cursor ()
-  (let ((calls nil)
-        (pages nil)
-        complete)
-    (cl-letf (((symbol-function 'slackit-api-request)
-               (lambda (_app endpoint &rest arguments)
-                 (let* ((parameters (plist-get arguments :parameters))
-                        (cursor (alist-get 'cursor parameters nil nil #'eq))
-                        (success (plist-get arguments :on-success)))
-                   (push (list endpoint cursor) calls)
-                   (funcall
-                    success
-                    (if cursor
+  (slackit-test-with-app (app "pagination")
+    (let ((calls nil)
+          (pages nil)
+          complete)
+      (cl-letf (((symbol-function 'slackit-api-request)
+                 (lambda (_app endpoint &rest arguments)
+                   (let* ((parameters (plist-get arguments :parameters))
+                          (cursor (alist-get 'cursor parameters nil nil #'eq))
+                          (success (plist-get arguments :on-success)))
+                     (push (list endpoint cursor) calls)
+                     (funcall
+                      success
+                      (if cursor
+                          '((ok . t)
+                            (channels . (((id . "C2"))))
+                            (response_metadata . ((next_cursor . ""))))
                         '((ok . t)
-                          (channels . (((id . "C2"))))
-                          (response_metadata . ((next_cursor . ""))))
-                      '((ok . t)
-                        (channels . (((id . "C1"))))
-                        (response_metadata . ((next_cursor . "next"))))))))))
-      (slackit-api-conversations-list-all
-       'fake-app
-       :on-page (lambda (items) (push items pages))
-       :on-complete (lambda () (setq complete t))))
-    (should complete)
-    (should (= 2 (length calls)))
-    (should (equal '(nil "next") (mapcar #'cadr (nreverse calls))))
-    (should (= 2 (length pages)))))
+                          (channels . (((id . "C1"))))
+                          (response_metadata . ((next_cursor . "next"))))))))))
+        (slackit-api-conversations-list-all
+         app
+         :on-page (lambda (items) (push items pages))
+         :on-complete (lambda () (setq complete t))))
+      (should complete)
+      (should (= 2 (length calls)))
+      (should (equal '(nil "next") (mapcar #'cadr (nreverse calls))))
+      (should (equal '("C1" "C2")
+                     (mapcar (lambda (page) (alist-get 'id (car page)))
+                             (nreverse pages)))))))
 
 (ert-deftest slackit-contract-bootstrap-readiness-is-complete-not-first-page ()
   (slackit-test-with-app (app "bootstrap")
@@ -337,39 +500,35 @@
 
 (ert-deftest slackit-contract-bootstrap-binds-identity-before-realtime ()
   (slackit-test-with-app (app "lazy-bootstrap")
-    (let (users-list-called
-          (realtime-starts 0))
-      (cl-letf
-          (((symbol-function 'slackit-api-auth-test)
-            (lambda (_app &rest arguments)
-              (funcall
-               (plist-get arguments :on-success)
-               '((ok . t) (team_id . "T1") (team . "Team")
-                 (user_id . "U0") (user . "self")))))
-           ((symbol-function 'slackit-api-conversations-list-all)
-            (lambda (_app &rest arguments)
-              (funcall (plist-get arguments :on-page) nil)
-              (funcall (plist-get arguments :on-complete))))
-           ((symbol-function 'slackit-api-users-list-all)
-            (lambda (&rest _arguments)
-              (setq users-list-called t))))
-        (slackit-bootstrap-account
-         app
-         (lambda (ready-app)
-           (should (eq app ready-app))
-           (cl-incf realtime-starts))))
-      (let* ((state (slackit-runtime-state app))
-             (credential
-              (slackit-transport-credential
-               (slackit-runtime-transport app))))
-        (should-not users-list-called)
-        (should (= 1 realtime-starts))
-        (should (equal "T1" (slackit-credential-team-id credential)))
-        (should (equal "U0" (slackit-credential-user-id credential)))
-        (should (slackit-state-bootstrap-ready-p state))
-        (should (slackit-state-user state "U0"))
-        (should-not
-         (gethash '(bootstrap) (appkit-app-request-table app)))))))
+    (let (identity-success page complete opened-team)
+      (cl-letf (((symbol-function 'slackit-api-auth-test)
+                 (lambda (owner &rest options)
+                   (setq identity-success (plist-get options :on-success))
+                   (slackit-test-request owner)))
+                ((symbol-function 'slackit-api-conversations-list-all)
+                 (lambda (owner &rest options)
+                   (setq page (plist-get options :on-page)
+                         complete (plist-get options :on-complete))
+                   (appkit-register-handle owner 'test-pages nil #'ignore)))
+                ((symbol-function 'websocket-open)
+                 (lambda (_url &rest _options)
+                   (setq opened-team (slackit-credential-team-id (slackit-runtime-credential app)))
+                   'test-websocket))
+                ((symbol-function 'websocket-close) #'ignore))
+        (slackit-bootstrap-account app t)
+        (should-not opened-team)
+        (funcall page '(((id . "C1") (name . "general") (is_member . t))))
+        (slackit-test-drain)
+        (should-not (slackit-state-bootstrap-ready-p (slackit-runtime-state app)))
+        (funcall identity-success '((team_id . "T1") (user_id . "U0") (user . "self")))
+        (slackit-test-drain)
+        (should (equal "T1" opened-team))
+        (should-not (slackit-state-bootstrap-ready-p (slackit-runtime-state app)))
+        (funcall complete)
+        (slackit-test-drain)
+        (should (slackit-state-bootstrap-ready-p (slackit-runtime-state app)))
+        (should (slackit-state-user (slackit-runtime-state app) "U0"))
+        (should-not (gethash '(bootstrap) (slackit-runtime-operations app)))))))
 
 (ert-deftest slackit-contract-lazy-user-lookups-are-deduplicated ()
   (slackit-test-with-app (app "lazy-user")
@@ -377,7 +536,8 @@
       (cl-letf (((symbol-function 'slackit-api-user-info)
                  (lambda (_app user-id &rest arguments)
                    (push user-id calls)
-                   (setq success (plist-get arguments :on-success)))))
+                   (setq success (plist-get arguments :on-success))
+                   (slackit-test-request _app (plist-get arguments :owner)))))
         (let ((first (slackit-runtime-ensure-user app "U1"))
               (second (slackit-runtime-ensure-user app "U1")))
           (should (eq first second))
@@ -385,12 +545,13 @@
           (funcall success
                    '((ok . t)
                      (user . ((id . "U1") (name . "alice")))))
+          (slackit-test-drain)
           (should (equal "alice"
                          (slackit-state-user-name
                           (slackit-runtime-state app) "U1")))
           (should-not (slackit-runtime-ensure-user app "U1"))
           (should-not
-           (gethash '(user "U1") (appkit-app-request-table app))))))))
+           (gethash '(user "U1") (slackit-runtime-operations app))))))))
 
 (ert-deftest slackit-contract-avatar-cache-is-private-and-deduplicated ()
   (let* ((root (make-temp-file "slackit-avatar-test-" t))
@@ -456,8 +617,6 @@
                                         slackit-avatar-cache-directory))))
                     (should (= #o600
                                (logand #o777 (file-modes file))))))))))
-      (clrhash slackit-avatar--fetches)
-      (clrhash slackit-avatar--failures)
       (when (file-directory-p root)
         (delete-directory root t)))))
 
@@ -485,7 +644,7 @@
         (let ((slackit-show-avatars nil)
               (slackit-right-align-timestamps t)
               (fill-column 60))
-          (cl-letf (((symbol-function 'appkit-view-responsive-width)
+          (cl-letf (((symbol-function 'appkit-surface-responsive-width)
                      (lambda (&rest _arguments) 60))
                     ((symbol-function
                       'appkit-chat-avatar-two-line-pixel-size)
@@ -513,43 +672,7 @@
                        (memq expected value)
                      (eq value expected)))))))))
 
-(ert-deftest slackit-contract-chat-views-enable-responsive-geometry ()
-  (slackit-test-with-app (app "responsive-view")
-    (slackit-state-put-conversation
-     (slackit-runtime-state app)
-     '((id . "C1") (name . "general") (is_member . t)))
-    (cl-letf (((symbol-function 'slackit-history-load-latest)
-               (lambda (&rest _arguments) nil)))
-      (let ((view (slackit-room-open app "C1" nil)))
-        (should (memq 'geometry (appkit-view-parts view)))
-        (with-current-buffer (appkit-view-buffer view)
-          (should appkit-view--responsive-geometry-p))))))
-
-
 (ert-deftest slackit-contract-geometry-redraws-timestamps-at-new-width ()
-  (with-temp-buffer
-    (let ((invalidations (appkit-invalidations-create))
-          (events '((:kind canary)))
-          applied-events
-          rendered-keys)
-      (setf (appkit-invalidations-parts invalidations) '(geometry)
-            (appkit-invalidations-entry-keys invalidations) '("changed"))
-      (cl-letf (((symbol-function 'appkit-view-responsive-width)
-                 (lambda (&rest _arguments) 44))
-                ((symbol-function 'appkit-chat-timeline-live-p)
-                 (lambda () t))
-                ((symbol-function 'appkit-chat-timeline-keys)
-                 (lambda () '("one" "two")))
-                ((symbol-function 'slackit-room--apply-event)
-                 (lambda (_view event)
-                   (push event applied-events)))
-                ((symbol-function 'slackit-room--render)
-                 (lambda (keys _resources)
-                   (setq rendered-keys keys))))
-        (slackit-room--sync 'fake-view invalidations events))
-      (should (= 44 fill-column))
-      (should (equal '("changed" "one" "two") rendered-keys))
-      (should (equal events (nreverse applied-events)))))
   (slackit-test-with-app (app "responsive-time")
     (let ((state (slackit-runtime-state app))
           (message
@@ -564,43 +687,43 @@
               (inhibit-read-only t))
           (cl-labels
               ((render-target
-                (width)
-                (erase-buffer)
-                (cl-letf (((symbol-function 'appkit-view-responsive-width)
-                           (lambda (&rest _arguments) width))
-                          ((symbol-function
-                            'appkit-chat-avatar-two-line-pixel-size)
-                           (lambda () 32)))
-                  (slackit-render-message-row
-                   app state message
-                   (slackit-room--message-context nil message)))
-                (let* ((positions
-                        (number-sequence
-                         (point-min) (max (point-min) (1- (point-max)))))
-                       (timestamp-position
-                        (seq-find
-                         (lambda (position)
-                           (eq (get-text-property position 'face)
-                               'slackit-timestamp))
-                         positions))
-                       (timestamp-line-start
-                        (and timestamp-position
-                             (save-excursion
-                               (goto-char timestamp-position)
-                               (line-beginning-position))))
-                       (spacer-position
-                        (and timestamp-position
-                             (seq-find
-                              (lambda (position)
-                                (let ((display
-                                       (get-text-property position 'display)))
-                                  (and (listp display)
-                                       (eq (car display) 'space)
-                                       (eq (cadr display) :align-to))))
-                              (number-sequence
-                               timestamp-line-start timestamp-position)))))
-                  (nth 2
-                       (get-text-property spacer-position 'display)))))
+                 (width)
+                 (erase-buffer)
+                 (cl-letf (((symbol-function 'appkit-surface-responsive-width)
+                            (lambda (&rest _arguments) width))
+                           ((symbol-function
+                             'appkit-chat-avatar-two-line-pixel-size)
+                            (lambda () 32)))
+                   (slackit-render-message-row
+                    app state message
+                    (slackit-room--message-context nil message)))
+                 (let* ((positions
+                         (number-sequence
+                          (point-min) (max (point-min) (1- (point-max)))))
+                        (timestamp-position
+                         (seq-find
+                          (lambda (position)
+                            (eq (get-text-property position 'face)
+                                'slackit-timestamp))
+                          positions))
+                        (timestamp-line-start
+                         (and timestamp-position
+                              (save-excursion
+                                (goto-char timestamp-position)
+                                (line-beginning-position))))
+                        (spacer-position
+                         (and timestamp-position
+                              (seq-find
+                               (lambda (position)
+                                 (let ((display
+                                        (get-text-property position 'display)))
+                                   (and (listp display)
+                                        (eq (car display) 'space)
+                                        (eq (cadr display) :align-to))))
+                               (number-sequence
+                                timestamp-line-start timestamp-position)))))
+                   (nth 2
+                        (get-text-property spacer-position 'display)))))
             (should (= 35 (render-target 40)))
             (should (= 55 (render-target 60)))))))))
 
@@ -754,30 +877,6 @@
       (should (equal "chat.update" (cadr update)))
       (should (stringp (alist-get 'blocks update-params))))))
 
-(ert-deftest slackit-contract-attach-dispatches-like-telega ()
-  (let ((slackit-compose-attach-commands
-         '(("code block" nil slackit-test--chosen-attach)
-           ("hidden" slackit-test--attach-unavailable
-            slackit-test--chosen-attach)))
-        chosen
-        offered)
-    (cl-letf
-        (((symbol-function 'slackit-test--chosen-attach)
-          (lambda () (interactive) (setq chosen t)))
-         ((symbol-function 'slackit-test--attach-unavailable)
-          (lambda () nil))
-         ((symbol-function 'completing-read)
-          (lambda (_prompt collection &rest _)
-            (setq offered (mapcar #'car collection))
-            "code block")))
-      (slackit-compose-attach))
-    (should chosen)
-    (should (equal '("code block") offered))
-    (should (eq #'slackit-compose-attach
-                (lookup-key slackit-room-mode-map (kbd "C-c C-a"))))
-    (should (eq #'slackit-compose-attach-file
-                (lookup-key slackit-room-mode-map (kbd "C-c C-f"))))))
-
 (ert-deftest slackit-contract-code-block-uses-owner-bound-native-editor ()
   (slackit-test-with-app (app "composer-code-block")
     (let ((state (slackit-runtime-state app))
@@ -790,7 +889,7 @@
       (cl-letf (((symbol-function 'slackit-history-load-latest)
                  (lambda (&rest _) nil)))
         (setq view (slackit-room-open app "D1" nil)))
-      (with-current-buffer (appkit-view-buffer view)
+      (with-current-buffer (appkit-surface-buffer view)
         (appkit-chatbuf-input-set-text "context")
         (cl-letf
             (((symbol-function 'appkit-compose-edit-buffer)
@@ -850,9 +949,9 @@
             (should (equal id (plist-get updated :id)))
             (should (equal "(message \"updated\")"
                            (plist-get updated :code)))))
-          (goto-char (point-max))
-          (appkit-chatbuf-input-backward-delete 1)
-          (should (equal "context\n" (appkit-chatbuf-input-state)))
+        (goto-char (point-max))
+        (appkit-chatbuf-input-backward-delete 1)
+        (should (equal "context\n" (appkit-chatbuf-input-state)))
         (should-not (slackit-compose-attachments))))))
 
 (ert-deftest slackit-contract-canceling-code-editor-preserves-draft ()
@@ -866,7 +965,7 @@
       (cl-letf (((symbol-function 'slackit-history-load-latest)
                  (lambda (&rest _) nil)))
         (setq view (slackit-room-open app "D1" nil)))
-      (with-current-buffer (appkit-view-buffer view)
+      (with-current-buffer (appkit-surface-buffer view)
         (appkit-chatbuf-input-set-text "unchanged")
         (let ((revision (appkit-chatbuf-composer-revision)))
           (cl-letf (((symbol-function 'appkit-compose-edit-buffer)
@@ -888,7 +987,7 @@
       (cl-letf (((symbol-function 'slackit-history-load-latest)
                  (lambda (&rest _) nil)))
         (setq view (slackit-room-open app "D1" nil)))
-      (with-current-buffer (appkit-view-buffer view)
+      (with-current-buffer (appkit-surface-buffer view)
         (cl-letf (((symbol-function 'appkit-compose-edit-buffer)
                    (lambda (&rest _) "(message \"send\")")))
           (slackit-compose-insert-code-block "emacs-lisp"))
@@ -909,7 +1008,7 @@
             (should (= 1 (length blocks)))
             (should
              (equal "emacs-lisp" (alist-get 'language preformatted))))
-          (appkit-request-sync view :part 'frame)
+          (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))
           (should (= revision (appkit-chatbuf-composer-revision)))
           (funcall
            success
@@ -919,7 +1018,7 @@
              (message
               (ts . "10.000001")
               (text . "``` code ```"))))
-          (appkit-sync-invalidations view)
+
           (should (string-empty-p (appkit-chatbuf-input-state))))))))
 
 (ert-deftest slackit-contract-clipboard-image-is-private-and-view-owned ()
@@ -933,7 +1032,7 @@
       (cl-letf (((symbol-function 'slackit-history-load-latest)
                  (lambda (&rest _) nil)))
         (setq view (slackit-room-open app "D1" nil)))
-      (with-current-buffer (appkit-view-buffer view)
+      (with-current-buffer (appkit-surface-buffer view)
         (cl-letf (((symbol-function 'gui-get-selection)
                    (lambda (&rest _) "private-image-bytes")))
           (slackit-compose-attach-clipboard-image "diagram"))
@@ -966,7 +1065,7 @@
             (cl-letf (((symbol-function 'slackit-history-load-latest)
                        (lambda (&rest _) nil)))
               (setq view (slackit-room-open app "D1" nil)))
-            (with-current-buffer (appkit-view-buffer view)
+            (with-current-buffer (appkit-surface-buffer view)
               (appkit-chatbuf-input-set-text "caption")
               (goto-char (point-max))
               (slackit-compose-attach-image file "fixture diagram")
@@ -1024,10 +1123,7 @@
                  "D1" nil "caption" view)
                 completed))
               (should-not (appkit-compose-operation-active-p))
-              (let ((event
-                     (car (appkit-view-pending-events-snapshot view))))
-                (should (eq 'compose-success (plist-get event :kind)))
-                (slackit-compose-apply-settlement event))
+              (slackit-test-drain)
               (should (string-empty-p (appkit-chatbuf-input-state)))
               (should-not (slackit-compose-attachments))))
         (when (file-exists-p file) (delete-file file))))))
@@ -1049,7 +1145,7 @@
             (cl-letf (((symbol-function 'slackit-history-load-latest)
                        (lambda (&rest _) nil)))
               (setq view (slackit-room-open app "D1" nil)))
-            (with-current-buffer (appkit-view-buffer view)
+            (with-current-buffer (appkit-surface-buffer view)
               (goto-char (point-max))
               (slackit-compose-attach-file file)
               (cl-letf
@@ -1117,25 +1213,22 @@
         (should-not (slackit-state-read-ts state "C1"))
         (funcall (car callbacks) '((ok . t)))
         (should-not (gethash '(mark "C1")
-                             (appkit-app-request-table app)))))))
+                             (slackit-runtime-operations app)))))))
 
 (ert-deftest slackit-contract-stop-revokes-operations-and-secrets ()
-  (let* ((app (slackit-runtime-start-account
-               "stop"
-               (list :token "xoxp-STOP-CANARY"
-                     :cookie "xoxd-STOP-CANARY")))
-         (transport (slackit-runtime-transport app))
-         (credential (slackit-transport-credential transport))
-         (generation (slackit-runtime-generation app)))
-    (slackit-runtime-operation-begin app '(write))
-    (should (= 1 (hash-table-count (appkit-app-request-table app))))
-    (slackit-runtime-stop-account app)
-    (should-not (appkit-app-live-p app))
-    (should-not (slackit-runtime-current-p app generation))
-    (should (= 0 (hash-table-count (appkit-app-request-table app))))
-    (should-not (slackit-credential-token credential))
-    (should-not (slackit-credential-cookie credential))
-    (should-not (slackit-runtime-account "stop"))))
+  (slackit-test-with-app (app "stop")
+    (let* ((transport (slackit-runtime-transport app))
+           (credential (slackit-transport-credential transport))
+           (generation (slackit-runtime-generation app)))
+      (slackit-runtime-operation-begin app '(write))
+      (should (= 1 (hash-table-count (slackit-runtime-operations app))))
+      (slackit-runtime-stop-account app)
+      (should-not (appkit-app-live-p app))
+      (should-not (slackit-runtime-current-p app generation))
+      (should (= 0 (hash-table-count (slackit-runtime-operations app))))
+      (should-not (slackit-credential-token credential))
+      (should-not (slackit-credential-cookie credential))
+      (should-not (slackit-runtime-account "stop")))))
 
 (ert-deftest slackit-contract-appkit-root-room-thread-smoke ()
   (slackit-test-with-app (app "surface")
@@ -1153,7 +1246,7 @@
       (slackit-state-set-bootstrap-complete state 'users)
       (slackit-state-set-bootstrap-complete state 'conversations)
       (let ((root (slackit-root-open app nil)))
-        (with-current-buffer (appkit-view-buffer root)
+        (with-current-buffer (appkit-surface-buffer root)
           (should (derived-mode-p 'slackit-root-mode))
           (should (string-match-p "#general" (buffer-string)))))
       (cl-letf (((symbol-function 'slackit-api-conversation-history)
@@ -1175,42 +1268,43 @@
                            (user . "U1") (text . "reply"))))
                       (response_metadata . ((next_cursor . ""))))))))
         (let ((room (slackit-room-open app "C1" nil)))
-          (with-current-buffer (appkit-view-buffer room)
+          (with-current-buffer (appkit-surface-buffer room)
             (should (derived-mode-p 'slackit-room-mode))
             (should (string-match-p "hello @Alice" (buffer-string)))
             (should (appkit-chatbuf-prompt-button-live-p))))
         (let ((thread (slackit-thread-open app "C1" "1.000001" nil)))
-          (with-current-buffer (appkit-view-buffer thread)
+          (with-current-buffer (appkit-surface-buffer thread)
             (should (derived-mode-p 'slackit-thread-mode))
             (should (string-match-p "reply" (buffer-string)))
             (should (appkit-chatbuf-prompt-button-live-p))))))))
 
 (ert-deftest slackit-contract-history-operation-owns-transport ()
-  "Replacing history should cancel transport through its Appkit operation."
+  "A history fence cancels real Surface-owned HTTP and rejects late pages."
   (slackit-test-with-app (app "history-owner")
-    (let ((state (slackit-runtime-state app))
-          view first second)
-      (slackit-state-put-conversation
-       state '((id . "C1") (name . "general")
-               (is_channel . t) (is_member . t)))
+    (slackit-state-put-conversation (slackit-runtime-state app)
+                                    '((id . "C1") (name . "general") (is_member . t)))
+    (let (surface first second first-fence late)
       (cl-letf (((symbol-function 'slackit-history-load-latest) #'ignore))
-        (setq view (slackit-room-open app "C1" nil)))
+        (setq surface (slackit-room-open app "C1")))
       (cl-letf (((symbol-function 'plz)
-                 (lambda (&rest _arguments) nil)))
-        (setq first (slackit-history-load-latest view "C1")
-              second (slackit-history-load-latest view "C1")))
-      (let ((first-owner (slackit-http-request-owner first))
-            (second-owner (slackit-http-request-owner second)))
-        (should (appkit-view-operation-p first-owner))
-        (should (appkit-view-operation-p second-owner))
-        (should (eq view (appkit-view-operation-view second-owner)))
-        (should-not (slackit-http-request-active-p first))
-        (should (slackit-http-request-active-p second))
-        (should-not (appkit-view-operation-current-p first-owner))
-        (should (appkit-view-operation-current-p second-owner))
-        (with-current-buffer (appkit-view-buffer view)
-          (should
-           (appkit-chat-history-request-current-p second-owner)))))))
+                 (lambda (_method _url &rest options)
+                   (unless late (setq late (plist-get options :then))) nil)))
+        (setq first (slackit-history-load-latest surface "C1"))
+        (with-current-buffer (appkit-surface-buffer surface)
+          (setq first-fence (appkit-chat-history-request-owner)))
+        (setq second (slackit-history-load-latest surface "C1")))
+      (should (eq surface (slackit-http-request-owner first)))
+      (should (eq surface (slackit-http-request-owner second)))
+      (should-not (slackit-http-request-active-p first))
+      (should-not (appkit-handle-alive-p (slackit-http-request-handle first)))
+      (should (appkit-handle-alive-p (slackit-http-request-handle second)))
+      (with-current-buffer (appkit-surface-buffer surface)
+        (should-not (appkit-chat-history-request-current-p first-fence)))
+      (funcall late (make-plz-response :status 200
+                                       :body "{\"ok\":true,\"messages\":[{\"ts\":\"1\",\"text\":\"late\"}]}"))
+      (should-not (slackit-state-message (slackit-runtime-state app) "C1" "1"))
+      (appkit-surface-stop surface)
+      (should-not (slackit-http-request-active-p second)))))
 
 (ert-deftest slackit-contract-emoji-renders-body-and-actionable-reactions ()
   (slackit-test-with-app (app "emoji")
@@ -1247,179 +1341,152 @@
                  "please :pray: :laughing: :slightly_smiling_face: :+1::skin-tone-3: :unknown:"
                  (alist-get 'text message)))))))
 
-(ert-deftest slackit-contract-avatar-prefers-circular-derived-image ()
-  (let ((file (make-temp-file "slackit-round-avatar-" nil ".png")))
-    (unwind-protect
-        (slackit-test-with-app (app "round-avatar")
-          (let* ((user
-                  '((id . "U1")
-                    (profile
-                     . ((image_72
-                         . "https://ca.slack-edge.com/avatar.png")))))
-                 (key (slackit-avatar-resource-key app user))
-                 (mtime (file-attribute-modification-time
-                         (file-attributes file))))
-            (clrhash slackit-avatar--sources)
-            (clrhash slackit-avatar--image-cache)
-            (puthash key (list file mtime) slackit-avatar--sources)
-            (cl-letf (((symbol-function
-                        'appkit-media-circular-image-from-file)
-                       (lambda (source size)
-                         (should (equal source file))
-                         (should (= size 32))
-                         'circular-image))
-                      ((symbol-function 'create-image)
-                       (lambda (&rest _arguments)
-                         (ert-fail "square fallback should not run"))))
-              (should (eq 'circular-image
-                          (slackit-avatar-cached-image app user 32))))))
-      (clrhash slackit-avatar--sources)
-      (clrhash slackit-avatar--image-cache)
-      (when (file-exists-p file) (delete-file file)))))
-
 (ert-deftest slackit-contract-file-images-use-origin-bound-private-previews ()
   (slackit-test-with-app (app "media")
-    (let* ((root (make-temp-file "slackit-media-test-" t))
-           (slackit-media-cache-directory
-            (expand-file-name "media/" root))
-           (public-url "https://cdn.example.invalid/public-image.png")
-           (private-url
-            "https://files.slack.com/files-pri/T1-F1/private-image.png")
-           (thumbnail-url
-            "https://files.slack.com/files-tmb/T1-F1/private-image_1024.png")
-           (message
-            `((channel . "C1")
-              (ts . "1.000001")
-              (blocks
-               . (((type . "image")
-                   (block_id . "B1")
-                   (title . ((type . "plain_text")
-                             (text . "Public image")))
-                   (alt_text . "preview")
-                   (image_url . ,public-url))))
-              (files
-               . (((id . "F1")
-                   (name . "private.png")
-                   (mimetype . "image/png")
-                   (permalink . "https://workspace.slack.com/files/U1/F1")
-                   (url_private . ,private-url)
-                   (thumb_1024 . ,thumbnail-url))))))
-           public-source
-           private-source
-           private-headers
-           opened-file)
-      (unwind-protect
-          (progn
+    (let ((surface (slackit-root-open app)))
+      (with-current-buffer (appkit-surface-buffer surface)
+        (let* ((root (make-temp-file "slackit-media-test-" t))
+               (slackit-media-cache-directory
+                (expand-file-name "media/" root))
+               (public-url "https://cdn.example.invalid/public-image.png")
+               (private-url
+                "https://files.slack.com/files-pri/T1-F1/private-image.png")
+               (thumbnail-url
+                "https://files.slack.com/files-tmb/T1-F1/private-image_1024.png")
+               (message
+                `((channel . "C1")
+                  (ts . "1.000001")
+                  (blocks
+                   . (((type . "image")
+                       (block_id . "B1")
+                       (title . ((type . "plain_text")
+                                 (text . "Public image")))
+                       (alt_text . "preview")
+                       (image_url . ,public-url))))
+                  (files
+                   . (((id . "F1")
+                       (name . "private.png")
+                       (mimetype . "image/png")
+                       (permalink . "https://workspace.slack.com/files/U1/F1")
+                       (url_private . ,private-url)
+                       (thumb_1024 . ,thumbnail-url))))))
+               public-source
+               private-source
+               private-headers
+               opened-file)
+          (unwind-protect
+              (progn
+                (clrhash slackit-media--fetches)
+                (clrhash slackit-media--failures)
+                (clrhash slackit-media--image-cache)
+                (setq message (slackit-decode-message message "C1"))
+                (should
+                 (equal thumbnail-url
+                        (alist-get 'thumb_1024 (car (alist-get 'files message)))))
+                (cl-letf
+                    (((symbol-function
+                       'appkit-media-inline-image-rendering-available-p)
+                      (lambda () t))
+                     ((symbol-function
+                       'appkit-media-cache-image-resource-async)
+                      (lambda (resource _cache _success _failure &rest arguments)
+                        (should-not arguments)
+                        (setq public-source (alist-get 'url resource))
+                        nil))
+                     ((symbol-function 'plz)
+                      (lambda (method url &rest arguments)
+                        (should (eq method 'get))
+                        (should-not (member "--location" plz-curl-default-args))
+                        (setq private-source url
+                              private-headers (plist-get arguments :headers))
+                        (let* ((as (plist-get arguments :as))
+                               (file (cadr as)))
+                          (with-temp-file file
+                            (set-buffer-multibyte nil)
+                            (insert "synthetic image"))
+                          (funcall (plist-get arguments :then) file))
+                        nil))
+                     ((symbol-function 'appkit-media-preview-image-from-file)
+                      (lambda (_file) 'decoded-private-image))
+                     ((symbol-function 'appkit-media-insert-image-slices)
+                      (lambda (image &rest _arguments)
+                        (should (eq image 'decoded-private-image))
+                        (insert "[decoded private preview]")))
+                     ((symbol-function 'appkit-media-open-file)
+                      (lambda (file)
+                        (setq opened-file file))))
+                  (slackit-media-ensure-message app message)
+                  (should (equal public-url public-source))
+                  (should (equal thumbnail-url private-source))
+                  (should
+                   (equal "Bearer xoxp-CANARY-TOKEN"
+                          (cdr (assoc "Authorization" private-headers))))
+                  (should
+                   (equal "d=xoxd-CANARY-COOKIE"
+                          (cdr (assoc "Cookie" private-headers))))
+                  (should (equal "https://app.slack.com/"
+                                 (cdr (assoc "Referer" private-headers))))
+                  (should-not (assoc "Origin" private-headers))
+                  (should-not
+                   (string-match-p
+                    (regexp-quote private-url)
+                    (prin1-to-string
+                     (slackit-media-message-resource-keys app message))))
+                  (let* ((private-item
+                          (seq-find
+                           (lambda (item)
+                             (eq (plist-get item :class) 'file))
+                           (slackit-media--message-items app message)))
+                         (context (slackit-media--item-context private-item))
+                         (action (plist-get context :open-action))
+                         (context-text (prin1-to-string context))
+                         (preview-key (plist-get private-item :resource-key))
+                         (content-key
+                          (plist-get private-item :content-resource-key))
+                         (preview-file
+                          (slackit-media--cached-file preview-key)))
+                    (should (functionp action))
+                    (should (functionp (plist-get context :download-action)))
+                    (should (functionp (plist-get context :save-as-action)))
+                    (should (file-regular-p preview-file))
+                    (should-not (equal preview-key content-key))
+                    (unless (memq system-type '(ms-dos windows-nt cygwin))
+                      (should (= #o600
+                                 (logand #o777 (file-modes preview-file)))))
+                    (should-not
+                     (string-match-p (regexp-quote private-url) context-text))
+                    (should-not
+                     (string-match-p (regexp-quote thumbnail-url) context-text))
+                    (funcall action)
+                    (slackit-test-drain)
+                    (let ((content-file
+                           (slackit-media--cached-file content-key)))
+                      (should (equal private-url private-source))
+                      (should (file-regular-p content-file))
+                      (should-not (equal preview-file content-file))
+                      (should (equal content-file opened-file))
+                      (unless (memq system-type '(ms-dos windows-nt cygwin))
+                        (should (= #o600
+                                   (logand #o777
+                                           (file-modes content-file)))))))
+                  (should-not
+                   (slackit-media--private-source-p
+                    "https://files.slack.com.attacker.invalid/files-tmb/T1-F1/x.png"))
+                  (with-temp-buffer
+                    (slackit-media-insert-message-cards app message)
+                    (should (string-match-p "Public image" (buffer-string)))
+                    (should (string-match-p "private.png" (buffer-string)))
+                    (should (string-match-p
+                             "decoded private preview" (buffer-string)))
+                    (should-not (string-match-p
+                                 (regexp-quote private-url)
+                                 (buffer-string))))))
             (clrhash slackit-media--fetches)
             (clrhash slackit-media--failures)
             (clrhash slackit-media--image-cache)
-            (setq message (slackit-decode-message message "C1"))
-            (should
-             (equal thumbnail-url
-                    (alist-get 'thumb_1024 (car (alist-get 'files message)))))
-            (cl-letf
-                (((symbol-function
-                   'appkit-media-inline-image-rendering-available-p)
-                  (lambda () t))
-                 ((symbol-function
-                   'appkit-media-cache-image-resource-async)
-                  (lambda (resource _cache _success _failure &rest arguments)
-                    (should-not arguments)
-                    (setq public-source (alist-get 'url resource))
-                    nil))
-                 ((symbol-function 'plz)
-                  (lambda (method url &rest arguments)
-                    (should (eq method 'get))
-                    (should-not (member "--location" plz-curl-default-args))
-                    (setq private-source url
-                          private-headers (plist-get arguments :headers))
-                    (let* ((as (plist-get arguments :as))
-                           (file (cadr as)))
-                      (with-temp-file file
-                        (set-buffer-multibyte nil)
-                        (insert "synthetic image"))
-                      (funcall (plist-get arguments :then) file))
-                    nil))
-                 ((symbol-function 'appkit-media-preview-image-from-file)
-                  (lambda (_file) 'decoded-private-image))
-                 ((symbol-function 'appkit-media-insert-image-slices)
-                  (lambda (image &rest _arguments)
-                    (should (eq image 'decoded-private-image))
-                    (insert "[decoded private preview]")))
-                 ((symbol-function 'appkit-media-open-file)
-                  (lambda (file)
-                    (setq opened-file file))))
-              (slackit-media-ensure-message app message)
-              (should (equal public-url public-source))
-              (should (equal thumbnail-url private-source))
-              (should
-               (equal "Bearer xoxp-CANARY-TOKEN"
-                      (cdr (assoc "Authorization" private-headers))))
-              (should
-               (equal "d=xoxd-CANARY-COOKIE"
-                      (cdr (assoc "Cookie" private-headers))))
-              (should (equal "https://app.slack.com/"
-                             (cdr (assoc "Referer" private-headers))))
-              (should-not (assoc "Origin" private-headers))
-              (should-not
-               (string-match-p
-                (regexp-quote private-url)
-                (prin1-to-string
-                 (slackit-media-message-resource-keys app message))))
-              (let* ((private-item
-                      (seq-find
-                       (lambda (item)
-                         (eq (plist-get item :class) 'file))
-                       (slackit-media--message-items app message)))
-                     (context (slackit-media--item-context private-item))
-                     (action (plist-get context :open-action))
-                     (context-text (prin1-to-string context))
-                     (preview-key (plist-get private-item :resource-key))
-                     (content-key
-                      (plist-get private-item :content-resource-key))
-                     (preview-file
-                      (slackit-media--cached-file preview-key)))
-                (should (functionp action))
-                (should (functionp (plist-get context :download-action)))
-                (should (functionp (plist-get context :save-as-action)))
-                (should (file-regular-p preview-file))
-                (should-not (equal preview-key content-key))
-                (unless (memq system-type '(ms-dos windows-nt cygwin))
-                  (should (= #o600
-                             (logand #o777 (file-modes preview-file)))))
-                (should-not
-                 (string-match-p (regexp-quote private-url) context-text))
-                (should-not
-                 (string-match-p (regexp-quote thumbnail-url) context-text))
-                (funcall action)
-                (let ((content-file
-                       (slackit-media--cached-file content-key)))
-                  (should (equal private-url private-source))
-                  (should (file-regular-p content-file))
-                  (should-not (equal preview-file content-file))
-                  (should (equal content-file opened-file))
-                  (unless (memq system-type '(ms-dos windows-nt cygwin))
-                    (should (= #o600
-                               (logand #o777
-                                       (file-modes content-file)))))))
-              (should-not
-               (slackit-media--private-source-p
-                "https://files.slack.com.attacker.invalid/files-tmb/T1-F1/x.png"))
-              (with-temp-buffer
-                (slackit-media-insert-message-cards app message)
-                (should (string-match-p "Public image" (buffer-string)))
-                (should (string-match-p "private.png" (buffer-string)))
-                (should (string-match-p
-                         "decoded private preview" (buffer-string)))
-                (should-not (string-match-p
-                             (regexp-quote private-url)
-                             (buffer-string))))))
-        (clrhash slackit-media--fetches)
-        (clrhash slackit-media--failures)
-        (clrhash slackit-media--image-cache)
-        (clrhash slackit-media--open-specs)
-        (clrhash slackit-media--audio-sessions)
-        (when (file-directory-p root) (delete-directory root t))))))
+            (clrhash slackit-media--open-specs)
+            (clrhash slackit-media--audio-sessions)
+            (when (file-directory-p root) (delete-directory root t))))))))
 
 (ert-deftest slackit-contract-video-poster-keeps-preview-file-extension ()
   (slackit-test-with-app (app "video-poster")
@@ -1474,261 +1541,249 @@
         (when (file-directory-p root) (delete-directory root t))))))
 
 (ert-deftest slackit-contract-media-specs-survive-equal-keys-until-account-stop ()
-  (let ((app
-         (slackit-runtime-start-account
-          "media-spec-owner"
-          (list :token "xoxp-CANARY-TOKEN"
-                :cookie "xoxd-CANARY-COOKIE")))
-        lookup-key)
-    (unwind-protect
-        (let ((key
-               (slackit-media--register-content-spec
-                app '(file (id "F-SPEC")) 'audio
-                "https://files.slack.com/files-pri/T1-F-SPEC/voice.mp3"
-                "voice.mp3" "audio/mpeg" 128 1000)))
-          (setq lookup-key (copy-tree key)
-                key nil)
-          (garbage-collect)
-          (should (slackit-media--content-spec-current lookup-key))
-          (should
-           (appkit-handle-alive-p
-            (gethash app slackit-media--spec-handles)))
-          (slackit-runtime-stop-account app)
-          (should-not (gethash lookup-key slackit-media--open-specs))
-          (should-not (gethash app slackit-media--spec-handles)))
-      (when (appkit-app-live-p app)
-        (slackit-runtime-stop-account app)))))
+  (slackit-test-with-app (app "media-spec-owner")
+    (let* ((key (slackit-media--register-content-spec
+                 app '(file (id "F-SPEC")) 'audio
+                 "https://files.slack.com/files-pri/T1-F-SPEC/voice.mp3"
+                 "voice.mp3" "audio/mpeg" 128 1000))
+           (lookup-key (copy-tree key)))
+      (setq key nil)
+      (garbage-collect)
+      (should (slackit-media--content-spec-current lookup-key))
+      (slackit-runtime-stop-account app)
+      (should-not (slackit-media--content-spec-current lookup-key))
+      (should-not (gethash lookup-key slackit-media--open-specs)))))
 
 (ert-deftest slackit-contract-audio-playback-is-appkit-owned ()
-  (slackit-test-with-app (app "audio-player")
-    (let* ((file (make-temp-file "slackit-audio-" nil ".mp3"))
-           (content-key
-            (slackit-media--register-content-spec
-             app '(file (id "F-AUDIO")) 'audio
-             "https://files.slack.com/files-pri/T1-F-AUDIO/voice.mp3"
-             "voice.mp3" "audio/mpeg" 128 42000))
-           start-arguments
-           toggled
-           session)
-      (unwind-protect
-          (cl-letf
-              (((symbol-function 'appkit-media-player-available-p)
-                (lambda (&rest _arguments) t))
-               ((symbol-function 'appkit-media-player-start-file)
-                (lambda (path &rest arguments)
-                  (should (equal file path))
-                  (setq start-arguments arguments
-                        session
-                        (appkit-media-player-session--create
-                         :status 'playing))
-                  session))
-               ((symbol-function 'appkit-media-player-toggle)
-                (lambda (current)
-                  (setq toggled current)
-                  current)))
-            (let ((result
-                   (slackit-media--start-audio-file content-key file)))
-              (should (eq session result)))
-            (should (eq app (plist-get start-arguments :owner)))
-            (should (= 42.0
-                       (plist-get start-arguments :duration-seconds)))
-            (should (functionp
-                     (plist-get start-arguments :on-change)))
-            (should (eq session
-                        (gethash content-key
-                                 slackit-media--audio-sessions)))
-            (slackit-media--start-audio-file content-key file)
-            (should (eq session toggled)))
-        (remhash content-key slackit-media--audio-sessions)
-        (when (file-exists-p file) (delete-file file))))))
+  "Playback belongs to the initiating Surface and receives repeat actions."
+  (slackit-test-with-app (app "audio-source")
+    (let* ((surface (slackit-root-open app))
+           (key (slackit-media--register-content-spec
+                 app '(audio "F1") 'audio
+                 "https://files.slack.com/files-pri/T1-F1/voice.mp3"
+                 "voice.mp3" "audio/mpeg" 10 1000))
+           (spec (slackit-media--content-spec-current key))
+           (input (list :surface surface :app app :model (appkit-app-model app) :generation (slackit-runtime-generation app)
+                        :identity '(root) :key key :spec spec :action 'open))
+           owner session (toggles 0) stopped)
+      (cl-letf (((symbol-function 'appkit-media-player-start-file)
+                 (lambda (file &rest options)
+                   (setq owner (plist-get options :owner)
+                         session (appkit-media-player-session--create
+                                  :kind 'audio :file file :status 'playing
+                                  :on-change (plist-get options :on-change)
+                                  :on-finalize (plist-get options :on-finalize)))))
+                ((symbol-function 'appkit-media-player-toggle)
+                 (lambda (actual) (should (eq session actual)) (cl-incf toggles)))
+                ((symbol-function 'appkit-media-player-stop)
+                 (lambda (actual) (when (eq session actual) (setq stopped t)))))
+        (appkit-surface-send surface (list 'slackit-media 'acquired input "/synthetic/voice.mp3"))
+        (should (eq surface owner))
+        (appkit-surface-send surface (list 'slackit-media 'acquired input "/synthetic/voice.mp3"))
+        (slackit-test-drain)
+        (should (= 1 toggles))
+        (appkit-surface-stop surface)
+        (should stopped)
+        (should (buffer-live-p (appkit-surface-buffer surface)))))))
 
 (ert-deftest slackit-contract-media-kinds-download-before-local-dispatch ()
   (slackit-test-with-app (app "media-kinds")
-    (let* ((root (make-temp-file "slackit-media-kinds-" t))
-           (slackit-media-cache-directory
-            (expand-file-name "media/" root))
-           (video-url
-            "https://files.slack.com/files-pri/T1-F2/movie.mp4")
-           (audio-url
-            "https://files.slack.com/files-pri/T1-F3/voice.mp3")
-           (document-url
-            "https://files.slack.com/files-pri/T1-F4/notes.pdf")
-           (bad-url
-            "https://files.slack.com/files-pri/T1-F5/login.pdf")
-           (message
-            `((channel . "C1")
-              (ts . "2.000001")
-              (files
-               . (((id . "F2") (name . "movie.mp4")
-                   (mimetype . "video/mp4")
-                   (url_private_download . ,video-url))
-                  ((id . "F3") (name . "voice.mp3")
-                   (mimetype . "audio/mpeg")
-                   (duration_ms . 42000)
-                   (url_private_download . ,audio-url))
-                  ((id . "F4") (name . "notes.pdf")
-                   (mimetype . "application/pdf")
-                   (url_private_download . ,document-url))
-                  ((id . "F5") (name . "login.pdf")
-                   (mimetype . "application/pdf")
-                   (url_private_download . ,bad-url))))))
-           fetched
-           header-snapshots
-           played-video
-           played-audio
-           opened-document)
-      (unwind-protect
-          (progn
-            (clrhash slackit-media--fetches)
-            (clrhash slackit-media--failures)
-            (clrhash slackit-media--image-cache)
-            (clrhash slackit-media--open-specs)
-            (setq message (slackit-decode-message message "C1"))
-            (cl-letf
-                (((symbol-function 'plz)
-                  (lambda (method url &rest arguments)
-                    (should (eq method 'get))
-                    (should-not (member "--location" plz-curl-default-args))
-                    (push url fetched)
-                    (push (plist-get arguments :headers) header-snapshots)
-                    (let ((file (cadr (plist-get arguments :as))))
-                      (with-temp-file file
-                        (set-buffer-multibyte nil)
-                        (insert
-                         (if (equal url bad-url)
-                             "<!doctype html><html><body>login</body></html>"
-                           "synthetic local media")))
-                      (funcall (plist-get arguments :then) file))
-                    nil))
-                 ((symbol-function 'appkit-media-play-video-file)
-                  (lambda (file label &rest arguments)
-                    (should (equal label "slackit"))
-                    (should (eq app (plist-get arguments :owner)))
-                    (setq played-video file)))
-                 ((symbol-function 'slackit-media--start-audio-file)
-                  (lambda (_key file) (setq played-audio file)))
-                 ((symbol-function 'appkit-media-open-file)
-                  (lambda (file) (setq opened-document file))))
-              (let ((items (slackit-media--file-items app message)))
-                (should (= 4 (length items)))
-                (dolist (item items)
-                  (let* ((context (slackit-media--item-context item))
-                         (context-text (prin1-to-string context)))
+    (let ((surface (slackit-root-open app)))
+      (with-current-buffer (appkit-surface-buffer surface)
+        (let* ((root (make-temp-file "slackit-media-kinds-" t))
+               (slackit-media-cache-directory
+                (expand-file-name "media/" root))
+               (video-url
+                "https://files.slack.com/files-pri/T1-F2/movie.mp4")
+               (audio-url
+                "https://files.slack.com/files-pri/T1-F3/voice.mp3")
+               (document-url
+                "https://files.slack.com/files-pri/T1-F4/notes.pdf")
+               (bad-url
+                "https://files.slack.com/files-pri/T1-F5/login.pdf")
+               (message
+                `((channel . "C1")
+                  (ts . "2.000001")
+                  (files
+                   . (((id . "F2") (name . "movie.mp4")
+                       (mimetype . "video/mp4")
+                       (url_private_download . ,video-url))
+                      ((id . "F3") (name . "voice.mp3")
+                       (mimetype . "audio/mpeg")
+                       (duration_ms . 42000)
+                       (url_private_download . ,audio-url))
+                      ((id . "F4") (name . "notes.pdf")
+                       (mimetype . "application/pdf")
+                       (url_private_download . ,document-url))
+                      ((id . "F5") (name . "login.pdf")
+                       (mimetype . "application/pdf")
+                       (url_private_download . ,bad-url))))))
+               fetched
+               header-snapshots
+               played-video
+               played-audio
+               opened-document)
+          (unwind-protect
+              (progn
+                (clrhash slackit-media--fetches)
+                (clrhash slackit-media--failures)
+                (clrhash slackit-media--image-cache)
+                (clrhash slackit-media--open-specs)
+                (setq message (slackit-decode-message message "C1"))
+                (cl-letf
+                    (((symbol-function 'plz)
+                      (lambda (method url &rest arguments)
+                        (should (eq method 'get))
+                        (should-not (member "--location" plz-curl-default-args))
+                        (push url fetched)
+                        (push (plist-get arguments :headers) header-snapshots)
+                        (let ((file (cadr (plist-get arguments :as))))
+                          (with-temp-file file
+                            (set-buffer-multibyte nil)
+                            (insert
+                             (if (equal url bad-url)
+                                 "<!doctype html><html><body>login</body></html>"
+                               "synthetic local media")))
+                          (funcall (plist-get arguments :then) file))
+                        nil))
+                     ((symbol-function 'appkit-media-play-video-file)
+                      (lambda (file label &rest arguments)
+                        (should (equal label "slackit"))
+                        (should (eq surface (plist-get arguments :owner)))
+                        (setq played-video file)))
+                     ((symbol-function 'appkit-media-player-start-file)
+                      (lambda (file &rest options)
+                        (setq played-audio file)
+                        (appkit-media-player-session--create
+                         :kind 'audio :file file :status 'playing
+                         :on-change (plist-get options :on-change)
+                         :on-finalize (plist-get options :on-finalize))))
+                     ((symbol-function 'appkit-media-open-file)
+                      (lambda (file) (setq opened-document file))))
+                  (let ((items (slackit-media--file-items app message)))
+                    (should (= 4 (length items)))
+                    (dolist (item items)
+                      (let* ((context (slackit-media--item-context item))
+                             (context-text (prin1-to-string context)))
+                        (should
+                         (functionp (plist-get context :open-action)))
+                        (dolist (url (list video-url audio-url
+                                           document-url bad-url))
+                          (should-not
+                           (string-match-p
+                            (regexp-quote url) context-text)))
+                        (funcall (plist-get context :open-action))
+                        (slackit-test-drain)))
+                    (should (equal (sort (list video-url audio-url
+                                               document-url bad-url)
+                                         #'string<)
+                                   (sort fetched #'string<)))
+                    (should (equal "mp4" (file-name-extension played-video)))
+                    (should (equal "mp3" (file-name-extension played-audio)))
                     (should
-                     (functionp (plist-get context :open-action)))
-                    (dolist (url (list video-url audio-url
-                                       document-url bad-url))
-                      (should-not
-                       (string-match-p
-                        (regexp-quote url) context-text)))
-                    (funcall (plist-get context :open-action))))
-                (should (equal (sort (list video-url audio-url
-                                           document-url bad-url)
-                                     #'string<)
-                               (sort fetched #'string<)))
-                (should (equal "mp4" (file-name-extension played-video)))
-                (should (equal "mp3" (file-name-extension played-audio)))
-                (should
-                 (equal "pdf" (file-name-extension opened-document)))
-                (should (file-regular-p played-video))
-                (should (file-regular-p played-audio))
-                (should (file-regular-p opened-document))
-                (dolist (item (seq-take items 3))
-                  (let* ((content-key
-                          (plist-get item :content-resource-key))
-                         (fetch-count (length fetched)))
-                    (should
-                     (eq 'downloaded
-                         (plist-get
-                          (slackit-media--content-state content-key)
-                          :status)))
-                    (should (file-regular-p
-                             (slackit-media--download-content content-key)))
-                    (should (= fetch-count (length fetched)))))
-                (let* ((bad-item (nth 3 items))
-                       (bad-key
-                        (plist-get bad-item :content-resource-key))
-                       (bad-state
-                        (slackit-media--content-state bad-key)))
-                  (should (eq 'error (plist-get bad-state :status)))
-                  (should-not (slackit-media--cached-file bad-key)))
-                (dolist (headers header-snapshots)
-                  (should
-                   (equal "Bearer xoxp-CANARY-TOKEN"
-                          (cdr (assoc "Authorization" headers))))
-                  (should
-                   (equal "d=xoxd-CANARY-COOKIE"
-                          (cdr (assoc "Cookie" headers))))
-                  (should (equal "empty"
-                                 (cdr (assoc "Sec-Fetch-Dest" headers))))
-                  (should-not (assoc "Origin" headers)))
-                (with-temp-buffer
-                  (slackit-media-insert-message-cards app message)
-                  (should (string-match-p "\\[video\\]" (buffer-string)))
-                  (should (string-match-p "\\[audio\\]" (buffer-string)))
-                  (should (string-match-p "\\[file\\]" (buffer-string)))
-                  (dolist (url (list video-url audio-url
-                                     document-url bad-url))
-                    (should-not
-                     (string-match-p
-                      (regexp-quote url) (buffer-string)))))))))
-        (clrhash slackit-media--fetches)
-        (clrhash slackit-media--failures)
-        (clrhash slackit-media--image-cache)
-        (clrhash slackit-media--open-specs)
-        (clrhash slackit-media--audio-sessions)
-        (when (file-directory-p root) (delete-directory root t)))))
+                     (equal "pdf" (file-name-extension opened-document)))
+                    (should (file-regular-p played-video))
+                    (should (file-regular-p played-audio))
+                    (should (file-regular-p opened-document))
+                    (dolist (item (seq-take items 3))
+                      (let* ((content-key
+                              (plist-get item :content-resource-key))
+                             (fetch-count (length fetched)))
+                        (should
+                         (eq 'downloaded
+                             (plist-get
+                              (slackit-media--content-state content-key)
+                              :status)))
+                        (slackit-media--download-content content-key)
+                        (slackit-test-drain)
+                        (should (file-regular-p
+                                 (slackit-media--content-cached-file
+                                  content-key (slackit-media--content-spec-current content-key))))
+                        (should (= fetch-count (length fetched)))))
+                    (let* ((bad-item (nth 3 items))
+                           (bad-key
+                            (plist-get bad-item :content-resource-key))
+                           (bad-state
+                            (slackit-media--content-state bad-key)))
+                      (should (eq 'error (plist-get bad-state :status)))
+                      (should-not (slackit-media--cached-file bad-key)))
+                    (dolist (headers header-snapshots)
+                      (should
+                       (equal "Bearer xoxp-CANARY-TOKEN"
+                              (cdr (assoc "Authorization" headers))))
+                      (should
+                       (equal "d=xoxd-CANARY-COOKIE"
+                              (cdr (assoc "Cookie" headers))))
+                      (should (equal "empty"
+                                     (cdr (assoc "Sec-Fetch-Dest" headers))))
+                      (should-not (assoc "Origin" headers)))
+                    (with-temp-buffer
+                      (slackit-media-insert-message-cards app message)
+                      (should (string-match-p "\\[video\\]" (buffer-string)))
+                      (should (string-match-p "\\[audio\\]" (buffer-string)))
+                      (should (string-match-p "\\[file\\]" (buffer-string)))
+                      (dolist (url (list video-url audio-url
+                                         document-url bad-url))
+                        (should-not
+                         (string-match-p
+                          (regexp-quote url) (buffer-string)))))))))
+          (clrhash slackit-media--fetches)
+          (clrhash slackit-media--failures)
+          (clrhash slackit-media--image-cache)
+          (clrhash slackit-media--open-specs)
+          (clrhash slackit-media--audio-sessions)
+          (when (file-directory-p root) (delete-directory root t)))))))
 
 (ert-deftest slackit-contract-media-download-cancel-removes-partial-file ()
   (slackit-test-with-app (app "media-cancel")
-    (let* ((root (make-temp-file "slackit-media-cancel-" t))
-           (slackit-media-cache-directory
-            (expand-file-name "media/" root))
-           (url "https://files.slack.com/files-pri/T1-F6/archive.zip")
-           (message
-            (slackit-decode-message
-             `((channel . "C1") (ts . "3.000001")
-               (files
-                . (((id . "F6") (name . "archive.zip")
-                    (mimetype . "application/zip")
-                    (url_private_download . ,url)))))
-             "C1"))
-           partial-file)
-      (unwind-protect
-          (progn
+    (let ((surface (slackit-root-open app)))
+      (with-current-buffer (appkit-surface-buffer surface)
+        (let* ((root (make-temp-file "slackit-media-cancel-" t))
+               (slackit-media-cache-directory
+                (expand-file-name "media/" root))
+               (url "https://files.slack.com/files-pri/T1-F6/archive.zip")
+               (message
+                (slackit-decode-message
+                 `((channel . "C1") (ts . "3.000001")
+                   (files
+                    . (((id . "F6") (name . "archive.zip")
+                        (mimetype . "application/zip")
+                        (url_private_download . ,url)))))
+                 "C1"))
+               partial-file)
+          (unwind-protect
+              (progn
+                (clrhash slackit-media--fetches)
+                (clrhash slackit-media--failures)
+                (clrhash slackit-media--open-specs)
+                (cl-letf
+                    (((symbol-function 'plz)
+                      (lambda (_method _url &rest arguments)
+                        (setq partial-file
+                              (cadr (plist-get arguments :as)))
+                        (with-temp-file partial-file
+                          (insert "partial"))
+                        nil)))
+                  (let* ((item (car (slackit-media--file-items app message)))
+                         (content-key
+                          (plist-get item :content-resource-key))
+                         (context (slackit-media--item-context item)))
+                    (funcall (plist-get context :download-action))
+                    (slackit-test-drain)
+                    (should (file-exists-p partial-file))
+                    (setq context (slackit-media--item-context item))
+                    (should (functionp (plist-get context :cancel-action)))
+                    (funcall (plist-get context :cancel-action))
+                    (should-not (file-exists-p partial-file))
+                    (should
+                     (eq 'not-downloaded
+                         (plist-get
+                          (slackit-media--content-state content-key)
+                          :status))))))
             (clrhash slackit-media--fetches)
             (clrhash slackit-media--failures)
             (clrhash slackit-media--open-specs)
-            (cl-letf
-                (((symbol-function 'plz)
-                  (lambda (_method _url &rest arguments)
-                    (setq partial-file
-                          (cadr (plist-get arguments :as)))
-                    (with-temp-file partial-file
-                      (insert "partial"))
-                    nil)))
-              (let* ((item (car (slackit-media--file-items app message)))
-                     (content-key
-                      (plist-get item :content-resource-key))
-                     (context (slackit-media--item-context item)))
-                (funcall (plist-get context :download-action))
-                (should (file-exists-p partial-file))
-                (should (gethash content-key slackit-media--fetches))
-                (setq context (slackit-media--item-context item))
-                (should (functionp (plist-get context :cancel-action)))
-                (funcall (plist-get context :cancel-action))
-                (should-not (file-exists-p partial-file))
-                (should-not
-                 (gethash content-key slackit-media--fetches))
-                (should
-                 (eq 'not-downloaded
-                     (plist-get
-                      (slackit-media--content-state content-key)
-                      :status))))))
-        (clrhash slackit-media--fetches)
-        (clrhash slackit-media--failures)
-        (clrhash slackit-media--open-specs)
-        (when (file-directory-p root) (delete-directory root t))))))
+            (when (file-directory-p root) (delete-directory root t))))))))
 
 (ert-deftest slackit-contract-custom-emoji-catalog-resolves-aliases-and-images ()
   (slackit-test-with-app (app "custom-emoji")
@@ -1757,9 +1812,9 @@
               (should (= size 18))
               'inline-custom-image)))
         (slackit-emoji-load-catalog app)
-        (should (equal published (slackit-emoji-resource-key app)))
+        (slackit-test-drain)
         (should-not
-         (gethash '(emoji-catalog) (appkit-app-request-table app)))
+         (gethash '(emoji-catalog) (slackit-runtime-operations app)))
         (should (equal "😆"
                        (slackit-emoji-display-string app "laughing")))
         (should (equal "😆"
@@ -1807,6 +1862,7 @@
          (input (concat mention mention)))
     (should (equal "<@U1> <@U1> "
                    (slackit-compose-serialize input)))))
+
 (ert-deftest slackit-contract-http-write-snapshot-cannot-regress-realtime ()
   (let ((state (slackit-state-create)))
     (slackit-state-upsert-message
@@ -1859,13 +1915,13 @@
                           (text . "early reply"))))
                      (response_metadata . ((next_cursor . "next"))))))))))
         (let ((view (slackit-thread-open app "C1" "1.000001" nil)))
-          (with-current-buffer (appkit-view-buffer view)
+          (with-current-buffer (appkit-surface-buffer view)
             (should (equal "1.000001"
                            (appkit-chat-history-window-first-key)))
             (should (equal "1.000002"
                            (appkit-chat-history-window-last-key)))
             (slackit-room-load-older)
-            (appkit-sync-invalidations view)
+
             (should-not (appkit-chat-history-window-last-key))
             (should (equal '("1.000001" "1.000002" "1.000003")
                            (appkit-chat-timeline-keys)))
@@ -1907,31 +1963,27 @@
       (should-not (slackit-auth-capture-running-p "second")))))
 
 (ert-deftest slackit-contract-pinned-auth-identity-rejects-bootstrap-mismatch ()
-  (let* ((app
-          (slackit-runtime-start-account
-           "identity"
-           (list :token "xoxp-CANARY"
-                 :cookie "xoxd-CANARY"
-                 :team-id "T1"
-                 :user-id "U1")))
-         (operation
-          (slackit-runtime-operation-begin app '(bootstrap))))
-    (unwind-protect
-        (progn
-          (slackit--bootstrap-identity-success
-           app operation
-           '((team_id . "T2") (user_id . "U2")
-             (team . "wrong") (user . "wrong"))
-           (lambda (_app)
-             (ert-fail "identity mismatch must not start realtime")))
-          (should
-           (equal "identity_mismatch"
-                  (slackit-account-state-bootstrap-error
-                   (slackit-runtime-state app))))
-          (should-not
-           (slackit-state-self-id (slackit-runtime-state app))))
-      (slackit-runtime-stop-account app))))
-
+  (slackit-test-with-app (app "identity")
+    (slackit-runtime-bind-credential-identity app "T1" "U1")
+    (let (success canceled socket-opened)
+      (cl-letf (((symbol-function 'slackit-api-auth-test)
+                 (lambda (owner &rest options)
+                   (setq success (plist-get options :on-success))
+                   (slackit-test-request owner)))
+                ((symbol-function 'slackit-api-conversations-list-all)
+                 (lambda (owner &rest _options)
+                   (appkit-register-handle owner 'test-pages nil
+                                           (lambda (_) (setq canceled t)))))
+                ((symbol-function 'websocket-open)
+                 (lambda (&rest _) (setq socket-opened t))))
+        (slackit-bootstrap-account app t)
+        (funcall success '((team_id . "T2") (user_id . "U2")))
+        (slackit-test-drain)
+        (should canceled)
+        (should-not socket-opened)
+        (should (equal "identity_mismatch"
+                       (slackit-account-state-bootstrap-error (slackit-runtime-state app))))
+        (should-not (slackit-state-self-id (slackit-runtime-state app)))))))
 
 (ert-deftest slackit-contract-transients-retain-exact-message-scope ()
   (slackit-test-with-app (app "transient")
@@ -1962,7 +2014,7 @@
               (setq media-called (list action context)))))
         (let* ((view (slackit-room-open app "C1" nil))
                scope)
-          (with-current-buffer (appkit-view-buffer view)
+          (with-current-buffer (appkit-surface-buffer view)
             (goto-char (point-min))
             (let ((match
                    (text-property-search-forward
@@ -2000,7 +2052,8 @@
       (cl-letf (((symbol-function 'websocket-open)
                  (lambda (&rest _arguments)
                    (setq websocket-opened t))))
-        (slackit-realtime-start app))
+        (slackit-realtime-start app)
+        (slackit-test-drain))
       (should-not websocket-opened)
       (should
        (eq 'protocol-error
@@ -2041,6 +2094,7 @@
            ((symbol-function 'websocket-close)
             (lambda (&rest _arguments) nil)))
         (slackit-realtime-start app)
+        (slackit-test-drain)
         (should (string-prefix-p
                  "wss://wss-primary.slack.com/?" opened-url))
         (should (string-match-p
@@ -2133,32 +2187,6 @@
            (eq #'slackit-actions-open-thread
                (lookup-key slackit-room-timeline-mode-map (kbd "T")))))))))
 
-(ert-deftest slackit-contract-user-frame-only-applies-events-without-hydration ()
-  (slackit-test-with-app (app "user-frame-only")
-    (slackit-state-put-user
-     (slackit-runtime-state app)
-     '((id . "U1") (name . "alice")
-       (profile . ((display_name . "Alice")))))
-    (cl-letf (((symbol-function 'slackit-api-user-info)
-               (lambda (&rest _arguments) 'synthetic-request)))
-      (let ((view (slackit-user-open app "U1" nil)))
-        (with-current-buffer (appkit-view-buffer view)
-          (let ((invalidations (appkit-invalidations-create))
-                accepted-events)
-            (setf (appkit-invalidations-parts invalidations) '(frame))
-            (cl-letf (((symbol-function 'slackit-user--accept-events)
-                       (lambda (events) (setq accepted-events events)))
-                      ((symbol-function 'slackit-user--state-user)
-                       (lambda (&rest _arguments)
-                         (ert-fail
-                          "frame-only sync hydrated user resources")))
-                      ((symbol-function 'slackit-user-render)
-                       (lambda ()
-                         (ert-fail
-                          "frame-only sync rendered user profile"))))
-              (slackit-user--sync view invalidations '(profile-event)))
-            (should (equal accepted-events '(profile-event)))))))))
-
 (ert-deftest slackit-contract-user-views-own-exact-account-identities ()
   (slackit-test-with-app (app "user-views")
     (let ((state (slackit-runtime-state app))
@@ -2179,16 +2207,16 @@
                    (push (cons user-id
                                (plist-get arguments :on-success))
                          callbacks)
-                   'synthetic-request)))
+                   (slackit-test-request _app (plist-get arguments :owner)))))
         (let ((first (slackit-user-open app "U1" nil))
               (second (slackit-user-open app "U2" nil)))
           (should-not (eq first second))
-          (should (equal '(user "U1") (appkit-view-id first)))
-          (should (equal '(user "U2") (appkit-view-id second)))
+          (should (equal '(user "U1") (appkit-surface-identity first)))
+          (should (equal '(user "U2") (appkit-surface-identity second)))
           (should-not
-           (equal (buffer-name (appkit-view-buffer first))
-                  (buffer-name (appkit-view-buffer second))))
-          (with-current-buffer (appkit-view-buffer first)
+           (equal (buffer-name (appkit-surface-buffer first))
+                  (buffer-name (appkit-surface-buffer second))))
+          (with-current-buffer (appkit-surface-buffer first)
             (should (equal "U1" slackit-user--user-id))
             (should (string-match-p "Alice Adams" (buffer-string)))
             (should (string-match-p "Engineer" (buffer-string)))
@@ -2197,15 +2225,15 @@
            (cdr (assoc "U1" callbacks))
            '((user . ((id . "U1") (name . "alice-new")
                       (profile . ((display_name . "Alice Updated")))))))
-          (with-current-buffer (appkit-view-buffer first)
-            (appkit-sync-invalidations first)
+          (slackit-test-drain)
+          (with-current-buffer (appkit-surface-buffer first)
             (should (string-match-p "Alice Updated" (buffer-string))))
           (funcall
            (cdr (assoc "U2" callbacks))
            '((user . ((id . "WRONG")
                       (profile . ((display_name . "Wrong User")))))))
-          (with-current-buffer (appkit-view-buffer second)
-            (appkit-sync-invalidations second)
+          (slackit-test-drain)
+          (with-current-buffer (appkit-surface-buffer second)
             (should (string-match-p "invalid_response" (buffer-string))))
           (should-not (slackit-state-user state "WRONG")))))))
 
@@ -2220,11 +2248,11 @@
                  (lambda (_app _user-id &rest arguments)
                    (setq success (plist-get arguments :on-success)
                          owner (plist-get arguments :owner))
-                   'synthetic-request)))
+                   (slackit-test-request _app (plist-get arguments :owner)))))
         (let ((view (slackit-user-open app "U1" nil)))
           (should (eq view owner))
           (should (slackit-runtime-user-pending-p app "U1"))
-          (appkit-kill-view view)
+          (appkit-surface-stop view)
           (should-not (slackit-runtime-user-pending-p app "U1"))
           (funcall
            success
@@ -2248,7 +2276,7 @@
        state '((id . "D1") (user . "U1") (is_im . t)
                (is_member . t)))
       (cl-letf (((symbol-function 'slackit-api-user-info)
-                 (lambda (&rest _arguments) 'synthetic-request))
+                 (lambda (owner _id &rest options) (slackit-test-request owner (plist-get options :owner))))
                 ((symbol-function 'slackit-api-conversations-open)
                  (lambda (_app _user-id &rest arguments)
                    (cl-incf api-count)
@@ -2259,12 +2287,12 @@
                  (lambda (target-app conversation-id &optional _select)
                    (setq opened (list target-app conversation-id)))))
         (let ((existing-view (slackit-user-open app "U1" nil)))
-          (with-current-buffer (appkit-view-buffer existing-view)
+          (with-current-buffer (appkit-surface-buffer existing-view)
             (slackit-user-open-chat))
           (should (equal (list app "D1") opened))
           (should (= 0 api-count)))
         (let ((created-view (slackit-user-open app "U2" nil)))
-          (with-current-buffer (appkit-view-buffer created-view)
+          (with-current-buffer (appkit-surface-buffer created-view)
             (slackit-user-open-chat)
             (should-error (slackit-user-open-chat) :type 'user-error))
           (should (= 1 api-count))
@@ -2286,7 +2314,7 @@
        state '((id . "U1") (name . "alice")
                (profile . ((display_name . "Alice")))))
       (cl-letf (((symbol-function 'slackit-api-user-info)
-                 (lambda (&rest _arguments) 'synthetic-request))
+                 (lambda (owner _id &rest options) (slackit-test-request owner (plist-get options :owner))))
                 ((symbol-function 'slackit-api-conversations-open)
                  (lambda (_app _user-id &rest arguments)
                    (setq dm-success (plist-get arguments :on-success))
@@ -2294,9 +2322,9 @@
                 ((symbol-function 'slackit-room-open)
                  (lambda (&rest arguments) (setq opened arguments))))
         (let ((view (slackit-user-open app "U1" nil)))
-          (with-current-buffer (appkit-view-buffer view)
+          (with-current-buffer (appkit-surface-buffer view)
             (slackit-user-open-chat))
-          (appkit-kill-view view)
+          (appkit-surface-stop view)
           (funcall dm-success '((channel . ((id . "D1")))))
           (should-not opened)
           (should-not (slackit-state-conversation state "D1")))))))
@@ -2313,19 +2341,19 @@
        '((id . "U1") (name . "right")
          (profile . ((display_name . "Right Alice")))))
       (cl-letf (((symbol-function 'slackit-api-user-info)
-                 (lambda (&rest _arguments) 'synthetic-request)))
+                 (lambda (owner _id &rest options) (slackit-test-request owner (plist-get options :owner)))))
         (let ((left-view (slackit-user-open left "U1" nil))
               (right-view (slackit-user-open right "U1" nil)))
           (should-not (eq left-view right-view))
-          (should (equal '(user "U1") (appkit-view-id left-view)))
-          (should (equal '(user "U1") (appkit-view-id right-view)))
+          (should (equal '(user "U1") (appkit-surface-identity left-view)))
+          (should (equal '(user "U1") (appkit-surface-identity right-view)))
           (should-not
-           (equal (buffer-name (appkit-view-buffer left-view))
-                  (buffer-name (appkit-view-buffer right-view))))
-          (with-current-buffer (appkit-view-buffer left-view)
+           (equal (buffer-name (appkit-surface-buffer left-view))
+                  (buffer-name (appkit-surface-buffer right-view))))
+          (with-current-buffer (appkit-surface-buffer left-view)
             (should (string-match-p "Left Alice" (buffer-string)))
             (should-not (string-match-p "Right Alice" (buffer-string))))
-          (with-current-buffer (appkit-view-buffer right-view)
+          (with-current-buffer (appkit-surface-buffer right-view)
             (should (string-match-p "Right Alice" (buffer-string)))
             (should-not (string-match-p "Left Alice" (buffer-string)))))))))
 
@@ -2545,6 +2573,7 @@
         (should-not (gethash left slackit-code--app-caches))
         (should (eq right-cache
                     (gethash right slackit-code--app-caches)))))))
+
 (ert-deftest slackit-contract-rich-code-renders-canonical-multiline-block ()
   (slackit-test-with-app (app "rich-code-render")
     (let* ((state (slackit-runtime-state app))
@@ -2602,6 +2631,7 @@
            (eq 'emacs-lisp-mode
                (get-text-property position 'slackit-code-mode)))))
       (should (equal fallback (alist-get 'text message))))))
+
 (ert-deftest slackit-contract-code-mode-resolution-is-emacs-owned ()
   (should (eq 'emacs-lisp-mode
               (slackit-code-mode-for-language "elisp")))
@@ -2611,7 +2641,6 @@
                 (slackit-code-mode-for-language "python"))))
   (should-not
    (slackit-code-mode-for-language "unsupported-language")))
-
 
 (provide 'slackit-contract-test)
 

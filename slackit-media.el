@@ -22,6 +22,310 @@
 (require 'slackit-customize)
 (require 'slackit-runtime)
 
+(cl-defstruct (slackit-media-fetch
+               (:constructor slackit-media-fetch-create))
+  app
+  generation
+  resource-key
+  purpose
+  kind
+  transfer
+  cache-file
+  handle
+  success-function
+  failure-function)
+
+(cl-defstruct (slackit-media-open-spec
+               (:constructor slackit-media-open-spec-create))
+  app
+  generation
+  kind
+  source
+  name
+  mime-type
+  size
+  duration-ms
+  private-source-p)
+
+(defun slackit-media--pending-input (key)
+  "Return the exact current Surface's pending acquisition for KEY."
+  (when-let* ((surface (appkit-current-surface))
+              ((appkit-surface-live-p surface)))
+    (cdr (assoc key (plist-get (appkit-surface-model surface) :media-inputs)))))
+
+(defun slackit-media--commit-content-file (input file)
+  "Commit INPUT's independently acquired FILE into its account-private cache."
+  (unless (slackit-media--input-current-p input)
+    (error "slackit: stale content acquisition"))
+  (let* ((key (plist-get input :key))
+         (fetch-key (plist-get input :fetch-key))
+         (spec (plist-get input :spec))
+         (target (slackit-media--private-cache-file
+                  key (slackit-media-open-spec-source spec) (slackit-media-open-spec-name spec))))
+    (unless (equal file target) (rename-file file target t))
+    (remhash fetch-key slackit-media--content-files)
+    (remhash fetch-key slackit-media--image-cache)
+    (remhash key slackit-media--failures)
+    (puthash key target slackit-media--content-files)
+    (when (eq (slackit-media-open-spec-kind spec) 'photo)
+      (puthash key (list target (file-attribute-modification-time (file-attributes target))
+                         (appkit-media-preview-image-from-file target))
+               slackit-media--image-cache))
+    target))
+
+(defvar slackit-media--content-files (make-hash-table :test #'equal)
+  "Validated local content files discovered only by acquisition.")
+
+(defun slackit-media--cached-file (key)
+  "Return KEY's acquired local file without filesystem discovery."
+  (or (gethash key slackit-media--content-files)
+      (car (gethash key slackit-media--image-cache))))
+
+(defun slackit-media--cached-image (key)
+  "Return KEY's acquired image descriptor without filesystem discovery."
+  (let ((image (nth 2 (gethash key slackit-media--image-cache))))
+    (and (not (eq image :invalid)) image)))
+
+(defun slackit-media--audio-source-start (_context input emit closed)
+  "Start real local playback owned by INPUT's initiating Surface Source."
+  (condition-case nil
+      (progn
+        (unless (slackit-media--input-current-p input)
+          (error "slackit: stale audio Surface"))
+        (let* ((key (plist-get input :key))
+               (spec (plist-get input :spec))
+               (previous (gethash key slackit-media--audio-sessions))
+               session)
+          (when (and previous (not (appkit-media-player-session-finalized-p previous)))
+            (appkit-media-player-stop previous))
+          (setq session
+                (appkit-media-player-start-file
+                 (plist-get input :file) :kind 'audio :owner (plist-get input :surface)
+                 :duration-seconds
+                 (let ((duration (slackit-media-open-spec-duration-ms spec)))
+                   (and (numberp duration) (/ (max 0 duration) 1000.0)))
+                 :on-change (lambda (session) (funcall emit (appkit-media-player-status session)))
+                 :on-finalize (lambda (_session) (funcall closed))))
+          (setf (plist-get input :session) session)
+          (puthash key session slackit-media--audio-sessions)
+          (appkit-source-cancellation-create
+           :kind 'transport :cancel (lambda () (appkit-media-player-stop session)))))
+    (error (funcall closed 'player-unavailable) nil)))
+
+(defun slackit-media--audio-source-outbound (_context input _payload _settled)
+  "Toggle the exact player captured by INPUT's live Source."
+  (if-let* ((session (plist-get input :session)))
+      (progn (appkit-media-player-toggle session) 'accepted)
+    'closed))
+
+(defun slackit-media--audio-intent-result (_input outcome)
+  "Map a playback command OUTCOME without publishing reentrantly."
+  (list 'slackit-audio-intent outcome))
+
+(defun slackit-media-sources (model)
+  "Describe MODEL's physically owned local audio streams."
+  (mapcar
+   (lambda (entry)
+     (let ((input (cdr entry)))
+       (appkit-source-spec-create
+        :key (list 'audio (car entry))
+        :identity (list (plist-get input :generation) (car entry))
+        :input input :start #'slackit-media--audio-source-start
+        :outbound #'slackit-media--audio-source-outbound :outbound-pending-limit 4
+        :event (lambda (input status) (list 'slackit-audio-state input status))
+        :closed (lambda (input &rest reason) (list 'slackit-audio-closed input (car reason)))
+        :emission-policy 'latest :pending-limit 1 :cancellation-requirement 'transport)))
+   (plist-get model :audio-inputs)))
+
+(defun slackit-media-audio-update (model message)
+  "Commit playback MESSAGE and an exact media redraw."
+  (let* ((input (cadr message))
+         (key (and (listp input) (plist-get input :key)))
+         (inputs (plist-get model :audio-inputs)))
+    (when (and (eq (car message) 'slackit-audio-closed)
+               (eq input (cdr (assoc key inputs))))
+      (setq model (plist-put (copy-sequence model) :audio-inputs
+                             (assoc-delete-all key (copy-sequence inputs)))))
+    (when (and (eq (car message) 'slackit-audio-closed) (caddr message))
+      (setq model (plist-put (copy-sequence model) :media
+                             (list :phase 'failed :key key :error (caddr message)))))
+    (appkit-next :model model
+                 :render (appkit-projection-change-create
+                          :frame-p t :full-p t :resources (and key (list key))))))
+
+(defun slackit-media--request (key action)
+  "Acquire KEY under the initiating Surface before committed ACTION."
+  (let* ((surface (appkit-current-surface))
+         (spec (slackit-media--content-spec-current key)))
+    (unless (and (appkit-surface-live-p surface) spec
+                 (eq (appkit-surface-app surface) (slackit-media-open-spec-app spec)))
+      (user-error "slackit: media requires its live account Surface"))
+    (appkit-surface-send
+     surface
+     (list 'slackit-media (if (eq action 'cancel) 'cancel 'acquire)
+           (list :surface surface :app (appkit-surface-app surface)
+                 :model (appkit-app-model (appkit-surface-app surface))
+                 :generation (slackit-runtime-generation (appkit-surface-app surface))
+                 :identity (copy-tree (appkit-surface-identity surface))
+                 :key key :spec spec :action action)))))
+
+(defun slackit-media--input-current-p (input)
+  "Whether INPUT still owns its exact initiating Surface and account."
+  (let ((surface (plist-get input :surface)) (app (plist-get input :app)))
+    (and (appkit-surface-live-p surface)
+         (eq app (appkit-surface-app surface))
+         (eq (plist-get input :model) (appkit-app-model app))
+         (equal (plist-get input :identity) (appkit-surface-identity surface))
+         (slackit-runtime-current-p app (plist-get input :generation)))))
+
+(defun slackit-media--acquire-start (_context input _observe resolve reject)
+  "Start INPUT's real Surface-owned acquisition."
+  (unless (slackit-media--input-current-p input)
+    (error "slackit: stale media Surface"))
+  (if-let* ((file (plist-get input :local-file)))
+      (progn
+        (if (file-regular-p file) (funcall resolve file) (funcall reject 'missing-file))
+        nil)
+    (let* ((spec (plist-get input :spec))
+           (settled nil)
+           (fetch
+            (slackit-media--ensure-item
+             (plist-get input :app)
+             (list :source (slackit-media-open-spec-source spec)
+                   :resource-key (plist-get input :fetch-key) :cache-key (plist-get input :key) :purpose 'content
+                   :kind (slackit-media-open-spec-kind spec)
+                   :private-source-p (slackit-media-open-spec-private-source-p spec)
+                   :cache-name (slackit-media-open-spec-name spec)
+                   :mime-type (slackit-media-open-spec-mime-type spec))
+             (lambda (file)
+               (setq settled t)
+               (condition-case nil
+                   (funcall resolve (slackit-media--commit-content-file input file))
+                 (error (funcall reject 'cache-error))))
+             (lambda (reason)
+               (setq settled t)
+               (when (slackit-media--input-current-p input)
+                 (slackit-media--record-failure (plist-get input :key)))
+               (remhash (plist-get input :fetch-key) slackit-media--failures)
+               (funcall reject reason))
+             (plist-get input :surface))))
+      (cond
+       ((slackit-media-fetch-p fetch)
+        (appkit-cancellation-create
+         :kind 'transport
+         :cancel (lambda () (appkit-cancel-handle (slackit-media-fetch-handle fetch)))))
+       (settled nil)
+       (t (funcall reject 'temporarily-unavailable) nil)))))
+
+(defun slackit-media--present-start (_context input _observe resolve reject)
+  "Perform committed local presentation for INPUT's exact Surface."
+  (if (not (slackit-media--input-current-p input))
+      (funcall reject 'stale)
+    (condition-case nil
+        (progn
+          (with-current-buffer (appkit-surface-buffer (plist-get input :surface))
+            (pcase (plist-get input :action)
+              ('open (if (plist-get input :local-file)
+                         (appkit-media-open-file (plist-get input :file))
+                       (slackit-media--open-content-file
+                        (plist-get input :key) (plist-get input :file)
+                        (plist-get input :surface))))
+              ('save (slackit-media--save-content-file
+                      (plist-get input :key) (plist-get input :file)))))
+          (funcall resolve t))
+      (error (funcall reject 'presentation-failed))))
+  nil)
+
+(defun slackit-media-update (_context model message)
+  "Return finite acquisition and presentation Effects for media MESSAGE."
+  (pcase-let ((`(slackit-media ,phase ,input . ,payload) message))
+    (if (not (slackit-media--input-current-p input))
+        (appkit-next :model model :render appkit-render-none)
+      (let (effect commands)
+        (when (slackit-media--input-current-p input)
+          (pcase phase
+            ('acquire
+             (setq input (plist-put (copy-sequence input) :fetch-key
+                                    (list (plist-get input :key)
+                                          (cl-incf slackit-runtime--operation-nonce))))
+             (setq effect
+                   (appkit-effect-create
+                    :key (list 'media (plist-get input :key)) :input input
+                    :start #'slackit-media--acquire-start :cancellation-requirement 'transport
+                    :success (lambda (input file) (list 'slackit-media 'acquired input file))
+                    :failure (lambda (input reason) (list 'slackit-media 'failed input reason)))))
+            ('cancel
+             (push (appkit-command-cancel-effect (list 'media (plist-get input :key))) commands)
+             (push (appkit-command-cancel-effect (list 'media-present (plist-get input :key))) commands))
+            ('acquired
+             (if (and (eq (plist-get input :action) 'open)
+                      (eq (slackit-media-open-spec-kind (plist-get input :spec)) 'audio))
+                 (let* ((key (plist-get input :key))
+                        (existing (cdr (assoc key (plist-get model :audio-inputs)))))
+                   (if existing
+                       (push (appkit-command-source-intent
+                              :key (list 'audio key)
+                              :expected-identity (list (plist-get existing :generation) key)
+                              :payload 'toggle :result-mapper #'slackit-media--audio-intent-result)
+                             commands)
+                     (let ((audio-input (append (copy-sequence input)
+                                                (list :file (car payload) :session nil))))
+                       (setq model (plist-put (copy-sequence model) :audio-inputs
+                                              (cons (cons key audio-input)
+                                                    (plist-get model :audio-inputs)))))))
+               (when (memq (plist-get input :action) '(open save))
+                 (setq effect
+                       (appkit-effect-create
+                        :key (list 'media-present (plist-get input :key))
+                        :input (plist-put (copy-sequence input) :file (car payload))
+                        :start #'slackit-media--present-start
+                        :success (lambda (input &rest _) (list 'slackit-media 'presented input))
+                        :failure (lambda (input reason) (list 'slackit-media 'failed input reason)))))))))
+        (setq model
+              (plist-put (copy-sequence model) :media-inputs
+                         (let* ((key (plist-get input :key))
+                                (entries (assoc-delete-all key (copy-sequence (plist-get model :media-inputs)))))
+                           (if (eq phase 'acquire) (cons (cons key input) entries) entries))))
+        (appkit-next
+         :model (plist-put (copy-sequence model) :media
+                           (list :phase phase :key (plist-get input :key)
+                                 :error (and (eq phase 'failed) (car payload))))
+         :render (appkit-projection-change-create :full-p t :frame-p t)
+         :commands (append commands (and effect (list (appkit-command-start-effect effect)))))))))
+
+(defun slackit-media-demand (app item)
+  "Describe one private ITEM acquisition without starting transport."
+  (let* ((key (plist-get item :resource-key))
+         (source (plist-get item :source))
+         (input (list :resource-key key :source source
+                      :private-source-p (plist-get item :private-source-p)
+                      :purpose (plist-get item :purpose) :kind (plist-get item :kind)
+                      :cache-name (plist-get item :cache-name) :mime-type (plist-get item :mime-type))))
+    (when source
+      (appkit-resource-demand-create
+       :key key :input (list app (slackit-runtime-generation app) input)
+       :loader #'slackit-media--load
+       :acquisition-identity (list key (secure-hash 'sha256 source))
+       :sharing-policy 'app-private :cache-policy 'while-interested))))
+
+(defun slackit-media--load (_context input resolve reject)
+  "Acquire declared INPUT with the existing validated transport."
+  (pcase-let ((`(,app ,generation ,item) input))
+    (unless (slackit-runtime-current-p app generation)
+      (error "slackit: retired media account"))
+    (let* ((settled nil)
+           (fetch (slackit-media--ensure-item
+                   app item
+                   (lambda (file) (setq settled t) (funcall resolve file))
+                   (lambda (reason) (setq settled t) (funcall reject reason)))))
+      (cond
+       ((slackit-media-fetch-p fetch)
+        (appkit-cancellation-create
+         :kind 'transport
+         :cancel (lambda () (appkit-cancel-handle (slackit-media-fetch-handle fetch)))))
+       (settled nil)
+       (t (funcall reject 'temporarily-unavailable) nil)))))
+
 (defcustom slackit-media-cache-directory
   (locate-user-emacs-file "slackit/media/")
   "Directory containing account-isolated cached Slack media images."
@@ -38,30 +342,6 @@
   :type 'integer
   :group 'slackit)
 
-(cl-defstruct (slackit-media-fetch
-               (:constructor slackit-media-fetch-create))
-  app
-  generation
-  resource-key
-  purpose
-  kind
-  transfer
-  cache-file
-  handle
-  success-function)
-
-(cl-defstruct (slackit-media-open-spec
-               (:constructor slackit-media-open-spec-create))
-  app
-  generation
-  kind
-  source
-  name
-  mime-type
-  size
-  duration-ms
-  private-source-p)
-
 (defvar slackit-media--image-cache (make-hash-table :test #'equal)
   "Decoded poster records keyed by opaque media resource identity.")
 
@@ -73,9 +353,6 @@
 
 (defvar slackit-media--open-specs (make-hash-table :test #'equal)
   "Opaque content keys to account-owned media specifications.")
-
-(defvar slackit-media--spec-handles (make-hash-table :test #'eq)
-  "Live Slackit apps to their content-registry lifecycle handles.")
 
 (defvar slackit-media--audio-sessions (make-hash-table :test #'equal)
   "Appkit audio sessions keyed by content resource identity.")
@@ -99,18 +376,8 @@
      slackit-media--open-specs)
     (dolist (key keys)
       (remhash key slackit-media--open-specs)
-      (remhash key slackit-media--audio-sessions)))
-  (remhash app slackit-media--spec-handles))
-
-(defun slackit-media--ensure-spec-handle (app)
-  "Ensure APP owns exact cleanup for its private media registry."
-  (or (gethash app slackit-media--spec-handles)
-      (let ((handle
-             (appkit-register-handle
-              app 'slackit-media-specs app
-              #'slackit-media--clear-app-specs)))
-        (puthash app handle slackit-media--spec-handles)
-        handle)))
+      (remhash key slackit-media--content-files)
+      (remhash key slackit-media--audio-sessions))))
 
 (defun slackit-media--register-content-spec
     (app identity kind source name mime-type size &optional duration-ms)
@@ -120,7 +387,6 @@ IDENTITY is secret-free.  SOURCE must be an accepted private Slack or public
 media source."
   (let ((private-source-p (slackit-media--private-source-p source)))
     (when (or private-source-p (slackit-media--public-source-p source))
-      (slackit-media--ensure-spec-handle app)
       (let ((key (slackit-media--resource-key app 'content identity)))
         (puthash
          key
@@ -139,7 +405,7 @@ media source."
 
 (defun slackit-media--account-scope (app)
   "Return opaque stable account scope for APP."
-  (secure-hash 'sha256 (prin1-to-string (appkit-app-id app))))
+  (secure-hash 'sha256 (prin1-to-string (appkit-app-identity app))))
 
 (defun slackit-media--resource-key (app kind identity)
   "Return an opaque account-scoped resource key for KIND and IDENTITY."
@@ -345,7 +611,6 @@ media source."
        (alist-get 'name file))
       "Slack file"))
 
-
 (defconst slackit-media--file-preview-fields
   '(thumb_1024 thumb_960 thumb_720 thumb_480 thumb_360
     thumb_160 thumb_80 thumb_64)
@@ -481,7 +746,7 @@ media source."
   "Return RESOURCE-KEY's decoded image without starting acquisition."
   (slackit-media--cached-image resource-key))
 
-(defun slackit-media--cached-file (resource-key)
+(defun slackit-media--discover-cache-file (resource-key)
   "Return RESOURCE-KEY's existing local cache file, or nil."
   (and resource-key
        (appkit-media-image-cache-existing-file
@@ -619,7 +884,7 @@ media source."
       :then (apply-partially #'slackit-media--fetch-success owner)
       :else (apply-partially #'slackit-media--fetch-failure owner))))
 
-(defun slackit-media--cached-image (resource-key)
+(defun slackit-media--discover-image (resource-key)
   "Return RESOURCE-KEY's decoded cached poster without starting acquisition."
   (let* ((cache-base (slackit-media--cache-base resource-key))
          (file (appkit-media-image-cache-existing-file cache-base))
@@ -656,7 +921,8 @@ media source."
   (let ((key (slackit-media-fetch-resource-key owner)))
     (when (eq owner (gethash key slackit-media--fetches))
       (remhash key slackit-media--fetches))
-    (setf (slackit-media-fetch-success-function owner) nil)
+    (setf (slackit-media-fetch-success-function owner) nil
+          (slackit-media-fetch-failure-function owner) nil)
     (when-let* ((transfer (slackit-media-fetch-transfer owner)))
       (setf (slackit-media-fetch-transfer owner) nil)
       (slackit-media--cancel-transfer transfer))
@@ -697,7 +963,6 @@ media source."
 (defun slackit-media--fetch-success (owner file)
   "Settle media fetch OWNER from completed local FILE."
   (let* ((current-p (slackit-media--owner-current-p owner))
-         (app (slackit-media-fetch-app owner))
          (key (slackit-media-fetch-resource-key owner))
          (purpose (slackit-media-fetch-purpose owner))
          (kind (slackit-media-fetch-kind owner))
@@ -715,7 +980,8 @@ media source."
                      (slackit-media--content-file-valid-p kind file))
                  image)))
          (success-function
-          (slackit-media-fetch-success-function owner)))
+          (slackit-media-fetch-success-function owner))
+         (failure-function (slackit-media-fetch-failure-function owner)))
     (when (file-regular-p file)
       (unless (memq system-type '(ms-dos windows-nt cygwin))
         (set-file-modes file #o600)))
@@ -724,6 +990,7 @@ media source."
       (if valid-p
           (progn
             (remhash key slackit-media--failures)
+            (when content-p (puthash key file slackit-media--content-files))
             (when image
               (let* ((attributes (file-attributes file))
                      (mtime (file-attribute-modification-time attributes)))
@@ -738,8 +1005,8 @@ media source."
     (setf (slackit-media-fetch-cache-file owner) nil
           (slackit-media-fetch-success-function owner) nil)
     (slackit-media--retire-fetch owner)
-    (when current-p
-      (slackit-runtime-publish-resource app key))
+    (when (and current-p (not valid-p) failure-function)
+      (funcall failure-function 'invalid-media))
     (when (and valid-p (functionp success-function))
       (condition-case nil
           (funcall success-function file)
@@ -749,8 +1016,8 @@ media source."
 (defun slackit-media--fetch-failure (owner _reason)
   "Settle failed media fetch OWNER without exposing remote details."
   (let ((current-p (slackit-media--owner-current-p owner))
-        (app (slackit-media-fetch-app owner))
-        (key (slackit-media-fetch-resource-key owner)))
+        (key (slackit-media-fetch-resource-key owner))
+        (failure-function (slackit-media-fetch-failure-function owner)))
     (when-let* ((file (slackit-media-fetch-cache-file owner)))
       (setf (slackit-media-fetch-cache-file owner) nil)
       (when (file-exists-p file)
@@ -759,8 +1026,8 @@ media source."
     (when current-p
       (slackit-media--record-failure key))
     (slackit-media--retire-fetch owner)
-    (when current-p
-      (slackit-runtime-publish-resource app key))))
+    (when (and current-p failure-function)
+      (funcall failure-function 'request-failed))))
 
 (defun slackit-media--retry-due-p (resource-key)
   "Return non-nil when RESOURCE-KEY has no active failure backoff."
@@ -774,24 +1041,25 @@ media source."
   (funcall first file)
   (funcall second file))
 
-(defun slackit-media--ensure-item (app item &optional success-function)
+(defun slackit-media--ensure-item (app item &optional success-function failure-function lifecycle-owner)
   "Start one deduplicated media acquisition for APP and ITEM.
 
 SUCCESS-FUNCTION receives the validated local file after acquisition."
   (let* ((source (plist-get item :source))
          (key (plist-get item :resource-key))
+         (cache-key (or (plist-get item :cache-key) key))
          (purpose (or (plist-get item :purpose) 'preview))
          (kind (or (plist-get item :kind) 'photo))
          (content-p (eq purpose 'content))
          (cached-file
           (if content-p
               (slackit-media--existing-content-file
-               key source (plist-get item :cache-name))
-            (slackit-media--cached-file key)))
+               cache-key source (plist-get item :cache-name))
+            (slackit-media--discover-cache-file key)))
          (cached-image
           (and cached-file
                (or (not content-p) (eq kind 'photo))
-               (slackit-media--cached-image key)))
+               (slackit-media--discover-image cache-key)))
          (cached-valid-p
           (and cached-file
                (if content-p
@@ -802,10 +1070,17 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
          (active (and key (gethash key slackit-media--fetches))))
     (cond
      (cached-valid-p
+      (when content-p (puthash key cached-file slackit-media--content-files))
       (when (functionp success-function)
         (funcall success-function cached-file))
       nil)
      (active
+      (when (functionp failure-function)
+        (let ((old (slackit-media-fetch-failure-function active)))
+          (setf (slackit-media-fetch-failure-function active)
+                (if (functionp old)
+                    (apply-partially #'slackit-media--compose-success-functions old failure-function)
+                  failure-function))))
       (when (functionp success-function)
         (let ((old (slackit-media-fetch-success-function active)))
           (setf (slackit-media-fetch-success-function active)
@@ -815,8 +1090,9 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
                      old success-function)
                   success-function))))
       active)
-     ((and source key (slackit-media--retry-due-p key))
+     ((and source key (slackit-media--retry-due-p cache-key))
       (slackit-media--prepare-cache-directory)
+      (remhash key slackit-media--content-files)
       (when cached-file
         (ignore-errors (delete-file cached-file))
         (remhash key slackit-media--image-cache))
@@ -827,14 +1103,13 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
                :resource-key key
                :purpose purpose
                :kind kind
-               :success-function success-function))
+               :success-function success-function :failure-function failure-function))
              (handle
               (appkit-register-handle
-               app 'slackit-media owner
+               (or lifecycle-owner app) 'slackit-media owner
                #'slackit-media--cancel-fetch)))
         (setf (slackit-media-fetch-handle owner) handle)
         (puthash key owner slackit-media--fetches)
-        (slackit-runtime-publish-resource app key)
         (condition-case nil
             (let ((transfer
                    (cond
@@ -843,7 +1118,7 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
                     (content-p
                      (let ((target
                             (slackit-media--private-cache-file
-                             key source (plist-get item :cache-name))))
+                             cache-key source (plist-get item :cache-name))))
                        (setf (slackit-media-fetch-cache-file owner) target)
                        (appkit-media-copy-or-download-resource-async
                         (appkit-media-resource-create
@@ -880,26 +1155,16 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
          spec)))
 
 (defun slackit-media--content-cached-file (content-key spec)
-  "Return validated CONTENT-KEY local file described by SPEC."
-  (let* ((file
-          (and spec
-               (slackit-media--existing-content-file
-                content-key
-                (slackit-media-open-spec-source spec)
-                (slackit-media-open-spec-name spec))))
-         (kind (and spec (slackit-media-open-spec-kind spec))))
-    (and file
-         (if (eq kind 'photo)
-             (slackit-media--cached-image content-key)
-           (slackit-media--content-file-valid-p kind file))
-         file)))
+  "Return acquired CONTENT-KEY's local file while SPEC remains available."
+  (and spec (gethash content-key slackit-media--content-files)))
 
 (defun slackit-media--content-state (content-key)
   "Return normalized transfer state for CONTENT-KEY."
   (let* ((spec (slackit-media--content-spec-current content-key))
          (file (and spec
                     (slackit-media--content-cached-file content-key spec)))
-         (active (gethash content-key slackit-media--fetches)))
+         (active (or (slackit-media--pending-input content-key)
+                     (gethash content-key slackit-media--fetches))))
     (cond
      (active
       (list :status 'downloading
@@ -911,84 +1176,16 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
      (t (list :status 'not-downloaded)))))
 
 (defun slackit-media--cancel-content (content-key)
-  "Cancel CONTENT-KEY's current account-owned download."
-  (let ((owner (gethash content-key slackit-media--fetches)))
-    (unless owner
-      (user-error "slackit: media is not downloading"))
-    (if-let* ((handle (slackit-media-fetch-handle owner)))
-        (appkit-cancel-handle handle)
-      (slackit-media--cancel-fetch owner))
-    (when-let* ((spec (slackit-media--content-spec-current content-key)))
-      (slackit-runtime-publish-resource
-       (slackit-media-open-spec-app spec) content-key))))
+  "Cancel only the initiating Surface's CONTENT-KEY Effect."
+  (unless (slackit-media--pending-input content-key)
+    (user-error "slackit: media is not downloading in this Surface"))
+  (slackit-media--request content-key 'cancel))
 
-(defun slackit-media--download-content
-    (content-key &optional success-function)
-  "Ensure CONTENT-KEY is local, then call SUCCESS-FUNCTION with its file."
-  (let* ((spec (slackit-media--content-spec-current content-key))
-         (app (and spec (slackit-media-open-spec-app spec))))
-    (unless spec
-      (user-error "slackit: media content is unavailable"))
-    (or
-     (slackit-media--ensure-item
-      app
-      (list :source (slackit-media-open-spec-source spec)
-            :resource-key content-key
-            :purpose 'content
-            :kind (slackit-media-open-spec-kind spec)
-            :private-source-p
-            (slackit-media-open-spec-private-source-p spec)
-            :cache-name (slackit-media-open-spec-name spec)
-            :mime-type (slackit-media-open-spec-mime-type spec))
-      success-function)
-     (slackit-media--content-cached-file content-key spec)
-     (user-error "slackit: media content is temporarily unavailable"))))
+(defun slackit-media--download-content (content-key)
+  "Acquire CONTENT-KEY under the initiating live Surface."
+  (slackit-media--request content-key 'download))
 
-(defun slackit-media--audio-session-update (content-key session)
-  "Publish exact CONTENT-KEY state changes from Appkit SESSION."
-  (when (eq session (gethash content-key slackit-media--audio-sessions))
-    (if-let* ((spec (slackit-media--content-spec-current content-key)))
-        (slackit-runtime-publish-resource
-         (slackit-media-open-spec-app spec) content-key)
-      (remhash content-key slackit-media--audio-sessions))))
-
-(defun slackit-media--start-audio-file (content-key file)
-  "Start, pause, or resume local audio FILE for CONTENT-KEY."
-  (let* ((spec (slackit-media--content-spec-current content-key))
-         (app (and spec (slackit-media-open-spec-app spec)))
-         (existing (gethash content-key slackit-media--audio-sessions)))
-    (unless spec
-      (user-error "slackit: media content is unavailable"))
-    (pcase (and existing
-                (appkit-media-player-status existing))
-      ((or 'playing 'paused)
-       (appkit-media-player-toggle existing))
-      ('starting
-       (user-error "slackit: audio playback is preparing"))
-      (_
-       (when (and existing
-                  (not (appkit-media-player-session-finalized-p existing)))
-         (appkit-media-player-stop existing))
-       (unless (appkit-media-player-available-p nil 'audio)
-         (user-error
-          "slackit: audio player is unavailable; customize `appkit-media-audio-player-command'"))
-       (let* ((duration-ms (slackit-media-open-spec-duration-ms spec))
-              (session
-               (appkit-media-player-start-file
-                file
-                :kind 'audio
-                :owner app
-                :duration-seconds
-                (and (numberp duration-ms)
-                     (/ (max 0 duration-ms) 1000.0))
-                :on-change
-                (apply-partially
-                 #'slackit-media--audio-session-update content-key))))
-         (puthash content-key session slackit-media--audio-sessions)
-         (slackit-runtime-publish-resource app content-key)
-         session)))))
-
-(defun slackit-media--open-content-file (content-key file)
+(defun slackit-media--open-content-file (content-key file &optional owner)
   "Open or play local FILE according to CONTENT-KEY's media kind."
   (let* ((spec (slackit-media--content-spec-current content-key))
          (kind (and spec (slackit-media-open-spec-kind spec)))
@@ -997,15 +1194,12 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
       (user-error "slackit: media content is unavailable"))
     (pcase kind
       ('photo (slackit-media--open-local-image-file file))
-      ('video (appkit-media-play-video-file file "slackit" :owner app))
-      ('audio (slackit-media--start-audio-file content-key file))
+      ('video (appkit-media-play-video-file file "slackit" :owner (or owner app)))
       (_ (appkit-media-open-file file)))))
 
 (defun slackit-media--open-content (content-key)
-  "Download CONTENT-KEY when needed, then open or play it locally."
-  (slackit-media--download-content
-   content-key
-   (apply-partially #'slackit-media--open-content-file content-key)))
+  "Acquire CONTENT-KEY under the initiating Surface, then present it."
+  (slackit-media--request content-key 'open))
 
 (defun slackit-media--save-content-file (content-key file)
   "Save local CONTENT-KEY FILE to a user-selected destination."
@@ -1021,10 +1215,8 @@ SUCCESS-FUNCTION receives the validated local file after acquisition."
     (message "slackit: media saved")))
 
 (defun slackit-media--save-content (content-key)
-  "Download CONTENT-KEY when needed, then save a local copy."
-  (slackit-media--download-content
-   content-key
-   (apply-partially #'slackit-media--save-content-file content-key)))
+  "Acquire CONTENT-KEY under the initiating Surface, then save a copy."
+  (slackit-media--request content-key 'save))
 
 (defun slackit-media--content-transfer (content-key)
   "Return Appkit transfer presentation for CONTENT-KEY."
@@ -1064,7 +1256,6 @@ deterministic operation in `slackit-media-insert-message-cards'."
   (when (slackit-media--public-source-p source)
     (slackit-media--ensure-item
      app (list :source source :resource-key resource-key))))
-
 
 (defun slackit-media--safe-context-payload (item)
   "Return non-capability metadata payload for media card ITEM."

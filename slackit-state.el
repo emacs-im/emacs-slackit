@@ -201,6 +201,7 @@
   (and conversation-id
        (gethash conversation-id
                 (slackit-account-state-conversations state))))
+
 (defun slackit-state-im-conversation-id (state user-id)
   "Return STATE's live direct-message conversation for USER-ID, or nil."
   (seq-find
@@ -212,7 +213,6 @@
             (equal user-id
                    (alist-get 'user conversation)))))
    (slackit-account-state-conversation-order state)))
-
 
 (defun slackit-state-conversation-name (state conversation-id)
   "Return display name for CONVERSATION-ID in STATE."
@@ -459,7 +459,7 @@ authoritative.  No HTTP write response may clear an observed tombstone."
                 (progn
                   (setcdr (assq 'users reaction) (cons user-id users))
                   (setcdr (assq 'count reaction)
-                           (1+ (or (alist-get 'count reaction) 0))))
+                          (1+ (or (alist-get 'count reaction) 0))))
               (push `((name . ,name) (count . 1) (users . (,user-id))) reactions))
           (let ((count (max 0 (1- (or (alist-get 'count reaction) 0)))))
             (setcdr (assq 'users reaction) (delete user-id users))
@@ -492,6 +492,9 @@ authoritative.  No HTTP write response may clear an observed tombstone."
 (defun slackit-state-apply-event (state event)
   "Reduce normalized EVENT into STATE and return change descriptors."
   (pcase (plist-get event :kind)
+    ('connection-status
+     (slackit-state-set-connection-status state (plist-get event :status))
+     (list (list :kind 'connection)))
     ('hello
      (slackit-state-set-connection-status state 'ready)
      (list (list :kind 'connection)))

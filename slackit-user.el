@@ -15,7 +15,7 @@
 (require 'subr-x)
 (require 'appkit-chat-avatar)
 (require 'appkit-core)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'appkit-position)
 (require 'appkit-ui)
 (require 'appkit-presentation)
@@ -55,29 +55,29 @@
 
 (defun slackit-user--view-current-p (view &optional user-id)
   "Return non-nil when VIEW owns exact USER-ID profile context."
-  (let* ((id (and (appkit-view-p view) (appkit-view-id view)))
+  (let* ((id (and (appkit-surface-p view) (appkit-surface-identity view)))
          (expected-user-id (or user-id slackit-user--user-id))
-         (app (and (appkit-view-p view) (appkit-view-app view))))
+         (app (and (appkit-surface-p view) (appkit-surface-app view))))
     (and expected-user-id
-         (appkit-view-live-p view)
-         (eq (appkit-app-kind app) 'slackit-account)
+         (appkit-surface-live-p view)
+         (slackit-runtime-account-p app)
          (equal id (slackit-user--view-id expected-user-id))
-         (eq view (appkit-view-for-id app id))
-         (with-current-buffer (appkit-view-buffer view)
+         (eq view (appkit-app-surface app id))
+         (with-current-buffer (appkit-surface-buffer view)
            (and (derived-mode-p 'slackit-user-mode)
-                (eq view (appkit-current-view))
+                (eq view (appkit-current-surface))
                 (equal slackit-user--user-id expected-user-id))))))
 
 (defun slackit-user--current-view ()
   "Return the exact live user view attached to the current buffer."
-  (let ((view (appkit-current-view)))
+  (let ((view (appkit-current-surface)))
     (or (and (slackit-user--view-current-p view) view)
         (user-error "slackit: this command requires a live user view"))))
 
 (defun slackit-user--state-user (view)
   "Return VIEW's current canonical Slack user, or nil."
   (slackit-state-user
-   (slackit-runtime-state (appkit-view-app view))
+   (slackit-runtime-state (appkit-surface-app view))
    slackit-user--user-id))
 
 (defun slackit-user--display-name (user)
@@ -184,7 +184,7 @@
   (insert "  ")
   (appkit-ui-insert-action-button
    (if (slackit-user--dm-pending-p
-        (appkit-view-app (slackit-user--current-view))
+        (appkit-surface-app (slackit-user--current-view))
         slackit-user--user-id)
        " Opening DM… "
      " Message ")
@@ -208,7 +208,7 @@
   "Render the current canonical Slack user profile."
   (interactive)
   (let* ((view (slackit-user--current-view))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (user (slackit-user--state-user view))
          (profile (and user (alist-get 'profile user))))
     (appkit-position-render-preserving
@@ -296,18 +296,19 @@
                (slackit-user--insert-field "Member ID" slackit-user--user-id)
                (slackit-user--insert-field "Role" roles)))
            (insert "\n")))
-       (add-text-properties
-        (point-min) (point-max)
-        (list 'slackit-user-profile-key
-              (slackit-user--view-id slackit-user--user-id)
-              'rear-nonsticky '(slackit-user-profile-key)))
+       (let ((inhibit-read-only t))
+         (add-text-properties
+          (point-min) (point-max)
+          (list 'slackit-user-profile-key
+                (slackit-user--view-id slackit-user--user-id)
+                'rear-nonsticky '(slackit-user-profile-key))))
        (goto-char (point-min)))
      :anchor-property 'slackit-user-profile-key
      :preserve-window-start t)))
 
 (defun slackit-user--header-line ()
   "Return the current user view's dynamic header line."
-  (let* ((view (appkit-current-view))
+  (let* ((view (appkit-current-surface))
          (user (and (slackit-user--view-current-p view)
                     (slackit-user--state-user view))))
     (format " Slackit user · %s (%s)%s"
@@ -315,7 +316,7 @@
             (or slackit-user--user-id "unknown")
             (if (and view
                      (slackit-runtime-user-pending-p
-                      (appkit-view-app view) slackit-user--user-id))
+                      (appkit-surface-app view) slackit-user--user-id))
                 " · loading"
               ""))))
 
@@ -332,39 +333,23 @@
          (setq slackit-user--dm-error-code
                (or (plist-get event :code) "request_failed")))))))
 
-(defun slackit-user--sync (view invalidations events)
-  "Synchronize exact user VIEW from INVALIDATIONS and EVENTS."
-  (when (slackit-user--view-current-p view (cadr (appkit-view-id view)))
-    (with-current-buffer (appkit-view-buffer view)
-      (slackit-user--accept-events events)
-      (when (appkit-invalidations-affect-p invalidations '(profile))
-        (when-let* ((user (slackit-user--state-user view)))
-          (slackit-avatar-ensure (appkit-view-app view) user)
-          (when-let* ((status-emoji
-                       (slackit-user--present-string
-                        (alist-get 'status_emoji (alist-get 'profile user)))))
-            (slackit-emoji-ensure-message
-             (appkit-view-app view) `((text . ,status-emoji)))))
-        (appkit-with-content-update view
-          (slackit-user-render))))))
-
 (defun slackit-user-refresh ()
   "Refresh the exact current Slack user profile."
   (interactive)
   (let* ((view (slackit-user--current-view))
-         (app (appkit-view-app view)))
+         (app (appkit-surface-app view)))
     (setq slackit-user--profile-error-code nil)
     (slackit-runtime-ensure-user
      app slackit-user--user-id :force t :view view)
-    (appkit-request-sync view :part 'profile)
-    (appkit-sync-invalidations view)))
+    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))
+    ))
 
 (defun slackit-user--dm-pending-p (app user-id)
   "Return APP's current direct-message operation for USER-ID, or nil."
   (let ((operation
          (and (appkit-app-live-p app)
               (gethash (list 'open-dm user-id)
-                       (appkit-app-request-table app)))))
+                       (slackit-runtime-operations app)))))
     (and (slackit-runtime-operation-current-p app operation) operation)))
 
 (defun slackit-user--publish-dm-error (_app operation error-data)
@@ -372,12 +357,12 @@
   (let ((view (slackit-operation-view operation))
         (user-id (slackit-operation-payload operation)))
     (when (slackit-user--view-current-p view user-id)
-      (appkit-view-enqueue-event
+      (slackit-runtime-deliver
        view (list :kind 'user-dm-error
                   :user-id user-id
                   :code (format "%s" (or (plist-get error-data :code)
                                          "request_failed"))))
-      (appkit-request-sync view :part 'profile))))
+      (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t)))))
 
 (defun slackit-user--dm-failure (app operation error-data)
   "Settle failed direct-message OPERATION for APP."
@@ -424,7 +409,7 @@
   "Open or create a direct-message room with the current profile user."
   (interactive)
   (let* ((view (slackit-user--current-view))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (user-id slackit-user--user-id)
          (state (slackit-runtime-state app))
          (existing (slackit-state-im-conversation-id state user-id)))
@@ -438,7 +423,7 @@
       (let ((operation
              (slackit-runtime-operation-begin
               app (list 'open-dm user-id) view nil user-id)))
-        (appkit-request-sync view :part 'profile)
+        (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))
         (slackit-api-conversations-open
          app user-id
          :owner view
@@ -446,13 +431,13 @@
          (apply-partially #'slackit-user--dm-success app operation)
          :on-error
          (apply-partially #'slackit-user--dm-failure app operation))
-        (appkit-sync-invalidations view))))))
+        )))))
 
 (defun slackit-user-open-avatar ()
   "Open the current user's avatar from its local account cache."
   (interactive)
   (let* ((view (slackit-user--current-view))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (user (or (slackit-user--state-user view)
                    (user-error "slackit: user profile is unavailable"))))
     (slackit-avatar-open app user)))
@@ -497,9 +482,10 @@
   (setq-local header-line-format '(:eval (slackit-user--header-line)))
   (buffer-disable-undo)
   (setq-local buffer-undo-list t))
+
 (defun slackit-user--release-view-operations (app view)
   "Retire account operations whose exact lifecycle owner is VIEW."
-  (let ((table (appkit-app-request-table app))
+  (let ((table (slackit-runtime-operations app))
         keys)
     (maphash
      (lambda (key operation)
@@ -510,11 +496,10 @@
     (dolist (key keys)
       (remhash key table))))
 
-
 (defun slackit-user--setup-view (view)
   "Bind exact identity and lifecycle state for user profile VIEW."
-  (let ((user-id (cadr (appkit-view-id view))))
-    (with-current-buffer (appkit-view-buffer view)
+  (let ((user-id (cadr (appkit-surface-identity view))))
+    (with-current-buffer (appkit-surface-buffer view)
       (setq slackit-user--user-id user-id
             slackit-user--profile-error-code nil
             slackit-user--dm-error-code nil))
@@ -522,38 +507,33 @@
      view 'function
      (apply-partially
       #'slackit-user--release-view-operations
-      (appkit-view-app view) view))))
+      (appkit-surface-app view) view))))
 
 ;;;###autoload
 (defun slackit-user-open (app user-id &optional select)
-  "Open APP's exact USER-ID profile and optionally SELECT it."
-  (unless (and (appkit-app-live-p app)
-               (eq (appkit-app-kind app) 'slackit-account))
+  "Open APP's exact USER-ID profile Surface."
+  (unless (and (appkit-app-live-p app) (slackit-runtime-account-p app))
     (user-error "slackit: user profile requires a live account"))
-  (unless (and (stringp user-id)
-               (not (string-empty-p user-id))
+  (unless (and (stringp user-id) (not (string-empty-p user-id))
                (not (string-prefix-p "B" user-id)))
     (user-error "slackit: user profile requires an exact Slack user ID"))
-  (let* ((view-id (slackit-user--view-id user-id))
-         (existing (appkit-view-for-id app view-id))
-         (view
-          (appkit-open-view
-           :app app
-           :id view-id
-           :mode 'slackit-user-mode
-           :buffer-name (format "*Slackit:%s:user %s*"
-                                (appkit-app-id app) user-id)
-           :state user-id
-           :sync-function #'slackit-user--sync
-           :parts '(profile)
-           :setup #'slackit-user--setup-view
-           :select select)))
-    (with-current-buffer (appkit-view-buffer view)
+  (let* ((id (list 'user user-id))
+         (existing (appkit-app-surface app id))
+         (surface (or existing
+                      (appkit-open-generated-surface
+                       (slackit-runtime--surface-type 'user #'slackit-user-mode)
+                       :app app :identity id :input id
+                       :buffer (slackit-runtime--host-buffer app id 'slackit-user-mode)
+                       :buffer-name (format "*Slackit:%s:user %s*"
+                                            (appkit-app-identity app) user-id)))))
+    (slackit-runtime--remember-host surface)
+    (with-current-buffer (appkit-surface-buffer surface)
       (unless existing
-        (slackit-runtime-ensure-user app user-id :force t :view view))
-      (appkit-invalidate view :structure t)
-      (appkit-sync-invalidations view))
-    view))
+        (slackit-user--setup-view surface)
+        (slackit-runtime-ensure-user app user-id :force t :view surface))
+      (slackit-runtime-render surface))
+    (when select (pop-to-buffer (appkit-surface-buffer surface)))
+    surface))
 
 (provide 'slackit-user)
 

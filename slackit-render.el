@@ -249,8 +249,7 @@ When SHORT is non-nil, return only the local hour and minute."
 
 (defun slackit-render--line-fill-column ()
   "Return responsive target width for the current Slackit timeline."
-  (or (appkit-view-responsive-width
-       slackit-room-auto-fill-margin-columns)
+  (or (appkit-surface-responsive-width (appkit-current-surface) slackit-room-auto-fill-margin-columns)
       (and (integerp fill-column) (> fill-column 0) fill-column)
       80))
 
@@ -338,10 +337,10 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
   "Toggle normalized REACTION on exact APP CONVERSATION-ID and TS."
   (when-let* ((name (alist-get 'name reaction)))
     (slackit-reaction-toggle app conversation-id ts name)))
+
 (defun slackit-render--open-thread (app conversation-id root-ts)
   "Open APP's exact CONVERSATION-ID thread rooted at ROOT-TS."
   (slackit-thread-open app conversation-id root-ts t))
-
 
 (defun slackit-render--insert-reactions (app state message)
   "Insert actionable emoji reaction chips for APP MESSAGE using STATE."
@@ -363,7 +362,6 @@ LEFT-PREFIX-WIDTH reserves display-only avatar columns."
            #'slackit-render--toggle-reaction app conversation-id ts))
      :help-echo-function
      (apply-partially #'slackit-render--reaction-help self-id))))
-
 
 (defun slackit-render--rich-code-message-p (message)
   "Return non-nil when MESSAGE owns a rich preformatted code element."

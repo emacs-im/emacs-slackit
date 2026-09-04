@@ -32,6 +32,7 @@
                    (slackit-runtime-state app) conversation-id ts)))
     (unless message (user-error "slackit: message no longer exists"))
     (list app conversation-id ts message)))
+
 (defun slackit-actions-activate ()
   "Activate the most specific semantic action at point.
 
@@ -48,7 +49,6 @@ message row."
     (message "slackit: no action at point")
     nil)))
 
-
 (defun slackit-actions--require-owned (state message)
   "Reject MESSAGE unless it belongs to current user in STATE."
   (unless (equal (slackit-state-self-id state)
@@ -59,16 +59,16 @@ message row."
   "Open the stable thread for the message at point."
   (interactive)
   (pcase-let* ((`(,app ,conversation-id ,ts ,message)
-                 (slackit-actions--context))
-                (root-ts (or (alist-get 'thread_ts message) ts)))
+                (slackit-actions--context))
+               (root-ts (or (alist-get 'thread_ts message) ts)))
     (slackit-thread-open app conversation-id root-ts t)))
 
 (defun slackit-actions-edit ()
   "Edit the owned message at point in the current composer."
   (interactive)
   (pcase-let* ((`(,app ,_conversation-id ,ts ,message)
-                 (slackit-actions--context))
-                (state (slackit-runtime-state app)))
+                (slackit-actions--context))
+               (state (slackit-runtime-state app)))
     (slackit-actions--require-owned state message)
     (unless (appkit-chatbuf-composer-idle-p)
       (user-error "slackit: finish or clear the current composer first"))
@@ -95,12 +95,12 @@ message row."
   "Delete the owned message at point after confirmation."
   (interactive)
   (pcase-let* ((`(,app ,conversation-id ,ts ,message)
-                 (slackit-actions--context))
-                (state (slackit-runtime-state app)))
+                (slackit-actions--context))
+               (state (slackit-runtime-state app)))
     (slackit-actions--require-owned state message)
     (when (yes-or-no-p "Delete this Slack message? ")
       (let* ((key (list 'delete conversation-id ts))
-             (existing (gethash key (appkit-app-request-table app))))
+             (existing (gethash key (slackit-runtime-operations app))))
         (when (slackit-runtime-operation-current-p app existing)
           (user-error "slackit: delete is already in flight"))
         (let ((operation

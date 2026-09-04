@@ -6,16 +6,16 @@ not a fork or compatibility layer for =emacs-slack=.  The package, feature,
 files, commands, variables, and faces use the =slackit-= namespace so both
 clients can be installed and loaded in one Emacs session.
 
-Status: the first daily-use vertical slice is implemented and covered by
-deterministic contract tests.  Live-workspace transport validation still
-requires account credentials and remains an explicit release check.
+Contract tests use isolated canonical Apps and Generated Surfaces with synthetic
+credentials and transports.  Live-workspace authentication and transport checks
+require deliberate account access outside those fixtures.
 
 * Product boundary
 
 Slackit owns Slack account configuration, protocol state, transport, error
 semantics, event reduction, message rendering, and Slack-specific actions.
-Appkit owns application/view lifecycle, generated-content transactions,
-coalesced invalidation, stable-key reconciliation, semantic position, chat
+Appkit owns App/Surface lifecycle, serialized transitions and closed commands,
+Generated Renderer transactions, stable-key reconciliation, semantic position,
 composer geometry, continuous history-window mechanics, directories, and media
 presentation.
 
@@ -25,8 +25,8 @@ The existing workspace projects have distinct roles:
   reference.  Slackit may port endpoint semantics and payload knowledge, but
   never loads its =slack-= modules or shares their global state, EIEIO models,
   LUI buffers, request worker, or symbols.
-- =disco.el= is the closest room/gateway/Appkit reference: canonical state is
-  changed before views are invalidated, and room timelines use stable server
+- =disco.el= is a room/gateway/Appkit reference: canonical state is committed
+  before explicit Surface projection requests, and timelines use stable server
   keys.
 - =emacs-qq= is the account-lifecycle reference: each stable account owns a
   separate Appkit application and state partition.
@@ -39,7 +39,7 @@ The existing workspace projects have distinct roles:
   mechanics.  Slackit does not add a second projection, composer, history, or
   lifecycle framework beside it.
 
-The compatibility floor is Emacs 29.1 with =appkit=, =browser-session=,
+The compatibility floor is Emacs 32.0 with Appkit 0.3.0, =browser-session=,
 =transient=, =plz=, and =websocket=.  Evil is an optional development/runtime
 integration discovered after load.  No =request=, =circe=/LUI, =dash=, =s=, or
 EIEIO dependency is required.
@@ -124,59 +124,72 @@ cannot replace a logged-in user's Web/Desktop realtime stream.
 
 * Ownership model
 
-** Account application
+** Canonical account App
 
-The Appkit application owns:
+Each local account starts the stable =slackit-runtime--app-type= with
+=:identity= and =:input=.  Its sole =slackit-runtime-model= aggregates the
+canonical =slackit-account-state=, credential-bearing =slackit-transport=,
+operation fences, desired realtime state, and exact App back-reference.
+Public Slackit state/transport accessors read that model; no buffer creates a
+surrogate App or a second authoritative account state.
 
-- one canonical =slackit-account-state=;
-- one =slackit-transport= with distinct account-lifecycle and realtime
-  connection generations, secret WebSocket URL, heartbeat/reconnect timers,
-  and connection status;
-- cursor-complete identity and joined-conversation bootstrap plus an on-demand
-  user cache;
-- account-wide writes, including send, edit, delete, reaction, and mark-read
-  operations, which must settle even if their originating room closes or
-  realtime reconnects;
-- the root, room, thread, and exact user-profile views for that account.
+Initial construction does not start transport.  The returned App is linked
+before explicit bootstrap/connect transitions request finite Effects or a
+Source.  Bootstrap observes identity and every conversation page, commits those
+facts, and enables the realtime Source only after authenticated identity agrees
+with the pinned credential.  Unknown senders and directory users use deduplicated
+finite user Effects.  The emoji catalog is a separate finite Effect.
 
-HTTP requests and account operations capture the account-lifecycle generation.
-WebSockets and liveness/reconnect timers capture the independent realtime
-connection generation.  Beginning a socket attempt increments only the latter;
-otherwise realtime startup/reconnect would silently retire in-flight bootstrap,
-history, and write callbacks.
+The realtime Source owns the existing WebSocket, hello timeout, heartbeat/pong
+timers, and reconnect sequence.  Its cancellation capability closes actual
+transport resources.  Source events enter App updates; transport callbacks do
+not synchronously post into an active Appkit pass.  Account-lifecycle generations
+fence HTTP/operations independently from connection-attempt generations, so a
+socket reconnect cannot retire an unrelated write or history page.
 
-Stopping an account increments both generations before calling
-=appkit-app-close=.  Appkit then cancels its WebSocket, timers, HTTP processes,
-and views.  Generation bumps cannot live only in the app-kind shutdown callback
-because Appkit invokes that callback after normal owner cleanup.  A callback
-captures the exact application object and its owning generation; matching only
-a reused local account ID is insufficient.
+Stopping revokes both generations before =appkit-app-close=.  Appkit cancels
+Sources, Effects, HTTP and Surface handles.  Shutdown clears credential
+references, operation fences, and account media specifications, and removes the
+registry entry only if it still points to that exact App.  Matching a reused
+account ID is never enough to authorize a late callback.
 
-There is no dynamically global “current Slack team” for callbacks.  Interactive
-commands may remember a default account ID for selection, but every operation
-and buffer resolves its exact owning Appkit application.
+** Generated Surfaces
 
-** Views
-
-Stable view IDs are secret-free protocol identities:
+Stable Surface types preserve each derived major mode and pair the exact App
+with a secret-free protocol identity:
 
 - root: =(root)=
 - conversation: =(room CONVERSATION-ID)=
 - thread: =(thread CONVERSATION-ID ROOT-TS)=
 - user: =(user USER-ID)=
 
-Suggested buffer names are =*Slackit:work*=,
-=*Slackit:work:#general*=, =*Slackit:work:#general:thread ROOT-TS*=, and
-=*Slackit:work:user USER-ID*=.  Names are presentation only; Appkit
-fingerprints remain authoritative if users rename buffers.
+Surface initialization captures its exact closed-command route.  Native
+Generated Renderers reconcile directory/profile content or the chat timeline;
+Surface updates apply controller consequences and return explicit
+=appkit-projection-change= requests.  Account publication sends one routed
+change batch per interested Surface, not an observer bridge or an invalidation
+registry.  Modes run before attachment, and lifecycle-owned HTTP, profile
+cleanup, and geometry setup run only after opening returns a ready Surface.
 
-Room and thread history requests are view-owned because cursors, exact windows,
-and loading state are view-local.  Their Appkit history owner and cancellable
-transport handle are retired together.  Message writes are account-owned.
-The navigation-only =conversations.open= write is owned by its exact user view;
-closing that view retires the request and prevents a delayed room jump.  UI
-settlement is applied only when its captured account/view generation and
-message/composer identity remain current.
+History cursors and exact windows belong to the room/thread Surface.  HTTP
+receives that real Surface as =:owner=.  The Appkit history operation is only a
+cancellation fence and binds the actual =slackit-http-request-handle=.  Responses
+check the captured Surface, App, model state, route identity, account generation,
+and operation before changing history.  Reads never fabricate acknowledgements.
+
+Account writes can settle after their initiating room closes.  Composer
+settlement separately checks the captured draft revision and auxiliary state.
+Navigation-only =conversations.open= is owned by its initiating profile Surface;
+retired navigation cannot create an IM or jump buffers.  Stopping a Surface
+revokes authority but preserves its buffer and editable draft.
+
+Reopening looks up only a package-owned host with matching stable account and
+Surface identity, compatible derived mode, and no live attachment.  Names alone
+never authorize buffer reuse.  The prior derived mode is invoked before the
+new attachment; structured draft properties, auxiliary context, and input
+history are restored through the chatbuf APIs.  The old Surface and its
+callback route remain revoked even when the same buffer hosts a replacement
+account App.
 
 * Canonical state
 
@@ -224,30 +237,29 @@ the exact account, conversation, message, and reaction/read identity.
 
 * Update path
 
-Every external result follows one path:
+External domain work follows an explicit ownership path:
 
 #+begin_example
-HTTP response / realtime event
-  -> normalize and validate
-  -> reduce canonical account state
-  -> produce Slackit change descriptors
-  -> enqueue descriptors on affected Appkit views
-  -> appkit-request-sync
-  -> the view sync callback adjusts view-local controllers
-  -> Appkit reconciles stable rows inside its transaction
+HTTP result / realtime Source event
+  -> normalize and validate exact owner
+  -> commit canonical account facts
+  -> closed command carrying a Surface change batch
+  -> Surface update adjusts its own controller
+  -> explicit projection request
+  -> Generated Renderer reconciles stable rows
 #+end_example
 
-Transport callbacks never edit generated buffer content, call row printers, or
-force redisplay.  Change descriptors carry only what projection needs, such as
-conversation ID, message =ts=, root =ts=, structural change kind, and resource
-keys.
+Finite acquisition Effects and live Sources return actual cancellation
+capabilities.  Their mappers receive the captured input before result payloads.
+Updates return closed commands rather than posting or sending reentrantly.
+Transport callbacks never edit generated content or call row printers.
 
-A room or thread sync drains its queued descriptors before projection.  A live
-create can seed an authoritative-empty Appkit history window; an edit
-invalidates one entry; a delete repairs an exact window edge before structural
-reconciliation.  User, conversation join/leave/rename/archive, reply metadata,
-reaction, and marked events update canonical state first and then request
-targeted root/room/thread invalidation.
+A live create can seed an authoritative-empty history window; a delete repairs
+its exact edge before reconciliation.  User, conversation, reply, reaction, and
+read changes retain stable row identity.  Presentation-only Resource completion
+uses the Resource companion and dependent row interests rather than a domain
+notification Effect.  Room and thread renderers redraw retained dependent rows
+without reprojecting protocol messages or replacing their Resource interests.
 
 * Appkit surfaces
 
@@ -337,12 +349,11 @@ The same action spans own mouse activation.  Their text-property keymaps take
 precedence over the timeline fallback and remain isolated from the writable
 composer.
 
-Both chat view kinds declare the Appkit =geometry= part and enable
-=appkit-view-enable-responsive-geometry=.  A coalesced geometry invalidation
-remeasures the canonical display window and force-redraws every visible
-timeline key, preserving position while recalculating alignment.  Rendering a
-hidden buffer may use =fill-column= temporarily, but displaying or resizing it
-must replace that fallback without application-owned window hooks.
+Both chat Surface kinds enable =appkit-surface-enable-responsive-geometry=
+after attachment.  Its owned callback updates the measured width and requests
+a geometry redraw of the exact timeline keys.  Rendering a hidden buffer can
+use =fill-column= temporarily; displaying or resizing it replaces that fallback
+through the Surface-owned geometry lifecycle.
 
 Unsupported blocks and subtypes remain visible as explicit safe rows.  Slack
 file objects project typed photo, video, audio, or document cards.  Preview
@@ -356,12 +367,23 @@ generation callbacks, and partial files are rejected; Unix cache directories
 and completed files use modes =0700= and =0600=.  Media card contexts and
 resource keys contain only opaque account-qualified hashes, never URLs or
 credentials.  Photos/GIFs open through Appkit's local image runtime.  Videos
-play from local files through Appkit's lifecycle-owned player.  Audio downloads
-before entering an Appkit-owned, Telega-style playback session whose progress,
-pause/resume restart, process, and account handle are protocol-neutral.
+play from local files through the initiating Surface's lifecycle-owned player.
+Audio downloads before a real Surface Source starts playback.  Progress and
+finalization use Source output; repeat activation uses a closed outbound toggle
+intent, and Source cancellation stops the exact player.
 Documents download before the configured local file opener.  Appkit card
 actions expose open/play, download, cancel, and save-as;
 media actions never fall back to a browser.
+
+Avatar, preview, and custom-emoji image acquisition is declarative.  The
+Generated Renderer returns deduplicated demands for the projected history
+window and the exact row interests that depend on each resource.  Loaders own
+cache discovery, private-directory preparation, transport, validation, and
+cancellation; row projection starts no acquisition.  Logical entries use
+=while-interested= retention while validated bytes remain separately cached on
+disk.  Explicit open/download/save commands start initiating-Surface acquisition
+Effects; committed successful acquisition starts local presentation, or declares
+the audio playback Source.  A retired Surface cannot present a late download.
 
 Initial room history uses =conversations.history=.  The room owns its returned
 older cursor because Appkit deliberately does not interpret protocol cursors.
@@ -519,19 +541,19 @@ controllers become a =disco-room.el=-sized unit.
 | =slackit.el= | Package entry point, registration/start/stop commands, identity/conversation bootstrap |
 | =slackit-customize.el= | User options, faces, and redacted diagnostic policy |
 | =slackit-auth.el= | Browser capture ownership, Slack mapping, private auth persistence, credential loading |
-| =slackit-runtime.el= | Account registry, Appkit apps, operation ownership, view invalidation dispatch |
+| =slackit-runtime.el= | Canonical App model, exact account retirement, closed Surface routing, Generated Renderer/Resource integration |
 | =slackit-state.el= | Canonical account store, revisions, tombstones, idempotent reducers, queries |
 | =slackit-decode.el= | Inbound JSON shape, safe file/reaction summaries, message/event decoding |
 | =slackit-http.el= | Origin-bound =plz= requests, credential routing, redaction, cancellation, read retry |
 | =slackit-api.el= | Slack endpoint parameters, cursor adaptation, typed results |
 | =slackit-realtime.el= | Web/Desktop gateway ownership, hello/readiness, heartbeat/reconnect, event dispatch |
 | =slackit-root.el= | Appkit directory projection and account root commands |
-| =slackit-room.el= | Room view assembly, invalidation sync, timeline projection |
+| =slackit-room.el= | Native room Surface assembly, controller transitions, timeline projection |
 | =slackit-history.el= | Initial/older paging and exact Appkit history-window transitions |
 | =slackit-compose.el= | Draft/aux capture, atomic file objects, Appkit upload operation, send/edit settlement |
 | =slackit-upload.el= | Exact Slack capability validation, credential-free streaming multipart upload, progress/cancel |
 | =slackit-completion.el= | Account-local user/channel candidates and structured insertion |
-| =slackit-avatar.el= | Credential-free profile image acquisition, private disk cache, resource invalidation |
+| =slackit-avatar.el= | Declarative credential-free avatar demands, cancellable acquisition, private disk cache |
 | =slackit-emoji.el= | Standard/workspace shortnames, aliases, completion, custom-image resources |
 | =slackit-media.el= | Typed preview/content projection, private/public acquisition, local open/play, transfer state |
 | =slackit-render.el= | Safe message-row rendering, Slack reference expansion, fallback rows |
@@ -665,6 +687,6 @@ Implementation should defend these observable contracts:
   unknown gap; receipts do not fabricate read/count state;
 - no write is automatically retried after timeout, rate limit, or unknown
   outcome; and
-- every external callback reduces canonical/controller state and requests
-  Appkit sync; only sync callbacks mutate generated content while preserving
-  point, window start, draft text, and undo history.
+- external domain results commit canonical/controller state and explicit
+  projection requests; only Generated Renderers mutate generated content,
+  preserving point, window start, draft text, and undo history.

@@ -12,7 +12,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'appkit-core)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'appkit-chat-history)
 (require 'appkit-chat-timeline)
 (require 'appkit-presentation)
@@ -42,7 +42,7 @@
 (defun slackit-thread-current-root-ts ()
   "Return exact root timestamp for the current thread."
   (or slackit-thread--root-ts
-      (when-let* ((view (appkit-current-view))) (nth 2 (appkit-view-id view)))
+      (when-let* ((view (appkit-current-surface))) (nth 2 (appkit-surface-identity view)))
       (user-error "slackit: thread has no root message")))
 
 (defun slackit-thread--header (state conversation-id root-ts)
@@ -127,7 +127,7 @@
             (appkit-chat-history-window-clear))))
        ((equal last ts)
         (if-let* ((previous (car (last (seq-filter
-                                       (lambda (key) (string< key ts)) keys)))))
+                                        (lambda (key) (string< key ts)) keys)))))
             (appkit-chat-history-window-set first previous)
           (appkit-chat-history-window-clear)))))))
 
@@ -138,7 +138,7 @@
 
 (defun slackit-thread--apply-event (view change)
   "Apply controller CHANGE for thread VIEW."
-  (let* ((app (appkit-view-app view))
+  (let* ((app (appkit-surface-app view))
          (state (slackit-runtime-state app))
          (conversation-id (slackit-room-current-conversation-id))
          (root-ts (slackit-thread-current-root-ts))
@@ -156,56 +156,25 @@
       ((or 'compose-success 'compose-failure)
        (slackit-compose-apply-settlement change)))))
 
-(defun slackit-thread--sync (view invalidations events)
-  "Synchronize thread VIEW from INVALIDATIONS and EVENTS."
-  (dolist (event events)
-    (slackit-thread--apply-event view event))
-  (let ((diff (slackit-room--derive-projection-diff invalidations events)))
-    (when (appkit-projection-diff-reconcile-p diff)
-      (slackit-thread--render
-       (appkit-projection-diff-force-keys diff)
-       (appkit-projection-diff-changed-dependencies diff)))))
-
-(defun slackit-thread--setup (_app conversation-id root-ts _view)
-  "Initialize one newly attached thread view."
-  (setq-local slackit-room--conversation-id conversation-id
-              slackit-thread--root-ts root-ts)
-  (slackit-history-init))
-
 (defun slackit-thread-open (app conversation-id root-ts &optional select)
-  "Open stable thread ROOT-TS in APP CONVERSATION-ID."
-  (unless (slackit-state-message
-           (slackit-runtime-state app) conversation-id root-ts)
-    (user-error "slackit: thread root no longer exists"))
-  (let* ((label (slackit-state-conversation-label
-                (slackit-runtime-state app) conversation-id))
-         (view-id (list 'thread conversation-id root-ts))
-         (existing (appkit-view-for-id app view-id))
-         (view (appkit-open-view
-                :app app
-                :id view-id
-                :mode 'slackit-thread-mode
-                :buffer-name (format "*Slackit:%s:%s:thread %s*"
-                                     (appkit-app-id app) label root-ts)
-                :state (cons conversation-id root-ts)
-                :sync-function #'slackit-thread--sync
-                :parts '(frame timeline composer geometry)
-                :setup (apply-partially
-                        #'slackit-thread--setup
-                        app conversation-id root-ts)
-                :select select)))
-    (slackit-room--configure-responsive-view
-     view #'slackit-thread--sync)
-    (with-current-buffer (appkit-view-buffer view)
-      (setq-local slackit-room--conversation-id conversation-id
-                  slackit-thread--root-ts root-ts)
+  "Open APP's exact thread Surface, retaining its editable draft."
+  (let* ((id (list 'thread conversation-id root-ts))
+         (existing (appkit-app-surface app id))
+         (surface (or existing
+                      (appkit-open-generated-surface
+                       (slackit-runtime--surface-type 'thread #'slackit-thread-mode)
+                       :app app :identity id :input id
+                       :buffer (slackit-runtime--host-buffer app id 'slackit-thread-mode)
+                       :buffer-name (format "*Slackit:%s:%s:thread %s*"
+                                            (appkit-app-identity app) conversation-id root-ts)))))
+    (slackit-runtime--remember-host surface)
+    (with-current-buffer (appkit-surface-buffer surface)
       (unless existing
-        (slackit-history-load-latest view conversation-id root-ts)
-        (appkit-invalidate view :structure t)
-        (appkit-sync-invalidations view))
-      (appkit-view-refresh-responsive-geometry))
-    view))
-
+        (appkit-surface-enable-responsive-geometry surface #'slackit-room--geometry-changed)
+        (slackit-history-load-latest surface conversation-id root-ts))
+      (slackit-runtime-render surface))
+    (when select (pop-to-buffer (appkit-surface-buffer surface)))
+    surface))
 
 (provide 'slackit-thread)
 

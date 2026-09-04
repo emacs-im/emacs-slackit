@@ -40,13 +40,13 @@
   (when (slackit-transient-scope-p scope)
     (let* ((view (slackit-transient-scope-view scope))
            (expected-id (slackit-transient-scope-view-id scope))
-           (app (and (appkit-view-p view) (appkit-view-app view))))
-      (and (appkit-view-live-p view)
-           (eq (appkit-app-kind app) 'slackit-account)
-           (equal (appkit-view-id view) expected-id)
-           (eq view (appkit-view-for-id app expected-id))
-           (with-current-buffer (appkit-view-buffer view)
-             (eq (appkit-current-view) view))))))
+           (app (and (appkit-surface-p view) (appkit-surface-app view))))
+      (and (appkit-surface-live-p view)
+           (slackit-runtime-account-p app)
+           (equal (appkit-surface-identity view) expected-id)
+           (eq view (appkit-app-surface app expected-id))
+           (with-current-buffer (appkit-surface-buffer view)
+             (eq (appkit-current-surface) view))))))
 
 (defun slackit-transient--room-view-valid-p (scope)
   "Return non-nil when SCOPE still owns its exact room or thread context."
@@ -55,13 +55,14 @@
               (view-id (slackit-transient-scope-view-id scope))
               (conversation-id
                (slackit-transient-scope-conversation-id scope))
-              (app (appkit-view-app view)))
+              (app (appkit-surface-app view)))
          (and (memq (car-safe view-id) '(room thread))
               (equal conversation-id (nth 1 view-id))
-              (with-current-buffer (appkit-view-buffer view)
+              (with-current-buffer (appkit-surface-buffer view)
                 (equal slackit-room--conversation-id conversation-id))
               (slackit-state-conversation
                (slackit-runtime-state app) conversation-id)))))
+
 (defun slackit-transient--user-view-valid-p (scope)
   "Return non-nil when SCOPE still owns its exact user profile."
   (and (slackit-transient--view-valid-p scope)
@@ -70,9 +71,8 @@
               (user-id (slackit-transient-scope-user-id scope)))
          (and (eq (car-safe view-id) 'user)
               (equal user-id (cadr view-id))
-              (with-current-buffer (appkit-view-buffer view)
+              (with-current-buffer (appkit-surface-buffer view)
                 (equal slackit-user--user-id user-id))))))
-
 
 (defun slackit-transient--conversation-valid-p (scope)
   "Return non-nil when SCOPE's exact conversation is still canonical."
@@ -82,14 +82,14 @@
                (slackit-transient-scope-conversation-id scope)))
          (and conversation-id
               (slackit-state-conversation
-               (slackit-runtime-state (appkit-view-app view))
+               (slackit-runtime-state (appkit-surface-app view))
                conversation-id)))))
 
 (defun slackit-transient--message (scope)
   "Return SCOPE's current canonical message, or nil."
   (when (slackit-transient--room-view-valid-p scope)
     (let* ((view (slackit-transient-scope-view scope))
-           (app (appkit-view-app view))
+           (app (appkit-surface-app view))
            (conversation-id
             (slackit-transient-scope-conversation-id scope))
            (ts (slackit-transient-scope-message-ts scope)))
@@ -100,7 +100,7 @@
 (defun slackit-transient--message-owned-p (scope)
   "Return non-nil when SCOPE's message belongs to the exact account self."
   (when-let* ((message (slackit-transient--message scope)))
-    (let* ((app (appkit-view-app (slackit-transient-scope-view scope)))
+    (let* ((app (appkit-surface-app (slackit-transient-scope-view scope)))
            (state (slackit-runtime-state app))
            (self-id (slackit-state-self-id state))
            (author-id (alist-get 'user message)))
@@ -110,13 +110,13 @@
 
 (defun slackit-transient--capture-view (kinds)
   "Capture the exact current Slackit view whose ID kind belongs to KINDS."
-  (let* ((view (appkit-current-view))
-         (view-id (and (appkit-view-p view) (appkit-view-id view)))
-         (app (and (appkit-view-p view) (appkit-view-app view))))
-    (unless (and (appkit-view-live-p view)
-                 (eq (appkit-app-kind app) 'slackit-account)
+  (let* ((view (appkit-current-surface))
+         (view-id (and (appkit-surface-p view) (appkit-surface-identity view)))
+         (app (and (appkit-surface-p view) (appkit-surface-app view))))
+    (unless (and (appkit-surface-live-p view)
+                 (slackit-runtime-account-p app)
                  (memq (car-safe view-id) kinds)
-                 (eq view (appkit-view-for-id app view-id)))
+                 (eq view (appkit-app-surface app view-id)))
       (user-error "slackit: this command requires a live Slackit %s view"
                   (mapconcat #'symbol-name kinds " or ")))
     view))
@@ -130,13 +130,14 @@
                        (appkit-directory-entry-payload entry))))
     (slackit-transient--scope-create
      :view view
-     :view-id (copy-tree (appkit-view-id view))
+     :view-id (copy-tree (appkit-surface-identity view))
      :conversation-id (and payload (copy-tree payload))
      :entry-payload (and payload (copy-tree payload)))))
+
 (defun slackit-transient--capture-user-scope ()
   "Capture the exact current Slackit user profile."
   (let* ((view (slackit-transient--capture-view '(user)))
-         (view-id (appkit-view-id view))
+         (view-id (appkit-surface-identity view))
          (user-id (cadr view-id))
          (scope
           (slackit-transient--scope-create
@@ -147,14 +148,13 @@
       (user-error "slackit: the user target is no longer canonical"))
     scope))
 
-
 (defun slackit-transient--capture-room-scope (&optional require-message)
   "Capture the current room view and exact row.
 
 When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (let* ((view (slackit-transient--capture-view '(room thread)))
-         (view-id (appkit-view-id view))
-         (app (appkit-view-app view))
+         (view-id (appkit-surface-identity view))
+         (app (appkit-surface-app view))
          (conversation-id (nth 1 view-id))
          (ts (slackit-room-message-ts-at-point))
          (scope
@@ -219,6 +219,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (let ((scope (slackit-transient--prefix-scope 'slackit-actions-transient)))
     (slackit-transient--require-message scope)
     scope))
+
 (defun slackit-transient--user-scope ()
   "Return and revalidate the active user menu scope."
   (let ((scope (slackit-transient--prefix-scope 'slackit-user-transient)))
@@ -226,11 +227,10 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
       (user-error "slackit: the user view that opened this menu is stale"))
     scope))
 
-
 (defun slackit-transient--call-in-view (scope function)
   "Call zero-argument FUNCTION in SCOPE's exact registered view."
   (let ((view (slackit-transient--require-view scope)))
-    (with-current-buffer (appkit-view-buffer view)
+    (with-current-buffer (appkit-surface-buffer view)
       ;; Revalidate after changing buffers so no repurposed buffer can run it.
       (slackit-transient--require-view scope)
       (funcall function))))
@@ -272,7 +272,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (let ((scope (slackit-transient--prefix-scope 'slackit-room-transient)))
     (or (not (slackit-transient--room-view-valid-p scope))
         (with-current-buffer
-            (appkit-view-buffer (slackit-transient-scope-view scope))
+            (appkit-surface-buffer (slackit-transient-scope-view scope))
           (and (not (slackit-compose-upload-active-p))
                (not (appkit-chatbuf-aux-active-p)))))))
 
@@ -291,7 +291,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (let ((scope (slackit-transient--prefix-scope 'slackit-actions-transient)))
     (or (not (slackit-transient--message-owned-p scope))
         (with-current-buffer
-            (appkit-view-buffer (slackit-transient-scope-view scope))
+            (appkit-surface-buffer (slackit-transient-scope-view scope))
           (not (appkit-chatbuf-composer-idle-p))))))
 
 (defun slackit-transient--actions-media-inapt-p (action)
@@ -332,7 +332,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
                     (slackit-transient-scope-view scope))))
     (not (and view
               (window-live-p
-               (get-buffer-window (appkit-view-buffer view) t))))))
+               (get-buffer-window (appkit-surface-buffer view) t))))))
 
 (defun slackit-transient--root-quit-inapt-p ()
   "Return non-nil when the root source window cannot be quit."
@@ -341,6 +341,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
 (defun slackit-transient--room-quit-inapt-p ()
   "Return non-nil when the room source window cannot be quit."
   (slackit-transient--quit-inapt-p 'slackit-room-transient))
+
 (defun slackit-transient--user-view-inapt-p ()
   "Return non-nil when the user prefix has lost its exact view."
   (not (slackit-transient--user-view-valid-p
@@ -350,14 +351,13 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   "Return non-nil when the user source window cannot be quit."
   (slackit-transient--quit-inapt-p 'slackit-user-transient))
 
-
 (defun slackit-transient--root-description ()
   "Return the exact root menu title."
   (let* ((scope (slackit-transient--prefix-scope 'slackit-root-transient))
          (view (and (slackit-transient--view-valid-p scope)
                     (slackit-transient-scope-view scope))))
     (if view
-        (format "Slackit · %s" (appkit-app-id (appkit-view-app view)))
+        (format "Slackit · %s" (appkit-app-identity (appkit-surface-app view)))
       "Slackit root · stale context")))
 
 (defun slackit-transient--room-description ()
@@ -367,7 +367,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
                     (slackit-transient-scope-view scope))))
     (if (not view)
         "Slackit room · stale context"
-      (let* ((app (appkit-view-app view))
+      (let* ((app (appkit-surface-app view))
              (view-id (slackit-transient-scope-view-id scope))
              (conversation-id
               (slackit-transient-scope-conversation-id scope))
@@ -386,10 +386,11 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
                 (slackit-transient-scope-message-ts scope)
                 (slackit-state-conversation-label
                  (slackit-runtime-state
-                  (appkit-view-app
+                  (appkit-surface-app
                    (slackit-transient-scope-view scope)))
                  (slackit-transient-scope-conversation-id scope)))
       "Slackit message · stale context")))
+
 (defun slackit-transient--user-description ()
   "Return the exact user-profile menu title."
   (let* ((scope
@@ -399,16 +400,15 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     (if (not view)
         "Slackit user · stale context"
       (let* ((user-id (slackit-transient-scope-user-id scope))
-             (state (slackit-runtime-state (appkit-view-app view))))
+             (state (slackit-runtime-state (appkit-surface-app view))))
         (format "%s · %s"
                 (slackit-state-user-name state user-id)
                 user-id)))))
 
-
 (defun slackit-transient--quit-view (scope)
   "Quit the window displaying SCOPE's exact view."
   (let* ((view (slackit-transient--require-view scope))
-         (window (get-buffer-window (appkit-view-buffer view) t)))
+         (window (get-buffer-window (appkit-surface-buffer view) t)))
     (unless (window-live-p window)
       (user-error "slackit: the menu's source view is no longer displayed"))
     (quit-window nil window)))
@@ -418,7 +418,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   :inapt-if #'slackit-transient--root-entry-inapt-p
   (interactive (list (slackit-transient--root-scope)))
   (let* ((view (slackit-transient--require-view scope))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (conversation-id (slackit-transient--require-conversation scope)))
     (unless (equal conversation-id
                    (slackit-transient-scope-entry-payload scope))
@@ -435,7 +435,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   "Stop the exact app generation captured by the root menu."
   :inapt-if #'slackit-transient--root-view-inapt-p
   (interactive (list (slackit-transient--root-scope)))
-  (let ((app (appkit-view-app (slackit-transient--require-view scope))))
+  (let ((app (appkit-surface-app (slackit-transient--require-view scope))))
     (unless (slackit-runtime-stop-account app)
       (user-error "slackit: the captured account is no longer running"))))
 
@@ -477,7 +477,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (slackit-transient--require-message scope)
   (let* ((view (slackit-transient--require-room scope))
          (view-id (slackit-transient-scope-view-id scope))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (conversation-id
           (slackit-transient-scope-conversation-id scope))
          (ts (slackit-transient-scope-message-ts scope)))
@@ -530,7 +530,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (interactive (list (slackit-transient--actions-scope)))
   (let* ((message (slackit-transient--require-message scope))
          (view (slackit-transient--require-room scope))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (conversation-id
           (slackit-transient-scope-conversation-id scope))
          (ts (slackit-transient-scope-message-ts scope))
@@ -550,10 +550,10 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (interactive (list (slackit-transient--actions-scope)))
   (let* ((message (slackit-transient--require-owned-message scope))
          (view (slackit-transient--require-room scope))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (state (slackit-runtime-state app))
          (ts (slackit-transient-scope-message-ts scope)))
-    (with-current-buffer (appkit-view-buffer view)
+    (with-current-buffer (appkit-surface-buffer view)
       (slackit-transient--require-room scope)
       (unless (appkit-chatbuf-composer-idle-p)
         (user-error "slackit: finish or clear the current composer first"))
@@ -576,12 +576,12 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
     ;; Input can run arbitrary command-loop hooks.  Revalidate after it.
     (slackit-transient--require-owned-message scope)
     (let* ((view (slackit-transient--require-room scope))
-           (app (appkit-view-app view))
+           (app (appkit-surface-app view))
            (conversation-id
             (slackit-transient-scope-conversation-id scope))
            (ts (slackit-transient-scope-message-ts scope))
            (key (list 'delete conversation-id ts))
-           (existing (gethash key (appkit-app-request-table app))))
+           (existing (gethash key (slackit-runtime-operations app))))
       (when (slackit-runtime-operation-current-p app existing)
         (user-error "slackit: delete is already in flight"))
       (let ((operation (slackit-runtime-operation-begin app key)))
@@ -610,7 +610,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   ;; Revalidate after prompting so a replacement app cannot inherit the write.
   (slackit-transient--require-message scope)
   (let* ((view (slackit-transient--require-room scope))
-         (app (appkit-view-app view)))
+         (app (appkit-surface-app view)))
     (slackit-reaction-toggle
      app
      (slackit-transient-scope-conversation-id scope)
@@ -624,7 +624,7 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   (slackit-transient--require-message scope)
   (let* ((view (slackit-transient--require-room scope))
          (view-id (slackit-transient-scope-view-id scope))
-         (app (appkit-view-app view))
+         (app (appkit-surface-app view))
          (ts (slackit-transient-scope-message-ts scope)))
     (unless (eq (car-safe view-id) 'room)
       (user-error "slackit: read marking is unavailable in thread views"))
@@ -707,7 +707,6 @@ When REQUIRE-MESSAGE is non-nil, reject a missing or stale message row."
   :inapt-if #'slackit-transient--user-quit-inapt-p
   (interactive (list (slackit-transient--user-scope)))
   (slackit-transient--quit-view scope))
-
 
 ;;;###autoload(autoload 'slackit-root-transient "slackit-transient" nil t)
 (transient-define-prefix slackit-root-transient (scope)

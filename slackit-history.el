@@ -12,7 +12,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'appkit-core)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'appkit-chat-history)
 (require 'slackit-api)
 (require 'slackit-runtime)
@@ -69,10 +69,13 @@
   "Load one history page for VIEW and CONVERSATION-ID.
 
 ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
-  (when (appkit-view-live-p view)
-    (appkit-with-live-view view
-      (let* ((app (appkit-view-app view))
+  (when (appkit-surface-live-p view)
+    (with-current-buffer (appkit-surface-buffer view)
+      (let* ((app (appkit-surface-app view))
+             (model (appkit-app-model app))
              (state (slackit-runtime-state app))
+             (generation (slackit-runtime-generation app))
+             (identity (copy-tree (appkit-surface-identity view)))
              (captured-revision (slackit-account-state-revision state))
              (captured-key-set
               (slackit-history--key-set
@@ -84,84 +87,97 @@ ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
              (cursor (and (not latest-p) slackit-history--cursor))
              (success
               (lambda (body)
-                (appkit-with-live-view view
-                  (when (appkit-chat-history-request-end request-owner)
-                    (let* ((messages
-                            (slackit-history--ordered-messages body))
-                           (response-keys
-                            (delq nil
-                                  (mapcar
-                                   (lambda (message)
-                                     (alist-get 'ts message))
-                                   messages)))
-                           (next-cursor
-                            (slackit-history--next-cursor body))
-                           (old-first
-                            (appkit-chat-history-window-first-key))
-                           (old-last
-                            (appkit-chat-history-window-last-key))
-                           (changes
-                            (slackit-state-merge-message-page
-                             state conversation-id messages
-                             captured-revision))
-                           (relevant-keys
-                            (slackit-history--relevant-keys
-                             state conversation-id root-ts))
-                           (retained-keys
-                            (slackit-history--retained-keys
-                             response-keys relevant-keys))
-                           (post-dispatch-create-p
-                            (seq-some
-                             (lambda (key)
-                               (not (gethash key captured-key-set)))
-                             relevant-keys)))
-                      (slackit-runtime-publish-changes app changes)
-                      (setq slackit-history--cursor next-cursor
-                            slackit-history--error nil)
-                      (cond
-                       ((and latest-p (null response-keys))
-                        (unless post-dispatch-create-p
-                          (appkit-chat-history-window-establish-empty)))
-                       ((and root-ts latest-p retained-keys)
-                        (appkit-chat-history-window-set
-                         (car retained-keys)
-                         (and next-cursor (car (last retained-keys)))))
-                       ((and root-ts retained-keys)
-                        (appkit-chat-history-window-set
-                         (or old-first (car retained-keys))
-                         (and next-cursor (car (last retained-keys)))))
-                       ((and latest-p retained-keys)
-                        (appkit-chat-history-window-set
-                         (car retained-keys) nil))
-                       ((and retained-keys
-                             (or (null old-last)
-                                 (member old-last relevant-keys)))
-                        (appkit-chat-history-window-set
-                         (car retained-keys) old-last)))
-                      (appkit-chat-history-older-loaded-set
-                       (null slackit-history--cursor))
-                      (appkit-request-sync
-                       view :structure t :position t))))))
+                (when (appkit-surface-live-p view) (with-current-buffer (appkit-surface-buffer view)
+                                                     (when (and (slackit-runtime-current-p app generation)
+                                                                (eq app (appkit-surface-app view))
+                                                                (eq model (appkit-app-model app))
+                                                                (eq state (slackit-runtime-state app))
+                                                                (equal identity (appkit-surface-identity view))
+                                                                (appkit-chat-history-request-end request-owner))
+                                                       (let* ((messages
+                                                               (slackit-history--ordered-messages body))
+                                                              (response-keys
+                                                               (delq nil
+                                                                     (mapcar
+                                                                      (lambda (message)
+                                                                        (alist-get 'ts message))
+                                                                      messages)))
+                                                              (next-cursor
+                                                               (slackit-history--next-cursor body))
+                                                              (old-first
+                                                               (appkit-chat-history-window-first-key))
+                                                              (old-last
+                                                               (appkit-chat-history-window-last-key))
+                                                              (changes
+                                                               (slackit-state-merge-message-page
+                                                                state conversation-id messages
+                                                                captured-revision))
+                                                              (relevant-keys
+                                                               (slackit-history--relevant-keys
+                                                                state conversation-id root-ts))
+                                                              (retained-keys
+                                                               (slackit-history--retained-keys
+                                                                response-keys relevant-keys))
+                                                              (post-dispatch-create-p
+                                                               (seq-some
+                                                                (lambda (key)
+                                                                  (not (gethash key captured-key-set)))
+                                                                relevant-keys)))
+                                                         (slackit-runtime-publish-changes app changes)
+                                                         (setq slackit-history--cursor next-cursor
+                                                               slackit-history--error nil)
+                                                         (cond
+                                                          ((and latest-p (null response-keys))
+                                                           (unless post-dispatch-create-p
+                                                             (appkit-chat-history-window-establish-empty)))
+                                                          ((and root-ts latest-p retained-keys)
+                                                           (appkit-chat-history-window-set
+                                                            (car retained-keys)
+                                                            (and next-cursor (car (last retained-keys)))))
+                                                          ((and root-ts retained-keys)
+                                                           (appkit-chat-history-window-set
+                                                            (or old-first (car retained-keys))
+                                                            (and next-cursor (car (last retained-keys)))))
+                                                          ((and latest-p retained-keys)
+                                                           (appkit-chat-history-window-set
+                                                            (car retained-keys) nil))
+                                                          ((and retained-keys
+                                                                (or (null old-last)
+                                                                    (member old-last relevant-keys)))
+                                                           (appkit-chat-history-window-set
+                                                            (car retained-keys) old-last)))
+                                                         (appkit-chat-history-older-loaded-set
+                                                          (null slackit-history--cursor))
+                                                         (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))))))
              (failure
               (lambda (error-data)
-                (appkit-with-live-view view
-                  (when (appkit-chat-history-request-end request-owner)
-                    (setq slackit-history--error
-                          (or (plist-get error-data :code) "request_failed"))
-                    (appkit-request-sync view :part 'frame))))))
-        (if root-ts
-            (slackit-api-conversation-replies
-             app conversation-id root-ts
-             :cursor cursor
-             :owner request-owner
-             :on-success success
-             :on-error failure)
-          (slackit-api-conversation-history
-           app conversation-id
-           :cursor cursor
-           :owner request-owner
-           :on-success success
-           :on-error failure))))))
+                (when (appkit-surface-live-p view) (with-current-buffer (appkit-surface-buffer view)
+                                                     (when (and (slackit-runtime-current-p app generation)
+                                                                (eq app (appkit-surface-app view))
+                                                                (eq model (appkit-app-model app))
+                                                                (eq state (slackit-runtime-state app))
+                                                                (equal identity (appkit-surface-identity view))
+                                                                (appkit-chat-history-request-end request-owner))
+                                                       (setq slackit-history--error
+                                                             (or (plist-get error-data :code) "request_failed"))
+                                                       (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))))))
+        (let ((request (if root-ts
+                           (slackit-api-conversation-replies
+                            app conversation-id root-ts
+                            :cursor cursor
+                            :owner view
+                            :on-success success
+                            :on-error failure)
+                         (slackit-api-conversation-history
+                          app conversation-id
+                          :cursor cursor
+                          :owner view
+                          :on-success success
+                          :on-error failure))))
+          (when (slackit-http-request-p request)
+            (appkit-chat-history-request-bind-handle
+             request-owner (slackit-http-request-handle request)))
+          request)))))
 
 (defun slackit-history-load-latest (view conversation-id &optional root-ts)
   "Load latest exact history for VIEW and CONVERSATION-ID."
@@ -169,11 +185,11 @@ ROOT-TS selects replies.  LATEST-P non-nil establishes a new window."
 
 (defun slackit-history-load-older (view conversation-id &optional root-ts)
   "Load the next room-history or thread-replies page for VIEW."
-  (appkit-with-live-view view
-    (unless (or (appkit-chat-history-loading-p)
-                (appkit-chat-history-older-loaded-p)
-                (not (appkit-chat-history-window-known-p)))
-      (slackit-history--request view conversation-id root-ts nil))))
+  (when (appkit-surface-live-p view) (with-current-buffer (appkit-surface-buffer view)
+                                       (unless (or (appkit-chat-history-loading-p)
+                                                   (appkit-chat-history-older-loaded-p)
+                                                   (not (appkit-chat-history-window-known-p)))
+                                         (slackit-history--request view conversation-id root-ts nil)))))
 
 (defun slackit-history-slice-messages (messages)
   "Return exact visible slice of ordered MESSAGES, or nil when unknown."

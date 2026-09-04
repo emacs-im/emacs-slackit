@@ -52,26 +52,46 @@
 
 (cl-defun slackit-api--paginate
     (app endpoint item-key &key parameters owner on-page on-complete on-error)
-  "Consume every cursor of read ENDPOINT ITEM-KEY for APP."
-  (cl-labels
-      ((request-page (cursor)
-         (slackit-api-request
-          app endpoint
-          :method 'get
-          :parameters (append parameters
-                              (and cursor `((cursor . ,cursor))))
-          :idempotent-p t
-          :owner (or owner app)
-          :on-success
-          (lambda (body)
-            (let ((items (or (alist-get item-key body) nil))
-                  (next (slackit-api--next-cursor body)))
-              (when on-page (funcall on-page items))
-              (if next
-                  (request-page next)
-                (when on-complete (funcall on-complete)))))
-          :on-error on-error)))
-    (request-page nil)))
+  "Consume every cursor under a real cancellable owner handle."
+  (let ((active t) current handle)
+    (setq handle
+          (appkit-register-handle
+           (or owner app) 'slackit-pagination nil
+           (lambda (_)
+             (setq active nil)
+             (when (slackit-http-request-p current) (slackit-http-cancel current)))))
+    (cl-labels
+        ((finish (callback &rest payload)
+           (when active
+             (setq active nil)
+             (appkit-retire-handle handle)
+             (when callback (apply callback payload))))
+         (request-page (cursor)
+           (when active
+             (let ((request
+                     (slackit-api-request
+                      app endpoint :method 'get
+                      :parameters (append parameters (and cursor (list (cons 'cursor cursor))))
+                      :idempotent-p t :owner (or owner app)
+                      :on-success
+                      (lambda (body)
+                        (when active
+                          (let ((items (or (alist-get item-key body) nil))
+                                (next (slackit-api--next-cursor body)))
+                            (when on-page (funcall on-page items))
+                            (when active
+                              (if next (request-page next)
+                                (finish on-complete))))))
+                      :on-error (lambda (reason) (finish on-error reason)))))
+               (when (and (slackit-http-request-p request)
+                          (slackit-http-request-active-p request))
+                 (setq current request))))))
+      (condition-case error-data
+          (request-page nil)
+        (error
+         (appkit-cancel-handle handle)
+         (signal (car error-data) (cdr error-data)))))
+    handle))
 
 (cl-defun slackit-api-auth-test (app &key on-success on-error)
   "Fetch stable team/self identity for APP."
@@ -89,7 +109,6 @@
    :on-success on-success
    :on-error on-error))
 
-
 (cl-defun slackit-api-user-info
     (app user-id &key owner on-success on-error)
   "Fetch exact Slack USER-ID for APP under optional lifecycle OWNER."
@@ -101,6 +120,7 @@
    :owner owner
    :on-success on-success
    :on-error on-error))
+
 (cl-defun slackit-api-conversations-open
     (app user-id &key owner on-success on-error)
   "Open or resume APP's direct-message conversation with USER-ID.
@@ -113,7 +133,6 @@ OWNER, when non-nil, owns cancellation of this non-retried write."
    :owner owner
    :on-success on-success
    :on-error on-error))
-
 
 (cl-defun slackit-api-conversations-list-all
     (app &key on-page on-complete on-error)

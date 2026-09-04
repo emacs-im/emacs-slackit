@@ -60,7 +60,7 @@
 (defun slackit-reaction-toggle (app conversation-id ts name)
   "Toggle reaction NAME on message TS using serialized latest intent."
   (let* ((key (list 'reaction conversation-id ts name))
-         (existing (gethash key (appkit-app-request-table app))))
+         (existing (gethash key (slackit-runtime-operations app))))
     (if (slackit-runtime-operation-current-p app existing)
         (let* ((payload (slackit-operation-payload existing))
                (desired (plist-get payload :desired-add-p)))

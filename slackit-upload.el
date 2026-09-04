@@ -95,7 +95,7 @@
         (slackit-upload-transfer-app transfer)
         (slackit-upload-transfer-generation transfer))
        (let ((owner (slackit-upload-transfer-owner transfer)))
-         (or (appkit-app-live-p owner) (appkit-view-live-p owner)))
+         (or (appkit-app-live-p owner) (appkit-surface-live-p owner)))
        (let ((handle (slackit-upload-transfer-handle transfer)))
          (or (null handle)
              (and (appkit-handle-p handle)

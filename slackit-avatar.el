@@ -26,7 +26,56 @@
   resource-key
   cache-base
   transfer
-  handle)
+  handle
+  resolve
+  reject)
+
+(defun slackit-avatar-demand (app user)
+  "Describe APP USER's private avatar acquisition without I/O."
+  (when-let* ((key (slackit-avatar-resource-key app user)))
+    (appkit-resource-demand-create
+     :key key :input (list app (slackit-runtime-generation app)
+                           (list (cons 'id (alist-get 'id user))
+                                 (cons 'profile (list (cons 'image_512 (slackit-avatar--profile-url user)))))
+                           key)
+     :loader #'slackit-avatar--load :acquisition-identity key
+     :sharing-policy 'app-private :cache-policy 'while-interested)))
+
+(defun slackit-avatar--load (_context input resolve reject)
+  "Acquire one declared avatar INPUT, returning its real cancel handle."
+  (pcase-let ((`(,app ,generation ,user ,key) input))
+    (unless (slackit-runtime-current-p app generation)
+      (error "slackit: retired avatar account"))
+    (slackit-avatar--prepare-cache-directory)
+    (let* ((file (appkit-media-image-cache-existing-file
+                  (slackit-avatar--cache-base key)))
+           (source (and file (slackit-avatar--remember-source key file))))
+      (cond
+       (source
+        (unless (memq system-type '(ms-dos windows-nt cygwin))
+          (set-file-modes file #o600))
+        (slackit-avatar--delete-stale-cache-files key file)
+        (funcall resolve source)
+        nil)
+       ((gethash key slackit-avatar--fetches)
+        (let* ((fetch (gethash key slackit-avatar--fetches))
+               (old-resolve (slackit-avatar-fetch-resolve fetch))
+               (old-reject (slackit-avatar-fetch-reject fetch)))
+          (setf (slackit-avatar-fetch-resolve fetch)
+                (lambda (value) (when old-resolve (funcall old-resolve value)) (funcall resolve value))
+                (slackit-avatar-fetch-reject fetch)
+                (lambda (reason) (when old-reject (funcall old-reject reason)) (funcall reject reason)))
+          (appkit-cancellation-create
+           :kind 'transport
+           :cancel (lambda () (appkit-cancel-handle (slackit-avatar-fetch-handle fetch))))))
+       ((not (slackit-avatar--retry-due-p key))
+        (funcall reject 'backoff) nil)
+       (t
+        (let ((fetch (slackit-avatar--ensure-fetch app user key resolve reject)))
+          (when fetch
+            (appkit-cancellation-create
+             :kind 'transport
+             :cancel (lambda () (appkit-cancel-handle (slackit-avatar-fetch-handle fetch)))))))))))
 
 (defvar slackit-avatar--image-cache (make-hash-table :test #'equal)
   "Decoded images keyed by resource identity, pixel size, and source mtime.")
@@ -75,7 +124,7 @@
                (not (string-empty-p user-id))
                (slackit-avatar--valid-url-p url))
       (list :avatar
-            (format "%s" (appkit-app-id app))
+            (format "%s" (appkit-app-identity app))
             user-id
             (secure-hash 'sha256 url)))))
 
@@ -181,29 +230,33 @@ Changing either invalidates every decoded size derived from the old source."
         (appkit-retire-handle handle)))))
 
 (defun slackit-avatar--fetch-success (owner file)
-  "Settle avatar fetch OWNER with private cache FILE."
+  "Settle avatar OWNER's Resource after private-cache validation."
   (let* ((current-p (slackit-avatar--owner-current-p owner))
-         (app (slackit-avatar-fetch-app owner))
-         (resource-key (slackit-avatar-fetch-resource-key owner))
-         source)
+         (key (slackit-avatar-fetch-resource-key owner))
+         (resolve (slackit-avatar-fetch-resolve owner))
+         (reject (slackit-avatar-fetch-reject owner)) source)
     (when (and (file-regular-p file)
                (not (memq system-type '(ms-dos windows-nt cygwin))))
       (set-file-modes file #o600))
     (when current-p
-      (slackit-avatar--delete-stale-cache-files resource-key file)
-      (setq source (slackit-avatar--remember-source resource-key file))
-      (remhash resource-key slackit-avatar--failures))
+      (slackit-avatar--delete-stale-cache-files key file)
+      (setq source (slackit-avatar--remember-source key file))
+      (remhash key slackit-avatar--failures))
     (slackit-avatar--retire-fetch owner)
-    (when (and current-p source)
-      (slackit-runtime-publish-resource app resource-key))))
+    (when current-p
+      (if source
+          (when resolve (funcall resolve source))
+        (when reject (funcall reject 'invalid-image))))))
 
 (defun slackit-avatar--fetch-failure (owner _error)
-  "Settle failed avatar fetch OWNER without exposing remote details."
-  (when (slackit-avatar--owner-current-p owner)
-    (puthash (slackit-avatar-fetch-resource-key owner)
-             (float-time)
-             slackit-avatar--failures))
-  (slackit-avatar--retire-fetch owner))
+  "Settle failed Resource OWNER without exposing remote details."
+  (let ((current (slackit-avatar--owner-current-p owner))
+        (reject (slackit-avatar-fetch-reject owner)))
+    (when current
+      (puthash (slackit-avatar-fetch-resource-key owner)
+               (float-time) slackit-avatar--failures))
+    (slackit-avatar--retire-fetch owner)
+    (when (and current reject) (funcall reject 'request-failed))))
 
 (defun slackit-avatar--retry-due-p (resource-key)
   "Return non-nil when RESOURCE-KEY has no active failure backoff."
@@ -212,7 +265,7 @@ Changing either invalidates every decoded size derived from the old source."
         (>= (- (float-time) failed-at)
             (max 0 slackit-avatar-retry-delay)))))
 
-(defun slackit-avatar--ensure-fetch (app user resource-key)
+(defun slackit-avatar--ensure-fetch (app user resource-key &optional resolve reject)
   "Start one deduplicated profile image fetch for APP USER RESOURCE-KEY."
   (unless (or (gethash resource-key slackit-avatar--fetches)
               (not (slackit-avatar--retry-due-p resource-key)))
@@ -222,7 +275,7 @@ Changing either invalidates every decoded size derived from the old source."
                    :app app
                    :generation (slackit-runtime-generation app)
                    :resource-key resource-key
-                   :cache-base cache-base))
+                   :cache-base cache-base :resolve resolve :reject reject))
            (handle (appkit-register-handle
                     app 'slackit-avatar owner
                     #'slackit-avatar--cancel-fetch)))
@@ -273,20 +326,28 @@ an existing private disk entry or start its account-owned acquisition."
           (when-let* ((image (slackit-avatar--source-image file size)))
             (puthash cache-key image slackit-avatar--image-cache)
             image)))))
+
 (defun slackit-avatar-cached-file (app user)
-  "Return APP USER's validated local avatar file, or nil."
-  (when-let* ((resource-key (slackit-avatar-resource-key app user))
-              (source (gethash resource-key slackit-avatar--sources))
-              (file (car source))
-              ((file-regular-p file)))
-    file))
+  "Return APP USER's acquired local avatar path without filesystem discovery."
+  (when-let* ((key (slackit-avatar-resource-key app user)))
+    (car (gethash key slackit-avatar--sources))))
 
 (defun slackit-avatar-open (app user)
-  "Open APP USER's cached avatar locally through Appkit."
-  (let ((file (slackit-avatar-cached-file app user)))
-    (unless file
-      (user-error "slackit: avatar is not available locally"))
-    (appkit-media-open-file file)))
+  "Validate the cached avatar under its initiating Surface before presentation."
+  (require 'slackit-media)
+  (let ((surface (appkit-current-surface))
+        (file (slackit-avatar-cached-file app user)))
+    (unless (and (appkit-surface-live-p surface)
+                 (eq app (appkit-surface-app surface)) file)
+      (user-error "slackit: avatar is not available in this live Surface"))
+    (appkit-surface-send
+     surface
+     (list 'slackit-media 'acquire
+           (list :surface surface :app app :model (appkit-app-model app) :generation (slackit-runtime-generation app)
+                 :identity (copy-tree (appkit-surface-identity surface))
+                 :key (slackit-avatar-resource-key app user) :local-file file :action 'open
+                 :spec (slackit-media-open-spec-create
+                        :app app :generation (slackit-runtime-generation app) :kind 'photo))))))
 
 (defun slackit-avatar-ensure (app user)
   "Ensure APP USER's avatar source is ready or being acquired.

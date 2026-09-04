@@ -9,14 +9,19 @@
 
 ;;; Code:
 
+(require 'appkit-app)
+(require 'appkit-surface)
+(require 'appkit-projection)
+(require 'appkit-command)
+(require 'appkit-source)
 (require 'cl-lib)
 (require 'subr-x)
 (require 'appkit-core)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'slackit-state)
 
-(declare-function slackit-api-user-info "slackit-api"
-                  (app user-id &rest arguments))
+(cl-defstruct (slackit-runtime-model (:constructor slackit-runtime-model-create))
+  state transport operations realtime-p app user-queue user-active)
 
 (cl-defstruct (slackit-credential
                (:constructor slackit-credential-create))
@@ -40,16 +45,445 @@
   reconnect-attempt
   next-message-id
   ready-p
-  stopping-p)
+  stopping-p
+  source-emit)
 
 (cl-defstruct (slackit-operation
                (:constructor slackit-operation-create))
   key
   nonce
   generation
+  model
   view
   composer-revision
   payload)
+
+(defun slackit-runtime-media-error-text ()
+  "Return the current Surface's safe committed media error, if any."
+  (when-let* ((surface (appkit-current-surface))
+              ((appkit-surface-live-p surface))
+              (error (plist-get (plist-get (appkit-surface-model surface) :media) :error)))
+    (format "Media error: %s" error)))
+
+(put 'slackit-runtime--host-key 'permanent-local t)
+(put 'slackit-runtime--host-app 'permanent-local t)
+
+(defvar slackit-runtime--hosts (make-hash-table :test #'equal)
+  "Owned presentation hosts keyed by stable account and Surface identity.")
+
+(defvar-local slackit-runtime--host-key nil)
+(defvar-local slackit-runtime--host-app nil)
+
+(defun slackit-runtime--host-buffer (app identity mode)
+  "Return only an exact stopped presentation host for APP and IDENTITY."
+  (let* ((key (list (appkit-app-identity app) identity))
+         (buffer (gethash key slackit-runtime--hosts)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (and (equal key slackit-runtime--host-key)
+                   (derived-mode-p mode)
+                   (null (appkit-current-surface))
+                   (or (eq app slackit-runtime--host-app)
+                       (not (appkit-app-live-p slackit-runtime--host-app))))
+          buffer)))))
+
+(defun slackit-runtime--remember-host (surface)
+  "Remember SURFACE's exact host without retaining live callback authority."
+  (let* ((app (appkit-surface-app surface))
+         (key (list (appkit-app-identity app) (copy-tree (appkit-surface-identity surface))))
+         (buffer (appkit-surface-buffer surface)))
+    (with-current-buffer buffer
+      (setq-local slackit-runtime--host-key key slackit-runtime--host-app app)
+      (puthash key buffer slackit-runtime--hosts)
+      (add-hook 'kill-buffer-hook
+                (lambda ()
+                  (when (eq buffer (gethash key slackit-runtime--hosts))
+                    (remhash key slackit-runtime--hosts))) nil t))))
+
+(defun slackit-runtime--initialize-mode (mode)
+  "Invoke MODE or the owned derived mode, restoring its structured draft."
+  (let* ((owned (and slackit-runtime--host-key (derived-mode-p mode)))
+         (actual-mode (if owned major-mode mode))
+         (chat (and owned (derived-mode-p 'appkit-chatbuf-mode)))
+         (input (and chat (appkit-chatbuf-input-state)))
+         (aux (and chat (copy-tree (appkit-chatbuf-aux-state))))
+         (history (and chat (appkit-chatbuf-input-history-elements))))
+    (funcall actual-mode)
+    (when owned
+      (let ((inhibit-read-only t) (buffer-undo-list t)) (erase-buffer)))
+    (when chat
+      (appkit-chatbuf-input-state-set input)
+      (appkit-chatbuf-aux-set aux)
+      (dolist (entry (reverse history)) (appkit-chatbuf-input-history-push entry)))))
+
+(defconst slackit-runtime--user-concurrency 16
+  "Bounded user acquisition slots, leaving App Effect capacity for startup.")
+
+(defun slackit-runtime--queue-user (model operation)
+  "Retain OPERATION once until an account user-acquisition slot is available."
+  (unless (or (memq operation (slackit-runtime-model-user-queue model))
+              (memq operation (slackit-runtime-model-user-active model)))
+    (setf (slackit-runtime-model-user-queue model)
+          (nconc (slackit-runtime-model-user-queue model) (list operation)))))
+
+(defun slackit-runtime--start-queued-users (app model)
+  "Return closed commands admitting queued users within the App Effect bound."
+  (let (commands)
+    (while (and (slackit-runtime-model-user-queue model)
+                (< (length (slackit-runtime-model-user-active model))
+                   slackit-runtime--user-concurrency))
+      (let ((operation (pop (slackit-runtime-model-user-queue model))))
+        (when (slackit-runtime-operation-current-p app operation)
+          (push operation (slackit-runtime-model-user-active model))
+          (push (appkit-command-start-effect (slackit-runtime--user-effect app operation)) commands))))
+    (nreverse commands)))
+
+(defun slackit-runtime--surface-sources (model)
+  "Describe only the transport-bearing presentation Sources desired by MODEL."
+  (when (plist-get model :audio-inputs)
+    (slackit-media-sources model)))
+
+(defun slackit-runtime--user-effect (app operation)
+  "Describe a finite account/profile-owned user acquisition."
+  (appkit-effect-create
+   :key (slackit-operation-key operation) :input (list app operation)
+   :start
+   (lambda (_context input _observe resolve reject)
+     (pcase-let ((`(,app ,operation) input))
+       (let ((request
+               (slackit-api-user-info
+                app (slackit-operation-payload operation)
+                :owner (or (slackit-operation-view operation) app)
+                :on-success resolve :on-error reject)))
+         (when (slackit-http-request-p request)
+           (appkit-cancellation-create
+            :kind 'transport :cancel (lambda () (slackit-http-cancel request)))))))
+   :cancellation-requirement 'transport
+   :success (lambda (input body) (list 'slackit-user-result input body nil))
+   :failure (lambda (input error) (list 'slackit-user-result input nil error))))
+
+(defun slackit-runtime--user-result (app operation body error-data)
+  "Commit a current user result and return its domain changes."
+  (when (slackit-runtime-operation-current-p app operation)
+    (let ((id (slackit-operation-payload operation))
+          (user (alist-get 'user body)))
+      (slackit-runtime-operation-end app operation)
+      (when (slackit-runtime--user-info-owner-current-p app operation)
+        (if (and user (equal id (alist-get 'id user)))
+            (progn
+              (slackit-state-put-user (slackit-runtime-state app) user)
+              (list (list :kind 'user :user-id id)))
+          (list (list :kind 'user-profile-error :user-id id
+                      :surface (slackit-operation-view operation)
+                      :code (or (plist-get error-data :code) "invalid_response"))))))))
+
+(defun slackit-runtime--needed-users (app changes)
+  "Find unknown users referenced by committed visible domain CHANGES."
+  (let ((state (slackit-runtime-state app)) ids)
+    (dolist (change changes)
+      (pcase (plist-get change :kind)
+        ((or 'bootstrap 'conversation)
+         (dolist (id (slackit-state-joined-conversation-ids state))
+           (when-let* ((user (alist-get 'user (slackit-state-conversation state id))))
+             (push user ids))))
+        ((or 'message-create 'message-update)
+         (when-let* ((message (slackit-state-message
+                               state (plist-get change :conversation-id) (plist-get change :ts)))
+                     (user (alist-get 'user message)))
+           (push user ids)))))
+    (seq-filter (lambda (id)
+                  (and (stringp id) (not (string-prefix-p "B" id))
+                       (not (slackit-state-user state id))
+                       (not (slackit-runtime-user-pending-p app id))))
+                (delete-dups ids))))
+
+(defun slackit-runtime--resource-result (surface kind)
+  "Return replacing visible Resource demands and dependent row interests."
+  (let* ((app (appkit-surface-app surface))
+         (state (slackit-runtime-state app))
+         (id (appkit-surface-identity surface))
+         (demands (make-hash-table :test #'equal))
+         (interests (make-hash-table :test #'equal)) order)
+    (cl-labels
+        ((retain (row demand)
+           (when demand
+             (let ((key (appkit-resource-demand-key demand)))
+               (unless (gethash key demands)
+                 (puthash key demand demands)
+                 (push key order))
+               (puthash key (cons row (delete row (gethash key interests))) interests))))
+         (images (row message)
+           (when (appkit-media-inline-image-rendering-available-p)
+             (dolist (item (slackit-media--message-items app message))
+               (retain row (slackit-media-demand app item)))
+             (dolist (name (slackit-emoji--message-names message))
+               (when-let* ((url (slackit-emoji--custom-url app name)))
+                 (retain row (slackit-media-demand
+                              app (list :source url :resource-key
+                                        (slackit-emoji--image-resource-key app name url)))))))))
+      (pcase kind
+        ((or 'room 'thread)
+         (dolist (message
+                  (slackit-history-slice-messages
+                   (if (eq kind 'thread)
+                       (delq nil (mapcar
+                                  (lambda (ts) (slackit-state-message state (cadr id) ts))
+                                  (slackit-state-reply-keys state (cadr id) (nth 2 id))))
+                     (slackit-room--all-messages state (cadr id)))))
+           (let ((row (alist-get 'ts message))
+                 (subject (slackit-render-avatar-subject state message)))
+             (when (and slackit-show-avatars (display-graphic-p) subject)
+               (retain row (slackit-avatar-demand app subject)))
+             (images row message))))
+        ('user
+         (when-let* ((user (slackit-state-user state (cadr id))))
+           (when (and slackit-show-avatars (display-graphic-p))
+             (retain 'profile (slackit-avatar-demand app user)))
+           (images 'profile (list (cons 'text
+                                        (alist-get 'status_emoji (alist-get 'profile user)))))))))
+    (appkit-render-result-create
+     :resource-demands (mapcar (lambda (key) (gethash key demands)) (nreverse order))
+     :resource-interest-update
+     (appkit-resource-interest-update-create
+      :mode 'replace
+      :entries (let (entries)
+                 (maphash (lambda (key rows)
+                            (push (appkit-resource-interest-create :key key :row-keys rows)
+                                  entries)) interests)
+                 entries)))))
+
+(defvar slackit-runtime--surface-types (make-hash-table :test #'eq)
+  "Stable Generated Surface types keyed by protocol presentation kind.")
+
+(defun slackit-runtime--renderer (kind)
+  "Create KIND's native Generated Renderer and Resource companion."
+  (cl-labels
+      ((render (surface _app-view _model request)
+         (if (and (memq kind '(room thread))
+                  (appkit-projection-change-resources request)
+                  (not (or (appkit-projection-change-full-p request)
+                           (appkit-projection-change-keys request)
+                           (appkit-projection-change-rekeys request)
+                           (appkit-projection-change-geometry-p request)
+                           (appkit-projection-change-frame-p request)
+                           (appkit-projection-change-position request))))
+             (progn
+               (appkit-chat-timeline-invalidate
+                (appkit-chat-timeline-dependent-keys
+                 (appkit-projection-change-resources request)))
+               (appkit-render-result-create
+                :resource-interest-update
+                (appkit-resource-interest-update-create :mode 'unchanged)))
+           (when (appkit-surface-live-p surface)
+             (pcase kind
+               ('room (slackit-room--render (appkit-projection-change-keys request)
+                                            (appkit-projection-change-resources request)))
+               ('thread (slackit-thread--render (appkit-projection-change-keys request)
+                                                (appkit-projection-change-resources request)))
+               ('root (appkit-directory-reconcile
+                       (appkit-directory-surface)
+                       (append (slackit-root--entries (slackit-runtime-state (appkit-surface-app surface)))
+                               (when-let* ((error (slackit-runtime-media-error-text)))
+                                 (list (appkit-directory-entry-create
+                                        :key '(media-error) :role 'note :label error :stamp error))))
+                       :force-keys (appkit-projection-change-keys request) :preserve-position-p t))
+               ('user
+                (slackit-user-render)
+                (when-let* ((error (slackit-runtime-media-error-text)))
+                  (let ((inhibit-read-only t))
+                    (save-excursion (goto-char (point-max)) (insert "\n" error "\n")))))))
+           (slackit-runtime--resource-result surface kind))))
+    (appkit-generated-renderer-create
+     :mount
+     (lambda (surface _app-view model)
+       (pcase (plist-get model :identity)
+         ('(root) (slackit-root--setup surface))
+         (`(room ,conversation-id)
+          (setq-local slackit-room--conversation-id conversation-id))
+         (`(thread ,conversation-id ,root-ts)
+          (setq-local slackit-room--conversation-id conversation-id
+                      slackit-thread--root-ts root-ts))
+         (`(user ,user-id) (setq-local slackit-user--user-id user-id))))
+     :unmount
+     (lambda (_surface)
+       (when (memq kind '(room thread))
+         (appkit-chat-history-request-cancel)
+         (setq-local buffer-read-only nil)))
+     :merge #'appkit-projection-change-merge :render #'render
+     :resource-request (lambda (keys)
+                         (appkit-projection-change-create :resources keys))
+     :recover (lambda (surface app-view model _request)
+                (render surface app-view model (appkit-projection-change-create :full-p t))))))
+
+(defun slackit-runtime--surface-type (kind mode)
+  "Return stable KIND type with derived MODE preserved."
+  (or (gethash kind slackit-runtime--surface-types)
+      (puthash kind
+               (appkit-surface-type-create
+                :name mode :mode (lambda () (slackit-runtime--initialize-mode mode)) :init #'slackit-runtime--surface-init
+                :update #'slackit-runtime--surface-update :sources #'slackit-runtime--surface-sources
+                :renderer-factory (lambda (_surface) (slackit-runtime--renderer kind)))
+               slackit-runtime--surface-types)))
+
+(defun slackit-runtime--app-update (context model message)
+  "Commit account MESSAGE and route closed Surface commands."
+  (if (eq (car-safe message) 'slackit-bootstrap)
+      (slackit-bootstrap-update context model message)
+    (let ((app (slackit-runtime-model-app model)) changes commands)
+      (pcase message
+        (`(slackit-cancel-effects ,keys)
+         (dolist (key keys) (push (appkit-command-cancel-effect key) commands))
+         (setf (slackit-runtime-model-user-active model)
+               (seq-remove (lambda (operation) (member (slackit-operation-key operation) keys))
+                           (slackit-runtime-model-user-active model))
+               (slackit-runtime-model-user-queue model)
+               (seq-remove (lambda (operation) (member (slackit-operation-key operation) keys))
+                           (slackit-runtime-model-user-queue model))))
+        (`(slackit-user-request ,operation)
+         (slackit-runtime--queue-user model operation))
+        (`(slackit-user-result (,result-app ,operation) ,body ,error-data)
+         (when (eq app result-app)
+           (setf (slackit-runtime-model-user-active model)
+                 (delq operation (slackit-runtime-model-user-active model)))
+           (setq changes (slackit-runtime--user-result app operation body error-data))))
+        (`(slackit-emoji-start ,operation)
+         (push (appkit-command-start-effect (slackit-emoji-catalog-effect app operation)) commands))
+        (`(slackit-emoji-result (,result-app ,operation) ,body)
+         (when (and (eq app result-app) (slackit-runtime-operation-current-p app operation))
+           (slackit-runtime-operation-end app operation)
+           (when body
+             (slackit-state-set-emojis (slackit-runtime-model-state model) (alist-get 'emoji body))
+             (setq changes (list (list :kind 'emoji))))))
+        (`(slackit-changes ,value) (setq changes value))
+        (`(slackit-event ,event)
+         (setq changes (slackit-state-apply-event (slackit-runtime-model-state model) event)))
+        ('slackit-realtime-start (setf (slackit-runtime-model-realtime-p model) t))
+        (`(slackit-resource ,key)
+         (when app
+           (maphash (lambda (_id entry)
+                      (let ((surface (cdr entry)))
+                        (when (appkit-surface-live-p surface)
+                          (push (appkit-command-post-message
+                                 :target (plist-get (appkit-surface-model surface) :address)
+                                 :message (list 'slackit-render
+                                                (appkit-projection-change-create :resources (list key)))
+                                 :delivery 'report) commands))))
+                    (appkit-app-surfaces app)))))
+      (when changes
+        (dolist (id (slackit-runtime--needed-users app changes))
+          (slackit-runtime--queue-user
+           model (slackit-runtime-operation-begin app (list 'user id) nil nil id)))
+        (maphash
+         (lambda (_id entry)
+           (let* ((surface (cdr entry))
+                  (relevant (and (appkit-surface-live-p surface)
+                                 (seq-filter
+                                  (lambda (change)
+                                    (slackit-runtime--surface-interested-p surface change))
+                                  changes))))
+             (when relevant
+               (push (appkit-command-post-message
+                      :target (plist-get (appkit-surface-model surface) :address)
+                      :message (list 'slackit-changes relevant) :delivery 'report)
+                     commands))))
+         (appkit-app-surfaces app)))
+      (appkit-next :model model :render appkit-render-none
+                   :commands (append (nreverse commands)
+                                     (slackit-runtime--start-queued-users app model))))))
+
+(defun slackit-runtime--sources (model)
+  "Describe MODEL's live account realtime stream."
+  (when (slackit-runtime-model-realtime-p model)
+    (let ((app (slackit-runtime-model-app model)))
+      (list (appkit-source-spec-create
+             :key 'realtime :identity (slackit-runtime-generation app)
+             :input app :start #'slackit-realtime--source-start
+             :event (lambda (_app event) (list 'slackit-event event))
+             :closed (lambda (_app &rest _reason) '(slackit-changes ((:kind connection))))
+             :pending-limit 512 :cancellation-requirement 'transport)))))
+
+(defun slackit-runtime--surface-interested-p (surface change)
+  "Whether SURFACE projects the domain identity in CHANGE."
+  (let* ((id (appkit-surface-identity surface))
+         (kind (plist-get change :kind))
+         (conversation (plist-get change :conversation-id)))
+    (and (or (null (plist-get change :surface))
+             (eq surface (plist-get change :surface)))
+         (or (eq (car id) 'root)
+             (memq kind '(connection bootstrap user user-profile-error emoji conversation))
+             (and conversation (equal conversation (cadr id)))))))
+
+(defun slackit-runtime--surface-init (context input)
+  "Capture the exact route and immutable Surface identity in INPUT."
+  (appkit-next :model (list :identity input
+                            :address (appkit-transition-context-owner-address context))
+               :render appkit-render-none))
+
+(defun slackit-runtime--surface-update (context model message)
+  "Commit Surface controller changes and one explicit projection request."
+  (pcase (car-safe message)
+    ('slackit-user-request
+     (appkit-next :model model :render appkit-render-none
+                  :commands (list (appkit-command-start-effect
+                                   (slackit-runtime--user-effect
+                                    (appkit-surface-app (appkit-current-surface)) (cadr message))))))
+    ('slackit-user-result
+     (appkit-next :model model :render appkit-render-none
+                  :commands (list (appkit-command-post-message
+                                   :target (appkit-transition-context-parent-address context)
+                                   :message message :delivery 'report))))
+    ('slackit-media (slackit-media-update context model message))
+    ((or 'slackit-audio-state 'slackit-audio-closed 'slackit-audio-intent)
+     (slackit-media-audio-update model message))
+    ('slackit-render (appkit-next :model model :render (cadr message)))
+    ((or 'slackit-change 'slackit-changes)
+     (let ((surface (appkit-current-surface))
+           (events (if (eq (car message) 'slackit-change) (list (cadr message)) (cadr message)))
+           keys resources)
+       (dolist (event events)
+         (pcase (car (plist-get model :identity))
+           ('room (slackit-room--apply-event surface event))
+           ('thread (slackit-thread--apply-event surface event))
+           ('user (slackit-user--accept-events (list event))))
+         (when-let* ((ts (plist-get event :ts))) (push ts keys))
+         (when-let* ((user (plist-get event :user-id))) (push (list :user user) resources))
+         (when-let* ((conversation (plist-get event :conversation-id)))
+           (push (list :conversation conversation) resources))
+         (when (eq (plist-get event :kind) 'emoji)
+           (push (slackit-emoji-resource-key (appkit-surface-app surface)) resources)))
+       (appkit-next :model model
+                    :render (appkit-projection-change-create
+                             :full-p t :frame-p t :keys (delete-dups keys)
+                             :resources (delete-dups resources)))))
+    (_ (appkit-next :model model :render appkit-render-none))))
+
+(defun slackit-runtime-render (surface &optional request)
+  "Request committed presentation of live SURFACE."
+  (when (appkit-surface-live-p surface)
+    (appkit-surface-send surface
+                         (list 'slackit-render
+                               (or request (appkit-projection-change-create :full-p t))))))
+
+(defun slackit-runtime-deliver (surface event)
+  "Deliver a presentation EVENT to its exact live SURFACE."
+  (when (appkit-surface-live-p surface)
+    (appkit-surface-send surface (list 'slackit-change event))))
+
+(defun slackit-runtime-operations (app)
+  "Return APP's account-owned operation fences."
+  (slackit-runtime-model-operations (appkit-app-model app)))
+
+(defun slackit-runtime-account-p (app)
+  "Whether APP is a Slackit canonical account."
+  (and (appkit-app-p app)
+       (eq (appkit-app-type-name (appkit-app-type app)) 'slackit-account)))
+
+(defun slackit-runtime--app-init (_context input)
+  "Initialize the canonical account INPUT."
+  (appkit-next :model input :render appkit-render-none))
+
+(declare-function slackit-api-user-info "slackit-api"
+                  (app user-id &rest arguments))
 
 (defvar slackit-runtime--accounts (make-hash-table :test #'equal)
   "Stable local account ID to live Slackit Appkit application.")
@@ -69,22 +503,16 @@
                (when (appkit-app-live-p app) (push app apps)))
              slackit-runtime--accounts)
     (sort apps (lambda (left right)
-                 (string< (format "%s" (appkit-app-id left))
-                          (format "%s" (appkit-app-id right)))))))
+                 (string< (format "%s" (appkit-app-identity left))
+                          (format "%s" (appkit-app-identity right)))))))
 
 (defun slackit-runtime-state (app)
-  "Return canonical Slackit state owned by APP."
-  (unless (and (appkit-app-p app)
-               (slackit-account-state-p (appkit-app-state app)))
-    (error "slackit: invalid account application"))
-  (appkit-app-state app))
+  "Return APP's sole canonical protocol state."
+  (slackit-runtime-model-state (appkit-app-model app)))
 
 (defun slackit-runtime-transport (app)
-  "Return transport owned by Slackit APP."
-  (unless (and (appkit-app-p app)
-               (slackit-transport-p (appkit-app-transport app)))
-    (error "slackit: invalid account transport"))
-  (appkit-app-transport app))
+  "Return APP's account-owned transport."
+  (slackit-runtime-model-transport (appkit-app-model app)))
 
 (defun slackit-runtime-credential (app)
   "Return the credential owned by Slackit APP, or nil."
@@ -143,7 +571,7 @@ browser-session identity."
 (defun slackit-runtime-current-p (app generation)
   "Return non-nil when APP and GENERATION still own callback publication."
   (and (appkit-app-live-p app)
-       (let ((transport (appkit-app-transport app)))
+       (let ((transport (slackit-runtime-transport app)))
          (and (slackit-transport-p transport)
               (not (slackit-transport-stopping-p transport))
               (= generation (slackit-transport-generation transport))))))
@@ -160,8 +588,8 @@ browser-session identity."
 
 (defun slackit-runtime--app-shutdown (app)
   "Complete cleanup for stopped Slackit APP."
-  (let ((transport (appkit-app-transport app))
-        (account-id (appkit-app-id app)))
+  (let ((transport (slackit-runtime-transport app))
+        (account-id (appkit-app-identity app)))
     (when (slackit-transport-p transport)
       (setf (slackit-transport-websocket transport) nil
             (slackit-transport-connection transport) nil
@@ -171,12 +599,19 @@ browser-session identity."
             (slackit-transport-reconnect-timer transport) nil
             (slackit-transport-ready-p transport) nil)
       (slackit-runtime--clear-credential transport))
-    (clrhash (appkit-app-request-table app))
+    (when (fboundp 'slackit-media--clear-app-specs)
+      (slackit-media--clear-app-specs app))
+    (setf (slackit-runtime-model-user-queue (appkit-app-model app)) nil
+          (slackit-runtime-model-user-active (appkit-app-model app)) nil)
+    (clrhash (slackit-runtime-operations app))
     (when (eq app (gethash account-id slackit-runtime--accounts))
       (remhash account-id slackit-runtime--accounts))))
 
-(appkit-define-app-kind slackit-account
-  :shutdown #'slackit-runtime--app-shutdown)
+(defconst slackit-runtime--app-type
+  (appkit-app-type-create
+   :name 'slackit-account :init #'slackit-runtime--app-init
+   :update #'slackit-runtime--app-update :sources #'slackit-runtime--sources
+   :shutdown #'slackit-runtime--app-shutdown))
 
 (defun slackit-runtime-start-account (account-id credential)
   "Start or return account ACCOUNT-ID using secret CREDENTIAL plist."
@@ -204,10 +639,13 @@ browser-session identity."
                  :ready-p nil
                  :stopping-p nil))
                (app (appkit-app-start
-                     'slackit-account
-                     :id account-id
-                     :state state
-                     :transport transport)))
+                     slackit-runtime--app-type
+                     :identity account-id
+                     :command-limit 64 :folded-command-limit 2048
+                     :input (slackit-runtime-model-create
+                             :state state :transport transport
+                             :operations (make-hash-table :test #'equal)))))
+          (setf (slackit-runtime-model-app (appkit-app-model app)) app)
           (puthash account-id app slackit-runtime--accounts)
           app))))
 
@@ -256,7 +694,7 @@ browser-session identity."
 
 (defun slackit-runtime--secret-values (app)
   "Return secret strings currently owned by APP."
-  (let* ((transport (and (appkit-app-p app) (appkit-app-transport app)))
+  (let* ((transport (and (appkit-app-p app) (slackit-runtime-transport app)))
          (credential (and (slackit-transport-p transport)
                           (slackit-transport-credential transport))))
     (delq nil
@@ -281,12 +719,13 @@ browser-session identity."
 (defun slackit-runtime-operation-begin
     (app key &optional view composer-revision payload)
   "Begin latest account-owned operation KEY in APP."
-  (let* ((table (appkit-app-request-table app))
+  (let* ((table (slackit-runtime-operations app))
          (operation
           (slackit-operation-create
            :key key
            :nonce (cl-incf slackit-runtime--operation-nonce)
            :generation (slackit-runtime-generation app)
+           :model (appkit-app-model app)
            :view view
            :composer-revision composer-revision
            :payload payload)))
@@ -295,39 +734,29 @@ browser-session identity."
 
 (defun slackit-runtime-operation-current-p (app operation)
   "Return non-nil when OPERATION is still latest and current in APP."
-  (and (slackit-operation-p operation)
+  (and (appkit-app-p app)
+       (slackit-operation-p operation)
+       (eq (slackit-operation-model operation) (appkit-app-model app))
        (slackit-runtime-current-p app
                                   (slackit-operation-generation operation))
        (eq operation
            (gethash (slackit-operation-key operation)
-                    (appkit-app-request-table app)))))
+                    (slackit-runtime-operations app)))))
 
 (defun slackit-runtime-operation-end (app operation)
   "Retire current OPERATION from APP and return non-nil when retired."
   (when (slackit-runtime-operation-current-p app operation)
-    (remhash (slackit-operation-key operation) (appkit-app-request-table app))
+    (remhash (slackit-operation-key operation) (slackit-runtime-operations app))
     t))
 
 (defun slackit-runtime--user-view-current-p (app view user-id)
   "Return non-nil when VIEW is APP's exact live USER-ID profile view."
   (let ((view-id (list 'user user-id)))
-    (and (appkit-view-live-p view)
-         (eq (appkit-view-app view) app)
-         (equal (appkit-view-id view) view-id)
-         (eq view (appkit-view-for-id app view-id)))))
+    (and (appkit-surface-live-p view)
+         (eq (appkit-surface-app view) app)
+         (equal (appkit-surface-identity view) view-id)
+         (eq view (appkit-app-surface app view-id)))))
 
-(defun slackit-runtime--publish-user-info-error
-    (app operation error-data)
-  "Publish redacted ERROR-DATA to OPERATION's exact user view."
-  (let ((view (slackit-operation-view operation))
-        (user-id (slackit-operation-payload operation))
-        (code (or (plist-get error-data :code) "request_failed")))
-    (when (slackit-runtime--user-view-current-p app view user-id)
-      (appkit-view-enqueue-event
-       view (list :kind 'user-profile-error
-                  :user-id user-id
-                  :code (format "%s" code)))
-      (appkit-request-sync view :part 'profile))))
 (defun slackit-runtime--user-info-owner-current-p (app operation)
   "Return non-nil when OPERATION's optional profile view remains current."
   (let ((view (slackit-operation-view operation))
@@ -335,165 +764,49 @@ browser-session identity."
     (or (null view)
         (slackit-runtime--user-view-current-p app view user-id))))
 
-
-(defun slackit-runtime--user-info-success (app operation body)
-  "Settle current lazy user OPERATION for APP from API BODY."
-  (when (slackit-runtime-operation-current-p app operation)
-    (if (not (slackit-runtime--user-info-owner-current-p app operation))
-        (slackit-runtime-operation-end app operation)
-      (let* ((state (slackit-runtime-state app))
-             (requested-id (slackit-operation-payload operation))
-             (user (alist-get 'user body))
-             (returned-id (alist-get 'id user)))
-        (if (and user (equal requested-id returned-id))
-            (progn
-              (slackit-runtime-operation-end app operation)
-              (slackit-state-put-user state user)
-              (slackit-runtime-publish-changes
-               app (list (list :kind 'user :user-id requested-id))))
-          (slackit-runtime--publish-user-info-error
-           app operation '(:code "invalid_response"))
-          (slackit-runtime-operation-end app operation))))))
-
-(defun slackit-runtime--user-info-failure (app operation error-data)
-  "Settle failed lazy user OPERATION without exposing its response."
-  (when (slackit-runtime-operation-current-p app operation)
-    (slackit-runtime--publish-user-info-error app operation error-data)
-    (slackit-runtime-operation-end app operation)))
-
 (defun slackit-runtime-user-pending-p (app user-id)
   "Return non-nil when APP owns a current USER-ID profile request."
   (let ((operation
          (and (appkit-app-live-p app)
               (gethash (list 'user user-id)
-                       (appkit-app-request-table app)))))
+                       (slackit-runtime-operations app)))))
     (and (slackit-runtime-operation-current-p app operation) operation)))
 
-(cl-defun slackit-runtime-ensure-user
-    (app user-id &key force view)
-  "Fetch Slack USER-ID once for live APP.
-
-Normally fetch only an unknown user.  FORCE refreshes a cached user.  VIEW,
-when it is the exact `(user USER-ID)' view, owns presentation-only failure
-notification.  Return the current/new operation, or nil for an invalid or
-already-cached identity."
-  (when (and (appkit-app-live-p app)
-             (stringp user-id)
-             (not (string-empty-p user-id))
-             (not (string-prefix-p "B" user-id))
-             (or force
-                 (not (slackit-state-user
-                       (slackit-runtime-state app) user-id))))
+(cl-defun slackit-runtime-ensure-user (app user-id &key force view)
+  "Acquire USER-ID under the exact account or initiating profile Surface."
+  (when (and (appkit-app-live-p app) (stringp user-id)
+             (not (string-empty-p user-id)) (not (string-prefix-p "B" user-id))
+             (or force (not (slackit-state-user (slackit-runtime-state app) user-id))))
     (let* ((key (list 'user user-id))
-           (pending (gethash key (appkit-app-request-table app))))
-      (if (slackit-runtime-operation-current-p app pending)
-          (progn
-            (when (and (null (slackit-operation-view pending))
-                       (slackit-runtime--user-view-current-p
-                        app view user-id))
-              (setf (slackit-operation-view pending) view))
-            pending)
-        (let ((operation
-               (slackit-runtime-operation-begin
-                app key
-                (and (slackit-runtime--user-view-current-p
-                      app view user-id)
-                     view)
-                nil user-id)))
-          (slackit-api-user-info
-           app user-id
-           :owner (slackit-operation-view operation)
-           :on-success
-           (apply-partially
-            #'slackit-runtime--user-info-success app operation)
-           :on-error
-           (apply-partially
-            #'slackit-runtime--user-info-failure app operation))
+           (surface (and (slackit-runtime--user-view-current-p app view user-id) view))
+           (pending (gethash key (slackit-runtime-operations app))))
+      (if (and (slackit-runtime-operation-current-p app pending)
+               (or (null surface) (eq surface (slackit-operation-view pending))))
+          pending
+        (when (slackit-runtime-operation-current-p app pending)
+          (appkit-app-send app (list 'slackit-cancel-effects (list key))))
+        (let ((operation (slackit-runtime-operation-begin app key surface nil user-id)))
+          (if surface
+              (appkit-surface-send surface (list 'slackit-user-request operation))
+            (appkit-app-send app (list 'slackit-user-request operation)))
           operation)))))
 
-(defun slackit-runtime--view-matches-conversation-p (view conversation-id)
-  "Return non-nil when VIEW belongs to CONVERSATION-ID."
-  (let ((id (appkit-view-id view)))
-    (and (consp id)
-         (memq (car id) '(room thread))
-         (equal (cadr id) conversation-id))))
-
-(defun slackit-runtime--publish-change-to-view (view change)
-  "Enqueue canonical CHANGE and invalidate matching live VIEW."
-  (let* ((id (appkit-view-id view))
-         (view-kind (car-safe id))
-         (chat-p (memq view-kind '(room thread)))
-         (kind (plist-get change :kind))
-         (conversation-id (plist-get change :conversation-id))
-         (conversation-match-p
-          (slackit-runtime--view-matches-conversation-p
-           view conversation-id))
-         (ts (plist-get change :ts))
-         (user-id (plist-get change :user-id)))
-    (cond
-     ((and (eq view-kind 'user)
-           (eq kind 'user)
-           (equal (cadr id) user-id))
-      (appkit-view-enqueue-event view change)
-      (appkit-request-sync view :structure t :part 'profile))
-     ((eq view-kind 'root)
-      (cond
-       ((and conversation-id
-             (memq kind
-                   '(message-create message-update message-delete read)))
-        (appkit-view-enqueue-event view change)
-        (appkit-request-sync view :entry conversation-id))
-       ((memq kind '(connection bootstrap user conversation))
-        (appkit-view-enqueue-event view change)
-        (appkit-request-sync view :structure t))))
-     ((and conversation-match-p
-           (memq kind
-                 '(message-create message-update message-delete reaction read)))
-      (appkit-view-enqueue-event view change)
-      (if (memq kind '(message-create message-delete))
-          (appkit-request-sync view :structure t :position t)
-        (appkit-request-sync view :entry ts :position t)))
-     ((and chat-p (eq kind 'connection))
-      (appkit-view-enqueue-event view change)
-      (appkit-request-sync view :part 'frame))
-     ((and chat-p (eq kind 'conversation))
-      (appkit-view-enqueue-event view change)
-      (appkit-request-sync
-       view
-       :part (and conversation-match-p 'frame)
-       :resource (list :conversation conversation-id)))
-     ((and chat-p (eq kind 'user))
-      (appkit-view-enqueue-event view change)
-      (appkit-request-sync view :resource (list :user user-id))))))
-
 (defun slackit-runtime-publish-changes (app changes)
-  "Publish canonical CHANGES to all affected views owned by APP."
+  "Commit CHANGES publication through APP's closed routing commands."
   (when (appkit-app-live-p app)
-    (maphash
-     (lambda (_id view)
-       (when (appkit-view-live-p view)
-         (dolist (change changes)
-           (slackit-runtime--publish-change-to-view view change))))
-     (appkit-app-view-registry app)))
+    (appkit-app-send app (list 'slackit-changes changes)))
   changes)
 
 (defun slackit-runtime-publish-resource (app resource)
-  "Invalidate opaque RESOURCE in every live view owned by APP."
+  "Publish RESOURCE presentation changes through APP."
   (when (appkit-app-live-p app)
-    (maphash
-     (lambda (_id view)
-       (when (appkit-view-live-p view)
-         (appkit-request-sync view :resource resource)))
-     (appkit-app-view-registry app)))
+    (appkit-app-send app (list 'slackit-resource resource)))
   resource)
 
 (defun slackit-runtime-reduce-event (app event)
-  "Reduce normalized EVENT into APP and request view synchronization."
+  "Commit normalized EVENT through its exact App."
   (when (appkit-app-live-p app)
-    (let ((changes (slackit-state-apply-event
-                    (slackit-runtime-state app) event)))
-      (slackit-runtime-publish-changes app changes)
-      changes)))
+    (appkit-app-send app (list 'slackit-event event))))
 
 (defun slackit-runtime-publish-bootstrap (app)
   "Publish current APP bootstrap state to its views."

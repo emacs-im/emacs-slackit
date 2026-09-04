@@ -11,6 +11,21 @@
 
 ;;; Code:
 
+(defun slackit-emoji-catalog-effect (app &optional operation)
+  "Describe the finite catalog acquisition for APP."
+  (let ((operation (or operation (slackit-runtime-operation-begin app '(emoji-catalog)))))
+    (appkit-effect-create
+     :key 'emoji-catalog :input (list app operation)
+     :start (lambda (_context input _observe resolve reject)
+              (let ((request (slackit-api-emoji-list
+                              (car input) :on-success resolve :on-error reject)))
+                (when (slackit-http-request-p request)
+                  (appkit-cancellation-create
+                   :kind 'transport :cancel (lambda () (slackit-http-cancel request))))))
+     :cancellation-requirement 'transport
+     :success (lambda (input body) (list 'slackit-emoji-result input body))
+     :failure (lambda (input &rest _reason) (list 'slackit-emoji-result input nil)))))
+
 (require 'cl-lib)
 (require 'subr-x)
 (require 'seq)
@@ -99,7 +114,7 @@
 (defun slackit-emoji-resource-key (app)
   "Return APP's opaque custom emoji catalog resource key."
   (list :slackit-emoji-catalog
-        (secure-hash 'sha256 (prin1-to-string (appkit-app-id app)))))
+        (secure-hash 'sha256 (prin1-to-string (appkit-app-identity app)))))
 
 (defun slackit-emoji--custom-value (app name)
   "Return APP custom emoji value for NAME, or nil."
@@ -217,33 +232,12 @@ Unknown tokens are preserved byte-for-byte, and TEXT itself is never modified."
          app (slackit-emoji--image-resource-key app name url) url))))
   nil)
 
-(defun slackit-emoji--catalog-success (app operation body)
-  "Settle APP custom emoji OPERATION from emoji.list BODY."
-  (when (slackit-runtime-operation-current-p app operation)
-    (slackit-state-set-emojis
-     (slackit-runtime-state app)
-     (or (alist-get 'emoji body) nil))
-    (slackit-runtime-operation-end app operation)
-    (slackit-runtime-publish-resource
-     app (slackit-emoji-resource-key app))))
-
-(defun slackit-emoji--catalog-failure (app operation _error)
-  "Settle failed APP custom emoji OPERATION without blocking startup."
-  (slackit-runtime-operation-end app operation))
-
 (defun slackit-emoji-load-catalog (app)
-  "Load APP's custom Slack emoji catalog once per pending operation."
-  (let* ((key '(emoji-catalog))
-         (pending (gethash key (appkit-app-request-table app))))
-    (if (slackit-runtime-operation-current-p app pending)
-        pending
-      (let ((operation (slackit-runtime-operation-begin app key)))
-        (slackit-api-emoji-list
-         app
-         :on-success
-         (apply-partially #'slackit-emoji--catalog-success app operation)
-         :on-error
-         (apply-partially #'slackit-emoji--catalog-failure app operation))
+  "Commit APP's catalog acquisition once per pending operation."
+  (let ((pending (gethash '(emoji-catalog) (slackit-runtime-operations app))))
+    (if (slackit-runtime-operation-current-p app pending) pending
+      (let ((operation (slackit-runtime-operation-begin app '(emoji-catalog))))
+        (appkit-app-send app (list 'slackit-emoji-start operation))
         operation))))
 
 (provide 'slackit-emoji)

@@ -11,15 +11,15 @@ image/video/audio/document media, Appkit-owned composer file uploads,
 send/edit/delete, explicit read marking, optional Evil integration, and
 context-safe Transient menus.
 
-Slackit requires Emacs 29.1, =browser-session=, =transient=, and the
-=browser-session= helper executable.  Configure optional stable IDs in
+Slackit requires Emacs 32.0, Appkit 0.3.0, =browser-session=, =transient=,
+and the =browser-session= helper executable.  Configure optional stable IDs in
 =slackit-account-ids= and run
 =M-x slackit=; an account without private auth opens an isolated browser login.
 =M-x slackit-register-account= remains a session-only headless fallback.
 
 In room and thread composers, =C-c C-a= opens the Slack attachment-action
 chooser; =C-c C-f= directly selects local media or a file.  Code blocks select
-an explicit language and open a separate, exact-view-owned native-mode editor
+an explicit language and open a separate, exact-Surface-owned native-mode editor
 before being atomically inserted and sent as Slack rich preformatted blocks.
 The chooser also supports an uploaded code snippet,
 media/file upload, an image with screen-reader text, and a clipboard image when

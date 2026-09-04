@@ -9,11 +9,21 @@
 
 ;;; Code:
 
+(defun slackit-room--geometry-changed (surface width)
+  "Commit a redraw at SURFACE's new measured WIDTH."
+  (when (appkit-surface-live-p surface)
+    (with-current-buffer (appkit-surface-buffer surface)
+      (setq-local fill-column (max 1 (- width slackit-room-auto-fill-margin-columns)))
+      (slackit-runtime-render
+       surface (appkit-projection-change-create
+                :geometry-p t :frame-p t :full-p t
+                :keys (and (appkit-chat-timeline-live-p) (appkit-chat-timeline-keys)))))))
+
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-core)
-(require 'appkit-invalidation)
+(require 'appkit-surface)
 (require 'appkit-projection)
 (require 'appkit-chatbuf)
 (require 'appkit-chat-completion)
@@ -67,26 +77,25 @@
 (defvar-local slackit-room--conversation-id nil
   "Exact Slack conversation ID owned by this room buffer.")
 
-
 (defun slackit-room-current-view ()
   "Return the exact live Slackit room or thread view."
-  (let* ((view (appkit-current-view))
-         (id (and (appkit-view-p view) (appkit-view-id view)))
-         (app (and (appkit-view-p view) (appkit-view-app view))))
-    (unless (and (appkit-view-live-p view)
-                 (eq (appkit-app-kind app) 'slackit-account)
+  (let* ((view (appkit-current-surface))
+         (id (and (appkit-surface-p view) (appkit-surface-identity view)))
+         (app (and (appkit-surface-p view) (appkit-surface-app view))))
+    (unless (and (appkit-surface-live-p view)
+                 (slackit-runtime-account-p app)
                  (memq (car-safe id) '(room thread))
-                 (eq (appkit-view-buffer view) (current-buffer)))
+                 (eq (appkit-surface-buffer view) (current-buffer)))
       (user-error "slackit: this command requires a live Slackit chat view"))
     view))
 
 (defun slackit-room-current-app ()
   "Return the current room's live Slackit application."
-  (appkit-view-app (slackit-room-current-view)))
+  (appkit-surface-app (slackit-room-current-view)))
 
 (defun slackit-room-current-conversation-id ()
   "Return the current room's exact conversation ID."
-  (nth 1 (appkit-view-id (slackit-room-current-view))))
+  (nth 1 (appkit-surface-identity (slackit-room-current-view))))
 
 (defun slackit-room-message-ts-at-point ()
   "Return Slack message timestamp at point, or nil."
@@ -135,7 +144,6 @@
     map)
   "Keymap for `slackit-room-mode'.")
 
-
 (define-derived-mode slackit-room-mode appkit-chatbuf-mode "Slackit-Room"
   "Writable Slackit room with an Appkit timeline and composer."
   (slackit-history-init)
@@ -155,16 +163,18 @@
 (defun slackit-room--footer ()
   "Return exact history status footer for the current room."
   (concat
+   (when-let* ((error (slackit-runtime-media-error-text))) (concat error "\n"))
    (slackit-compose-upload-card)
    (when (appkit-chatbuf-aux-active-p)
      (appkit-chatbuf-aux-render
       :title (or (plist-get (appkit-chatbuf-aux-state) :title)
                  "Message action")
+      :preview (appkit-ui-one-line-preview-create
+                :text (or (plist-get (appkit-chatbuf-aux-state) :preview) ""))
       :cancel-action #'slackit-compose-cancel-context))
    (appkit-chat-history-delimiter-string
     (max 20
-         (or (appkit-view-responsive-width
-              slackit-room-auto-fill-margin-columns)
+         (or (appkit-surface-responsive-width (appkit-current-surface) slackit-room-auto-fill-margin-columns)
              fill-column
              80))
     :loading-text "loading Slack history…")
@@ -212,7 +222,7 @@
                 (slackit-state-top-level-keys state conversation-id))))
 
 (defun slackit-room--message-resources (app state message)
-  "Return and ensure opaque Appkit resources for APP MESSAGE from STATE."
+  "Return opaque dependencies for APP MESSAGE from STATE without acquisition."
   (let* ((user-id (alist-get 'user message))
          (subject (slackit-render-avatar-subject state message))
          (resources
@@ -227,14 +237,6 @@
                    (alist-get 'text message))
                   (slackit-media-message-resource-keys app message)
                   (slackit-emoji-message-resource-keys app message))))))
-    (when user-id
-      (slackit-runtime-ensure-user app user-id))
-    (when (and slackit-show-avatars
-               (display-graphic-p)
-               subject)
-      (slackit-avatar-ensure app subject))
-    (slackit-media-ensure-message app message)
-    (slackit-emoji-ensure-message app message)
     resources))
 
 (defun slackit-room--message-epoch (message)
@@ -352,7 +354,7 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
 
 (defun slackit-room--apply-event (view change)
   "Apply controller consequences of canonical CHANGE for VIEW."
-  (let* ((state (slackit-runtime-state (appkit-view-app view)))
+  (let* ((state (slackit-runtime-state (appkit-surface-app view)))
          (conversation-id (slackit-room-current-conversation-id))
          (kind (plist-get change :kind))
          (ts (plist-get change :ts)))
@@ -366,99 +368,50 @@ UNREAD-DIVIDER marks MESSAGE as the first unread row."
       ((or 'compose-success 'compose-failure)
        (slackit-compose-apply-settlement change)))))
 
-(defun slackit-room--configure-responsive-view (view sync-function)
-  "Configure live chat VIEW for responsive rendering through SYNC-FUNCTION."
-  (setf (appkit-view-sync-function view) sync-function
-        (appkit-view-parts view) '(frame timeline composer geometry))
-  (appkit-view-enable-responsive-geometry view)
-  view)
-
-(defun slackit-room--derive-projection-diff (invalidations events)
-  "Apply chat geometry and derive a projection diff for INVALIDATIONS and EVENTS."
-  (let* ((parts (appkit-invalidations-parts invalidations))
-         (resources (appkit-invalidations-resource-keys invalidations))
-         (geometry-p (memq 'geometry parts))
-         (all-resources-p (memq 'all resources)))
-    (when geometry-p
-      (when-let* ((width
-                   (appkit-view-responsive-width
-                    slackit-room-auto-fill-margin-columns)))
-        (setq-local fill-column width)))
-    (appkit-projection-diff-derive
-     invalidations
-     :existing-keys
-     (and (or geometry-p all-resources-p)
-          (appkit-chat-timeline-live-p)
-          (appkit-chat-timeline-keys))
-     :reconcile-parts '(frame timeline composer)
-     :reconcile (not (null events)))))
-
-(defun slackit-room--sync (view invalidations events)
-  "Synchronize room VIEW from INVALIDATIONS and EVENTS."
-  (dolist (event events)
-    (slackit-room--apply-event view event))
-  (let ((diff (slackit-room--derive-projection-diff invalidations events)))
-    (when (appkit-projection-diff-reconcile-p diff)
-      (slackit-room--render
-       (appkit-projection-diff-force-keys diff)
-       (appkit-projection-diff-changed-dependencies diff)))))
-
-(defun slackit-room--setup (conversation-id _app _view)
-  "Initialize a newly attached room for CONVERSATION-ID."
-  (setq-local slackit-room--conversation-id conversation-id)
-  (slackit-history-init))
-
 (defun slackit-room-open (app conversation-id &optional select)
-  "Open APP's CONVERSATION-ID room and optionally SELECT it."
-  (let* ((state (slackit-runtime-state app))
-         (label (slackit-state-conversation-label state conversation-id))
-         (view-id (list 'room conversation-id))
-         (existing (appkit-view-for-id app view-id))
-         (view (appkit-open-view
-                :app app
-                :id view-id
-                :mode 'slackit-room-mode
-                :buffer-name (format "*Slackit:%s:%s*"
-                                     (appkit-app-id app) label)
-                :state conversation-id
-                :sync-function #'slackit-room--sync
-                :parts '(frame timeline composer geometry)
-                :setup (apply-partially
-                        #'slackit-room--setup conversation-id app)
-                :select select)))
-    (slackit-room--configure-responsive-view
-     view #'slackit-room--sync)
-    (with-current-buffer (appkit-view-buffer view)
-      (setq-local slackit-room--conversation-id conversation-id)
+  "Open APP's exact room Surface, retaining its editable draft."
+  (let* ((id (list 'room conversation-id))
+         (existing (appkit-app-surface app id))
+         (surface (or existing
+                      (appkit-open-generated-surface
+                       (slackit-runtime--surface-type 'room #'slackit-room-mode)
+                       :app app :identity id :input id
+                       :buffer (slackit-runtime--host-buffer app id 'slackit-room-mode)
+                       :buffer-name (format "*Slackit:%s:%s*"
+                                            (appkit-app-identity app)
+                                            (slackit-state-conversation-label
+                                             (slackit-runtime-state app) conversation-id))))))
+    (slackit-runtime--remember-host surface)
+    (with-current-buffer (appkit-surface-buffer surface)
       (unless existing
-        (slackit-history-load-latest view conversation-id)
-        (appkit-invalidate view :structure t)
-        (appkit-sync-invalidations view))
-      (appkit-view-refresh-responsive-geometry))
-    view))
+        (appkit-surface-enable-responsive-geometry surface #'slackit-room--geometry-changed)
+        (slackit-history-load-latest surface conversation-id))
+      (slackit-runtime-render surface))
+    (when select (pop-to-buffer (appkit-surface-buffer surface)))
+    surface))
 
 (defun slackit-room-load-older ()
   "Load the current room-history or thread-replies next page."
   (interactive)
   (let* ((view (slackit-room-current-view))
-         (id (appkit-view-id view))
+         (id (appkit-surface-identity view))
          (root-ts (and (eq (car-safe id) 'thread) (nth 2 id))))
     (slackit-history-load-older
      view (slackit-room-current-conversation-id) root-ts)
-    (appkit-request-sync view :part 'frame)))
+    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))
 
 (defun slackit-room-refresh ()
   "Replace current room or thread history with a fresh first page."
   (interactive)
   (let* ((view (slackit-room-current-view))
-         (id (appkit-view-id view))
+         (id (appkit-surface-identity view))
          (root-ts (and (eq (car-safe id) 'thread) (nth 2 id))))
     (appkit-chat-history-window-clear)
     (setq slackit-history--cursor nil
           slackit-history--error nil)
     (slackit-history-load-latest
      view (slackit-room-current-conversation-id) root-ts)
-    (appkit-request-sync view :structure t)))
+    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))
 
 (provide 'slackit-room)
 
