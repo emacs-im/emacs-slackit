@@ -146,7 +146,7 @@ otherwise realtime startup/reconnect would silently retire in-flight bootstrap,
 history, and write callbacks.
 
 Stopping an account increments both generations before calling
-=appkit-stop-app=.  Appkit then cancels its WebSocket, timers, HTTP processes,
+=appkit-app-close=.  Appkit then cancels its WebSocket, timers, HTTP processes,
 and views.  Generation bumps cannot live only in the app-kind shutdown callback
 because Appkit invokes that callback after normal owner cleanup.  A callback
 captures the exact application object and its owning generation; matching only

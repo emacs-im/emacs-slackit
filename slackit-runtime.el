@@ -203,7 +203,7 @@ browser-session identity."
                  :next-message-id 1
                  :ready-p nil
                  :stopping-p nil))
-               (app (appkit-start-app
+               (app (appkit-app-start
                      'slackit-account
                      :id account-id
                      :state state
@@ -245,7 +245,7 @@ browser-session identity."
                (slackit-runtime-account account-or-id))))
     (when (appkit-app-live-p app)
       (slackit-runtime-revoke-generation app)
-      (appkit-stop-app app)
+      (appkit-app-close app)
       t)))
 
 (defun slackit-runtime-stop-all ()
