@@ -1981,8 +1981,7 @@
     ("zero" . "0️⃣")
     ("zipper_mouth_face" . "🤐")
     ("zombie" . "🧟")
-    ("zzz" . "💤")
-    ]
+    ("zzz" . "💤")]
   "Every Slack standard shortname and alias mapped to its Unicode glyph.")
 
 (provide 'slackit-emoji-data)

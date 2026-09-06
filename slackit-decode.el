@@ -32,18 +32,18 @@
                   (when-let* ((value (alist-get key file)))
                     (cons key value)))
                 '(id name title mimetype filetype size permalink
-                     permalink_public mode pretty_type url_private
-                     url_private_download duration_ms audio_wave_samples
-                     thumb_video thumb_video_w thumb_video_h
-                     mp4 mp4_low hls media_display_type
-                     is_external external_type external_url
-                     thumb_64 thumb_80 thumb_160
-                     thumb_360 thumb_360_w thumb_360_h
-                     thumb_480 thumb_480_w thumb_480_h
-                     thumb_720 thumb_720_w thumb_720_h
-                     thumb_960 thumb_960_w thumb_960_h
-                     thumb_1024 thumb_1024_w thumb_1024_h
-                     original_w original_h))))
+                  permalink_public mode pretty_type url_private
+                  url_private_download duration_ms audio_wave_samples
+                  thumb_video thumb_video_w thumb_video_h
+                  mp4 mp4_low hls media_display_type
+                  is_external external_type external_url
+                  thumb_64 thumb_80 thumb_160
+                  thumb_360 thumb_360_w thumb_360_h
+                  thumb_480 thumb_480_w thumb_480_h
+                  thumb_720 thumb_720_w thumb_720_h
+                  thumb_960 thumb_960_w thumb_960_h
+                  thumb_1024 thumb_1024_w thumb_1024_h
+                  original_w original_h))))
 
 (defun slackit-decode--reaction (reaction)
   "Return canonical Slack REACTION alist."
@@ -73,7 +73,7 @@
        (bot_id . ,bot-id)
        (files . ,(mapcar #'slackit-decode--safe-file (or files nil)))
        (reactions . ,(mapcar #'slackit-decode--reaction
-                              (or reactions nil))))
+                             (or reactions nil))))
      result)))
 
 (defun slackit-decode-user (user)

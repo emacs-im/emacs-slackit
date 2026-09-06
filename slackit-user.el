@@ -341,8 +341,7 @@
     (setq slackit-user--profile-error-code nil)
     (slackit-runtime-ensure-user
      app slackit-user--user-id :force t :view view)
-    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))
-    ))
+    (slackit-runtime-render view (appkit-projection-change-create :full-p t :frame-p t))))
 
 (defun slackit-user--dm-pending-p (app user-id)
   "Return APP's current direct-message operation for USER-ID, or nil."
@@ -430,8 +429,7 @@
          :on-success
          (apply-partially #'slackit-user--dm-success app operation)
          :on-error
-         (apply-partially #'slackit-user--dm-failure app operation))
-        )))))
+         (apply-partially #'slackit-user--dm-failure app operation)))))))
 
 (defun slackit-user-open-avatar ()
   "Open the current user's avatar from its local account cache."

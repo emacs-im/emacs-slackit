@@ -258,6 +258,7 @@ is consumed, so duplicate code blocks retain their distinct ordered metadata."
   (list mode language
         (secure-hash 'sha256 text)
         slackit-code-fontify-blocks))
+
 (defun slackit-code--cache-get (cache key)
   "Return a detached cached value from CACHE for KEY."
   (when-let* ((value (gethash key (slackit-code-cache-entries cache))))

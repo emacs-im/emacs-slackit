@@ -206,28 +206,28 @@
   "Dispatch one fixed-origin REQUEST attempt."
   (when (slackit-http--request-current-p request)
     (pcase-let* ((`(,url . ,body)
-                   (slackit-http--url-and-body
-                    (slackit-http-request-endpoint request)
-                    (slackit-http-request-method request)
-                    (slackit-http-request-parameters request)))
-                  (app (slackit-http-request-app request))
-                  ;; `--location' would forward custom headers through redirects.
-                  ;; Slackit rejects redirects by removing it for every request.
-                  (plz-curl-default-args
-                   (remove "--location" plz-curl-default-args))
-                  (process
-                   (plz (slackit-http-request-method request) url
-                     :headers (slackit-http--headers
-                               app (slackit-http-request-method request))
-                     :body body
-                     :as 'response
-                     :timeout slackit-http-timeout
-                     :connect-timeout slackit-http-timeout
-                     :then (lambda (response)
-                             (slackit-http--handle-success request response))
-                     :else (lambda (error-object)
-                             (slackit-http--handle-failure
-                              request error-object)))))
+                  (slackit-http--url-and-body
+                   (slackit-http-request-endpoint request)
+                   (slackit-http-request-method request)
+                   (slackit-http-request-parameters request)))
+                 (app (slackit-http-request-app request))
+                 ;; `--location' would forward custom headers through redirects.
+                 ;; Slackit rejects redirects by removing it for every request.
+                 (plz-curl-default-args
+                  (remove "--location" plz-curl-default-args))
+                 (process
+                  (plz (slackit-http-request-method request) url
+                    :headers (slackit-http--headers
+                              app (slackit-http-request-method request))
+                    :body body
+                    :as 'response
+                    :timeout slackit-http-timeout
+                    :connect-timeout slackit-http-timeout
+                    :then (lambda (response)
+                            (slackit-http--handle-success request response))
+                    :else (lambda (error-object)
+                            (slackit-http--handle-failure
+                             request error-object)))))
       (if (slackit-http--request-current-p request)
           (setf (slackit-http-request-process request) process)
         (when (and (processp process) (process-live-p process))
@@ -244,18 +244,18 @@ GET requests explicitly marked IDEMPOTENT-P may retry a 429 response."
     (error "slackit: unsupported HTTP method"))
   (let* ((effective-owner (or owner app))
          (request
-          (slackit-http-request-create
-           :app app
-           :owner effective-owner
-           :generation (slackit-runtime-generation app)
-           :endpoint endpoint
-           :method method
-           :parameters parameters
-           :idempotent-p (and idempotent-p t)
-           :attempt 0
-           :on-success on-success
-           :on-error on-error
-           :active-p t))
+           (slackit-http-request-create
+            :app app
+            :owner effective-owner
+            :generation (slackit-runtime-generation app)
+            :endpoint endpoint
+            :method method
+            :parameters parameters
+            :idempotent-p (and idempotent-p t)
+            :attempt 0
+            :on-success on-success
+            :on-error on-error
+            :active-p t))
          (handle (appkit-register-handle
                   effective-owner 'slackit-http request
                   #'slackit-http--cancel-request)))

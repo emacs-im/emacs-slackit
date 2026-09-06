@@ -129,7 +129,6 @@
   (slackit-completion--insert-read-candidate
    "Mention channel: " (slackit-completion--channel-candidates)))
 
-
 (defun slackit-completion-decode-wire (state text)
   "Return Slack wire TEXT with known references as structured objects."
   (let ((position 0)

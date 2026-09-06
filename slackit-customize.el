@@ -177,7 +177,6 @@ must not be logged."
   :type 'number
   :group 'slackit)
 
-
 (defface slackit-account-name
   '((t :inherit font-lock-keyword-face :weight bold))
   "Face for Slackit account names."
@@ -217,7 +216,6 @@ must not be logged."
   '((t :inherit shadow :slant italic))
   "Face for Slackit loading and connection status."
   :group 'slackit)
-
 
 (provide 'slackit-customize)
 
