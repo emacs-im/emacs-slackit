@@ -148,10 +148,9 @@
           (slackit-media--failures (make-hash-table :test #'equal))
           (slackit-media--open-specs (make-hash-table :test #'equal))
           (slackit-media--audio-sessions (make-hash-table :test #'equal))
-          (slackit-code--app-caches (make-hash-table :test #'equal))
+          (slackit-code--app-caches (make-hash-table :test #'eq))
           (slackit-avatar--prepared-cache-directory nil)
           (slackit-media--prepared-cache-directory nil)
-          (slackit-code--fontification-buffers (make-hash-table :test #'eq))
           (,variable (slackit-runtime-start-account
                       ,id (list :token "xoxp-CANARY-TOKEN" :cookie "xoxd-CANARY-COOKIE")))
           (slackit-test--apps (cons ,variable slackit-test--apps))
@@ -176,9 +175,6 @@
                       (push (appkit-surface-buffer (cdr entry)) buffers)))
                   (appkit-app-surfaces ,variable))
          (slackit-runtime-stop-account ,variable))
-       (maphash (lambda (_mode buffer)
-                  (when (buffer-live-p buffer) (push buffer buffers)))
-                slackit-code--fontification-buffers)
        (dolist (buffer buffers)
          (when (buffer-live-p buffer) (kill-buffer buffer)))
        (when (file-directory-p fixture-root) (delete-directory fixture-root t)))))
@@ -2454,12 +2450,6 @@
             (slackit-code-block-string
              app "(let ((value 1)) value)" "elisp"))
       (should-not (get-text-property 0 'slackit-test-canary second))
-      (let ((buffer
-             (gethash 'emacs-lisp-mode
-                      slackit-code--fontification-buffers)))
-        (should (buffer-live-p buffer))
-        (with-current-buffer buffer
-          (should (= 0 (buffer-size)))))
       (let* ((cache (gethash app slackit-code--app-caches))
              (entries (slackit-code-cache-entries cache))
              cache-key)
@@ -2467,6 +2457,21 @@
         (should (= 1 (hash-table-count entries)))
         (should-not
          (string-match-p "value 1" (prin1-to-string cache-key)))))))
+
+(ert-deftest slackit-contract-code-fontification-failure-keeps-source ()
+  (slackit-test-with-app (app "code-fallback")
+    (let ((source "(let ((value 1)) value)") calls)
+      (cl-letf (((symbol-function 'appkit-fontify-string)
+                 (lambda (text mode)
+                   (push (list text mode) calls)
+                   nil)))
+        (let ((result (slackit-code-block-string app source "elisp")))
+          (should (equal calls (list (list source 'emacs-lisp-mode))))
+          (should (equal source (substring-no-properties result)))
+          (should-not (get-text-property 0 'slackit-code-mode result))
+          (should (eq 'block (get-text-property 0 'slackit-code-kind result)))
+          (should (slackit-test--face-includes-p
+                   (get-text-property 0 'face result) 'slackit-code-block)))))))
 
 (ert-deftest slackit-contract-unlabelled-and-unknown-code-stay-fixed-pitch ()
   (slackit-test-with-app (app "code-no-detector")

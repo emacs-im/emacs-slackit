@@ -14,6 +14,7 @@
 (require 'org-src)
 (require 'subr-x)
 (require 'appkit-core)
+(require 'appkit-fontify)
 
 (defgroup slackit-code nil
   "Display-only syntax highlighting for Slack code."
@@ -57,15 +58,6 @@
 
 (defvar slackit-code--app-caches (make-hash-table :test #'eq)
   "Live Slackit app to its account-owned code cache.")
-
-(defvar slackit-code--fontification-buffers (make-hash-table :test #'eq)
-  "Major mode to an empty, explicitly owned Font Lock scratch buffer.")
-
-(defvar-local slackit-code--fontification-owner-p nil
-  "Non-nil only in a Slackit-owned code fontification buffer.")
-
-(defvar-local slackit-code--fontification-mode nil
-  "Major mode identity owned by the current fontification buffer.")
 
 (defun slackit-code--present-string (value)
   "Return non-empty string VALUE, or nil."
@@ -168,70 +160,6 @@ is consumed, so duplicate code blocks retain their distinct ordered metadata."
   (when-let* ((name (slackit-code--normalize-language language)))
     (org-src-get-lang-mode-if-bound name)))
 
-(defun slackit-code--fontification-buffer (mode)
-  "Return Slackit's empty, explicitly owned scratch buffer for MODE."
-  (let ((buffer (gethash mode slackit-code--fontification-buffers)))
-    (unless (and (buffer-live-p buffer)
-                 (buffer-local-value 'slackit-code--fontification-owner-p
-                                     buffer)
-                 (eq mode
-                     (buffer-local-value 'slackit-code--fontification-mode
-                                         buffer)))
-      (setq buffer
-            (generate-new-buffer
-             (format " *slackit-code-fontification:%s*" mode)))
-      (with-current-buffer buffer
-        (setq-local slackit-code--fontification-owner-p t)
-        (setq-local slackit-code--fontification-mode mode)
-        (setq-local buffer-undo-list t))
-      (puthash mode buffer slackit-code--fontification-buffers))
-    buffer))
-
-(defun slackit-code--next-face-change (text position length)
-  "Return next face-property boundary in TEXT after POSITION before LENGTH."
-  (min (or (next-single-property-change position 'face text) length)
-       (or (next-single-property-change position 'font-lock-face text) length)))
-
-(defun slackit-code--sanitize-font-lock (text)
-  "Return TEXT retaining only native face presentation properties."
-  (let* ((source (or text ""))
-         (result (substring-no-properties source))
-         (length (length source))
-         (position 0))
-    (while (< position length)
-      (let* ((next (slackit-code--next-face-change source position length))
-             (face (or (get-text-property position 'face source)
-                       (get-text-property position 'font-lock-face source))))
-        (when face
-          (add-text-properties position next (list 'face face) result))
-        (setq position next)))
-    result))
-
-(defun slackit-code--fontify-native (mode text)
-  "Return TEXT fontified with MODE, or nil on a contained failure."
-  (condition-case nil
-      (let ((buffer (slackit-code--fontification-buffer mode)))
-        (with-current-buffer buffer
-          (unwind-protect
-              (progn
-                (let ((inhibit-read-only t))
-                  (erase-buffer)
-                  (insert text " "))
-                (unless (eq major-mode mode)
-                  (let ((inhibit-message t))
-                    (delay-mode-hooks (funcall mode))))
-                (unless (bound-and-true-p font-lock-mode)
-                  (font-lock-mode 1))
-                (when (fboundp 'font-lock-flush)
-                  (font-lock-flush (point-min) (point-max)))
-                (when (fboundp 'font-lock-ensure)
-                  (font-lock-ensure (point-min) (point-max)))
-                (slackit-code--sanitize-font-lock
-                 (buffer-substring (point-min) (1- (point-max)))))
-            (let ((inhibit-read-only t))
-              (erase-buffer)))))
-    (error nil)))
-
 (defun slackit-code--cancel-cache (cache)
   "Clear and retire account-owned code CACHE."
   (when (slackit-code-cache-p cache)
@@ -299,7 +227,7 @@ is consumed, so duplicate code blocks retain their distinct ordered metadata."
          (cached (and cache (slackit-code--cache-get cache key)))
          (native (or cached
                      (and mode
-                          (slackit-code--fontify-native mode source))))
+                          (appkit-fontify-string source mode))))
          (effective-mode (and native mode))
          (payload (copy-sequence (or native source))))
     (when (and cache key native (null cached))
