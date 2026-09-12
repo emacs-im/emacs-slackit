@@ -123,8 +123,6 @@
           (appkit-next :model model :render appkit-render-none
                        :commands (append (nreverse commands) (appkit-next-commands next))))))))
 
-(with-eval-after-load 'evil
-  (require 'slackit-evil))
 
 (defun slackit-bootstrap-account (app &optional start-services-p)
   "Commit finite identity and cursor-complete bootstrap for APP."
@@ -271,5 +269,8 @@ When CREDENTIAL is nil, resolve it through
   (slackit-runtime-stop-all))
 
 (provide 'slackit)
+
+(with-eval-after-load 'evil
+  (require 'slackit-evil nil t))
 
 ;;; slackit.el ends here

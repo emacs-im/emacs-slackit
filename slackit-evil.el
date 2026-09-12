@@ -12,7 +12,7 @@
 ;;; Code:
 
 (require 'appkit-evil)
-(require 'slackit-customize)
+(require 'slackit)
 
 (defgroup slackit-evil nil
   "Optional native Evil integration for Slackit."
