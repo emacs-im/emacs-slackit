@@ -5,9 +5,9 @@
 ;;; Commentary:
 
 ;; Slackit's ordinary maps remain its Emacs-state interface.  This optional
-;; adapter installs only deliberate application actions in Evil state maps, so
-;; native prefixes, motions, and operators remain available.  Message actions
-;; live on the timeline minor-mode map, which Appkit disables in the composer.
+;; adapter installs deliberate application actions in Evil state maps.  Message
+;; actions live on the timeline minor-mode map, which Appkit disables in the
+;; composer; ordinary Evil editing remains available in the writable draft.
 
 ;;; Code:
 
@@ -52,41 +52,54 @@ When nil, leave Evil's initial-state selection untouched."
      "RET" #'appkit-directory-activate
      "<return>" #'appkit-directory-activate
      "g r" #'slackit-root-refresh
+     "g j" #'appkit-directory-next-item
+     "g k" #'appkit-directory-previous-item
      "TAB" #'appkit-directory-tab-dwim
      "<backtab>" #'appkit-directory-previous-item
      "?" #'slackit-root-transient)))
 
 (defun slackit-evil--define-room-keys ()
   "Install room-wide and timeline-only modal bindings."
-  ;; Appkit disables the timeline map in the writable composer.  Keep
-  ;; operators and word motions native outside deliberate application keys.
+  ;; Appkit disables the message action map in the writable composer.
   (appkit-evil-map
     (:map slackit-room-mode-map
      :nm
-     "g r" #'slackit-room-refresh
      "g +" #'slackit-room-load-older
-     "?" #'slackit-room-transient)
+     "?" #'slackit-room-transient
+     "Z a" #'slackit-compose-attach
+     "Z f" #'slackit-compose-attach-file
+     "Z v" #'slackit-compose-attach-clipboard-image
+     :i
+     "RET" #'newline
+     "<return>" #'newline)
     (:map slackit-room-timeline-mode-map
      :nm
      "q" #'quit-window
      "RET" #'slackit-actions-activate
      "<return>" #'slackit-actions-activate
-     "T" #'slackit-actions-open-thread
-     "i" #'appkit-evil-chatbuf-enter-input
-     "E" #'slackit-actions-edit
-     "R" #'slackit-actions-react
-     "Y" #'slackit-actions-copy-text
+     "g r" #'slackit-actions-open-thread
+     "r" #'slackit-actions-open-thread
+     "R" #'undefined
+     "i" #'slackit-actions-edit
+     "!" #'slackit-actions-react
+     "Z y" #'slackit-actions-copy-text
      "?" #'slackit-actions-transient
-     :n
-     "D" #'slackit-actions-delete)))
+     "D" #'slackit-actions-delete
+     "d d" #'slackit-actions-delete)))
 
 (defun slackit-evil--define-user-keys ()
-  "Install user-profile modal bindings without shadowing local actions."
+  "Install user-profile modal bindings."
   (appkit-evil-define-readonly-keys 'slackit-user-mode-map)
   (appkit-evil-map
     (:map slackit-user-mode-map
      :nm
-     "g r" #'slackit-user-refresh
+     "m" #'slackit-user-open-chat
+     "a" #'slackit-user-open-avatar
+     "Z y" #'slackit-user-copy-mention
+     "g I" #'slackit-user-copy-id
+     "Y" #'undefined
+     "TAB" #'forward-button
+     "<backtab>" #'slackit-user-button-backward
      "?" #'slackit-user-transient
      "q" #'quit-window)))
 
@@ -108,6 +121,11 @@ Safe to call multiple times."
 
 (with-eval-after-load 'evil
   (slackit-evil-setup))
+
+(with-eval-after-load 'evil-snipe
+  (dolist (mode slackit-evil--application-modes)
+    (add-hook (intern (format "%s-hook" mode)) #'turn-off-evil-snipe-mode)
+    (add-hook (intern (format "%s-hook" mode)) #'turn-off-evil-snipe-override-mode)))
 
 (provide 'slackit-evil)
 
