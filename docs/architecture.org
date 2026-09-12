@@ -673,7 +673,7 @@ Implementation should defend these observable contracts:
   structured mentions serialize as separate occurrences;
 - public media resources contain no raw source URL or credential, start outside
   rendering, and settle loading to preview/failure by exact row;
-- Evil remains optional and preserves native motions/operators plus the
+- Evil remains optional, with deliberate modal message actions and the
   timeline/composer boundary; Transient suffixes retain their original live
   Appkit view/account/message generation;
 - send/edit HTTP snapshots cannot overwrite a later realtime edit or clear a

@@ -25,5 +25,7 @@ The chooser also supports an uploaded code snippet,
 media/file upload, an image with screen-reader text, and a clipboard image when
 graphical clipboard access is available.
 
+Optional Evil integration is defined in =slackit-evil.el=.
+
 Architecture, security, lifecycle, and deferred-scope contracts are in
 [[file:docs/architecture.org][docs/architecture.org]].
